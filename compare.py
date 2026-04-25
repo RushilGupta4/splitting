@@ -10,12 +10,19 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
+from ensure_samples import (
+    extract_reference_samples_tensor,
+    load_reference_payload,
+    reference_samples_path,
+)
 from infer import (
     _load_model_and_stats,
     _parse_split_percentages,
     _parse_x_grid,
+    prepare_reference_cdf_state,
     run_estimate_and_sample,
     run_fixed_N_sampling,
+    warm_reference_ks_kernel,
 )
 
 log = logging.getLogger("compare")
@@ -97,6 +104,7 @@ def parse_args():
         "--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu"
     )
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--num_base_samples", type=int, default=1000000)
     parser.add_argument("--output", type=str, default="outputs/compare_results.json")
     parser.add_argument(
         "--csv_output",
@@ -175,6 +183,7 @@ def _run_trial(
     target_spec,
     data_mean,
     data_std,
+    reference_cdf_state,
     args,
     split_percentages,
     x_grid,
@@ -185,6 +194,7 @@ def _run_trial(
         target_spec=target_spec,
         data_mean=data_mean,
         data_std=data_std,
+        reference_cdf_state=reference_cdf_state,
         B=spec["B"],
         T=args.T,
         sampling_steps=spec["sampling_steps"],
@@ -331,8 +341,60 @@ def _build_config_payload(
     return config
 
 
+def _load_reference_cdf_states(
+    checkpoint_path: str,
+    step_eta_pairs: List[Tuple[int, float]],
+    num_base_samples: int,
+):
+    reference_cdf_states = {}
+    for sampling_steps, eta in step_eta_pairs:
+        path = reference_samples_path(checkpoint_path, sampling_steps, eta)
+        if not os.path.exists(path):
+            raise FileNotFoundError(
+                f"Missing reference samples for steps={sampling_steps}, eta={eta}: {path}. "
+                "Run ensure_samples.py first."
+            )
+
+        payload = load_reference_payload(path, map_location="cpu")
+        samples = extract_reference_samples_tensor(payload)
+        if int(samples.shape[0]) < num_base_samples:
+            raise ValueError(
+                f"Reference samples for steps={sampling_steps}, eta={eta} only contain "
+                f"{samples.shape[0]} points, but --num_base_samples={num_base_samples}. "
+                "Run ensure_samples.py first."
+            )
+
+        if isinstance(payload, dict):
+            payload_steps = payload.get("sampling_steps")
+            payload_eta = payload.get("eta")
+            if payload_steps is not None and int(payload_steps) != int(sampling_steps):
+                raise ValueError(
+                    f"Reference file {path} has sampling_steps={payload_steps}, expected {sampling_steps}"
+                )
+            if payload_eta is not None and float(payload_eta) != float(eta):
+                raise ValueError(
+                    f"Reference file {path} has eta={payload_eta}, expected {eta}"
+                )
+
+        selected_samples = samples[:num_base_samples]
+        reference_cdf_states[(int(sampling_steps), float(eta))] = prepare_reference_cdf_state(
+            selected_samples
+        )
+        log.debug(
+            "Loaded reference samples for steps=%s eta=%s from %s",
+            sampling_steps,
+            eta,
+            path,
+        )
+    if reference_cdf_states:
+        warm_reference_ks_kernel(next(iter(reference_cdf_states.values())))
+    return reference_cdf_states
+
+
 def main():
     args = parse_args()
+    if torch.cuda.is_available() and str(args.device).startswith("cuda"):
+        torch.cuda.set_device(torch.device(args.device))
     logging.basicConfig(
         level=logging.DEBUG if args.debug else logging.INFO,
         format="[%(name)s] %(message)s",
@@ -341,6 +403,9 @@ def main():
     B_list = _parse_int_list(args.B_list, "B_list")
     B1_list = _parse_int_list(args.B1_list, "B1_list")
     step_eta_pairs = _parse_step_eta_pairs(args.step_eta_pairs)
+    reference_cdf_states = _load_reference_cdf_states(
+        args.checkpoint, step_eta_pairs, args.num_base_samples
+    )
     split_percentages = _parse_split_percentages(args.split_percentages)
     x_grid = _parse_x_grid(args.x_grid)
     if args.independent_n2 < 2:
@@ -368,6 +433,9 @@ def main():
                 target_spec=target_spec,
                 data_mean=data_mean,
                 data_std=data_std,
+                reference_cdf_state=reference_cdf_states[
+                    (int(spec["sampling_steps"]), float(spec["eta"]))
+                ],
                 args=args,
                 split_percentages=split_percentages,
                 x_grid=x_grid,

@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Sequence, Tuple
 
 import numpy as np
 import torch
+from numba import njit
 from tqdm import tqdm
 
 from model import Denoiser
@@ -12,7 +13,6 @@ from utils import (
     get_checkpoint_normalization_stats,
     get_checkpoint_target_spec,
     infer_input_dim_from_checkpoint,
-    mixture_lower_orthant_cdf,
     validate_split_percentages,
 )
 
@@ -115,26 +115,134 @@ class DDIM:
         return x
 
 
-def _empirical_lower_orthant_cdf(samples_np, points_np, chunk_size=2048):
-    empirical = np.empty(points_np.shape[0], dtype=float)
-    for start in range(0, points_np.shape[0], chunk_size):
-        end = min(start + chunk_size, points_np.shape[0])
-        points_chunk = points_np[start:end]
-        indicators = (samples_np[:, None, 0] <= points_chunk[None, :, 0]) & (
-            samples_np[:, None, 1] <= points_chunk[None, :, 1]
-        )
-        empirical[start:end] = indicators.mean(axis=0)
-    return empirical
+def _coerce_samples_np(samples) -> np.ndarray:
+    samples_np = (
+        samples.detach().cpu().numpy() if isinstance(samples, torch.Tensor) else samples
+    )
+    samples_np = np.asarray(samples_np, dtype=float).reshape(-1, 2)
+    if samples_np.ndim != 2 or samples_np.shape[1] != 2:
+        raise ValueError(f"Expected samples of shape [N, 2], got {samples_np.shape}")
+    return samples_np
 
 
-def compute_ks_distance(samples, target_spec):
-    """Compute 2D lower-orthant KS distance to the target Gaussian mixture."""
-    samples_np = samples.detach().cpu().numpy().reshape(-1, 2)
+def _prepare_empirical_cdf_state(samples) -> Dict[str, Any]:
+    samples_np = _coerce_samples_np(samples)
+    if samples_np.shape[0] == 0:
+        raise ValueError("Cannot prepare an empirical CDF state from zero samples")
+
+    y_values, y_ranks = np.unique(samples_np[:, 1], return_inverse=True)
+    x_order = np.argsort(samples_np[:, 0], kind="mergesort")
+    return {
+        "count": int(samples_np.shape[0]),
+        "x_sorted": np.ascontiguousarray(samples_np[x_order, 0], dtype=np.float64),
+        "y_ranks_sorted": np.ascontiguousarray(
+            y_ranks[x_order].astype(np.int64) + 1, dtype=np.int64
+        ),
+        "y_values": np.ascontiguousarray(y_values, dtype=np.float64),
+    }
+
+
+def prepare_reference_cdf_state(samples) -> Dict[str, Any]:
+    return _prepare_empirical_cdf_state(samples)
+
+
+@njit(cache=True)
+def _fenwick_add(tree: np.ndarray, index: int):
+    while index < tree.shape[0]:
+        tree[index] += 1
+        index += index & -index
+
+
+@njit(cache=True)
+def _fenwick_prefix_sum(tree: np.ndarray, index: int) -> int:
+    total = 0
+    while index > 0:
+        total += int(tree[index])
+        index -= index & -index
+    return total
+
+
+@njit(cache=True)
+def _upper_bound(sorted_values: np.ndarray, target: float) -> int:
+    left = 0
+    right = sorted_values.shape[0]
+    while left < right:
+        mid = (left + right) // 2
+        if sorted_values[mid] <= target:
+            left = mid + 1
+        else:
+            right = mid
+    return left
+
+
+@njit(cache=True)
+def _empirical_lower_orthant_cdf_numba(
+    x_sorted: np.ndarray,
+    y_ranks_sorted: np.ndarray,
+    y_values: np.ndarray,
+    points_np: np.ndarray,
+    sample_count: int,
+) -> np.ndarray:
+    query_order = np.argsort(points_np[:, 0])
+    counts = np.empty(points_np.shape[0], dtype=np.float64)
+    tree = np.zeros(y_values.shape[0] + 1, dtype=np.int64)
+
+    sample_idx = 0
+    for ordered_idx in range(query_order.shape[0]):
+        query_idx = query_order[ordered_idx]
+        query_x = points_np[query_idx, 0]
+        while sample_idx < sample_count and x_sorted[sample_idx] <= query_x:
+            _fenwick_add(tree, int(y_ranks_sorted[sample_idx]))
+            sample_idx += 1
+        y_limit = _upper_bound(y_values, points_np[query_idx, 1])
+        counts[query_idx] = _fenwick_prefix_sum(tree, y_limit) / float(sample_count)
+
+    return counts
+
+
+def _empirical_lower_orthant_cdf_from_state(
+    state: Dict[str, Any], points: np.ndarray
+) -> np.ndarray:
+    points_np = np.ascontiguousarray(
+        np.asarray(points, dtype=np.float64).reshape(-1, 2)
+    )
+    if points_np.shape[0] == 0:
+        return np.empty(0, dtype=float)
+    return _empirical_lower_orthant_cdf_numba(
+        state["x_sorted"],
+        state["y_ranks_sorted"],
+        state["y_values"],
+        points_np,
+        int(state["count"]),
+    )
+
+
+def warm_reference_ks_kernel(reference_cdf_state: Dict[str, Any]):
+    sample_x = reference_cdf_state["x_sorted"][0]
+    sample_y = reference_cdf_state["y_values"][0]
+    warm_points = np.ascontiguousarray([[sample_x, sample_y]], dtype=np.float64)
+    _empirical_lower_orthant_cdf_numba(
+        reference_cdf_state["x_sorted"],
+        reference_cdf_state["y_ranks_sorted"],
+        reference_cdf_state["y_values"],
+        warm_points,
+        int(reference_cdf_state["count"]),
+    )
+
+
+def compute_reference_ks_distance(samples, reference_cdf_state: Dict[str, Any]):
+    """Compute 2D lower-orthant KS distance against a cached empirical reference."""
+    samples_np = _coerce_samples_np(samples)
     candidate_points = np.unique(samples_np, axis=0)
-    empirical_cdf = _empirical_lower_orthant_cdf(samples_np, candidate_points)
-    true_cdf = mixture_lower_orthant_cdf(candidate_points, target_spec)
-    ks_distance = float(np.max(np.abs(empirical_cdf - true_cdf)))
-    return ks_distance, empirical_cdf, true_cdf
+    sample_cdf_state = _prepare_empirical_cdf_state(samples_np)
+    empirical_cdf = _empirical_lower_orthant_cdf_from_state(
+        sample_cdf_state, candidate_points
+    )
+    reference_cdf = _empirical_lower_orthant_cdf_from_state(
+        reference_cdf_state, candidate_points
+    )
+    ks_distance = float(np.max(np.abs(empirical_cdf - reference_cdf)))
+    return ks_distance, empirical_cdf, reference_cdf
 
 
 def _sample_loop(ddim: DDIM, model, x: torch.Tensor, start_t: int, end_t: int):
@@ -559,7 +667,7 @@ def _estimate_sigmas_from_tree(
 
 def _sync_device(device):
     if torch.cuda.is_available() and str(device).startswith("cuda"):
-        torch.cuda.synchronize()
+        torch.cuda.synchronize(torch.device(device))
 
 
 def _estimate_sigmas_independently(
@@ -1082,8 +1190,10 @@ def _run_single_sampling_trial(
     split_factors: Sequence[float],
     data_mean: torch.Tensor,
     data_std: torch.Tensor,
+    reference_cdf_state: Dict[str, Any],
     phase1_x0_samples: torch.Tensor | None = None,
 ):
+    sampling_start = time.perf_counter()
     samples, realized_cost = run_probabilistic_inference(
         model=model,
         ddim=ddim,
@@ -1093,19 +1203,26 @@ def _run_single_sampling_trial(
         data_mean=data_mean,
         data_std=data_std,
     )
+    phase2_sampling_time = time.perf_counter() - sampling_start
     leaf_count = int(samples.shape[0])
     ks_samples = samples
     if phase1_x0_samples is not None and phase1_x0_samples.shape[0] > 0:
         ks_samples = torch.cat([phase1_x0_samples, samples], dim=0)
 
+    ks_start = time.perf_counter()
     ks_distance = float("nan")
     if ks_samples.shape[0] > 0:
-        ks_distance, _, _ = compute_ks_distance(ks_samples, target_spec)
+        ks_distance, _, _ = compute_reference_ks_distance(
+            ks_samples, reference_cdf_state
+        )
+    phase2_ks_time = time.perf_counter() - ks_start
 
     return {
         "ks_distance": float(ks_distance),
         "realized_cost": int(realized_cost),
         "leaf_count": leaf_count,
+        "phase2_sampling_time": float(phase2_sampling_time),
+        "phase2_ks_time": float(phase2_ks_time),
         "samples": samples.cpu().numpy(),
     }
 
@@ -1119,6 +1236,12 @@ def _summarize_sampling_trials(trial_results: Sequence[Dict[str, Any]]):
     )
     leaf_counts = np.array(
         [trial["leaf_count"] for trial in trial_results], dtype=float
+    )
+    phase2_sampling_times = np.array(
+        [trial["phase2_sampling_time"] for trial in trial_results], dtype=float
+    )
+    phase2_ks_times = np.array(
+        [trial["phase2_ks_time"] for trial in trial_results], dtype=float
     )
     stats = _summarize_results(ks_distances)
     extinction_rate = float(np.mean(leaf_counts == 0.0)) if leaf_counts.size else 0.0
@@ -1140,6 +1263,20 @@ def _summarize_sampling_trials(trial_results: Sequence[Dict[str, Any]]):
         "leaf_count_mean": float(leaf_counts.mean()) if leaf_counts.size else 0.0,
         "leaf_count_std": float(leaf_counts.std()) if leaf_counts.size else 0.0,
         "extinction_rate": float(extinction_rate),
+        "phase2_sampling_times": phase2_sampling_times.tolist(),
+        "phase2_sampling_time_mean": (
+            float(phase2_sampling_times.mean()) if phase2_sampling_times.size else 0.0
+        ),
+        "phase2_sampling_time_std": (
+            float(phase2_sampling_times.std()) if phase2_sampling_times.size else 0.0
+        ),
+        "phase2_ks_times": phase2_ks_times.tolist(),
+        "phase2_ks_time_mean": (
+            float(phase2_ks_times.mean()) if phase2_ks_times.size else 0.0
+        ),
+        "phase2_ks_time_std": (
+            float(phase2_ks_times.std()) if phase2_ks_times.size else 0.0
+        ),
         "samples": [trial["samples"] for trial in trial_results],
     }
 
@@ -1262,6 +1399,7 @@ def _run_sampling_trials(
     split_factors: Sequence[float],
     data_mean: torch.Tensor,
     data_std: torch.Tensor,
+    reference_cdf_state: Dict[str, Any],
     debug: bool = False,
 ):
     ks_distances = []
@@ -1285,6 +1423,7 @@ def _run_sampling_trials(
             split_factors=split_factors,
             data_mean=data_mean,
             data_std=data_std,
+            reference_cdf_state=reference_cdf_state,
         )
         realized_costs.append(trial_result["realized_cost"])
         leaf_counts.append(trial_result["leaf_count"])
@@ -1329,6 +1468,7 @@ def _run_single_estimate_and_sample_trial(
     target_spec: Dict[str, Any],
     data_mean: torch.Tensor,
     data_std: torch.Tensor,
+    reference_cdf_state: Dict[str, Any],
     *,
     B: int,
     B1: int,
@@ -1469,7 +1609,6 @@ def _run_single_estimate_and_sample_trial(
         "Phase 2 sampling setup: "
         f"expected_cost_per_root={expected_cost_per_root:.6f}, n0={n0}, expected_total_samples={expected_total_samples:.6f}",
     )
-    phase2_start = time.perf_counter()
     sampling_result = _run_single_sampling_trial(
         model=model,
         target_spec=target_spec,
@@ -1479,16 +1618,17 @@ def _run_single_estimate_and_sample_trial(
         split_factors=split_factors,
         data_mean=data_mean,
         data_std=data_std,
+        reference_cdf_state=reference_cdf_state,
         phase1_x0_samples=phase1_samples_for_ks,
     )
-    phase2_time = time.perf_counter() - phase2_start
 
     print(
         f"[timings] diffusion={diffusion_time:.3f}s "
         f"estimate_sigmas={estimation_time:.3f}s "
         f"sigma_matrix={allocation_result['matrix_build_time']:.4f}s "
         f"optimize_N_i={allocation_result['optimize_time']:.4f}s "
-        f"phase2={phase2_time:.3f}s"
+        f"phase2_sampling={sampling_result['phase2_sampling_time']:.3f}s "
+        f"phase2_ks={sampling_result['phase2_ks_time']:.3f}s"
     )
 
     return {
@@ -1525,6 +1665,7 @@ def run_estimate_and_sample(
     target_spec: Dict[str, Any],
     data_mean: torch.Tensor,
     data_std: torch.Tensor,
+    reference_cdf_state: Dict[str, Any],
     *,
     B: int,
     B1: int,
@@ -1562,6 +1703,7 @@ def run_estimate_and_sample(
                 target_spec=target_spec,
                 data_mean=data_mean,
                 data_std=data_std,
+                reference_cdf_state=reference_cdf_state,
                 B=B,
                 B1=B1,
                 T=T,
@@ -1682,6 +1824,7 @@ def run_fixed_N_sampling(
     target_spec: Dict[str, Any],
     data_mean: torch.Tensor,
     data_std: torch.Tensor,
+    reference_cdf_state: Dict[str, Any],
     *,
     B: int,
     T: int,
@@ -1735,6 +1878,7 @@ def run_fixed_N_sampling(
         split_factors=split_factors,
         data_mean=data_mean,
         data_std=data_std,
+        reference_cdf_state=reference_cdf_state,
         debug=debug,
     )
     _debug_log(
