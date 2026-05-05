@@ -11,6 +11,9 @@ import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 from matplotlib.ticker import ScalarFormatter
 
+SOLVER_LINESTYLES = ("--", "-.", ":", (0, (3, 1, 1, 1)))
+SOLVER_MARKERS = ("^", "D", "x", "P", "v", "*", "h")
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -28,6 +31,11 @@ def parse_args():
         type=str,
         default=None,
         help="Optional figure title",
+    )
+    parser.add_argument(
+        "--std",
+        action="store_true",
+        help="Show mean_ks +/- std_ks intervals when std_ks is available",
     )
     return parser.parse_args()
 
@@ -89,8 +97,15 @@ def _load_rows(csv_path: str):
                     "sampling_steps": sampling_steps,
                     "eta": eta,
                     "mean_ks": mean_ks,
+                    "std_ks": _parse_float(raw_row.get("std_ks", "")),
                     "mode": raw_row.get("mode", "").strip(),
                     "method_label": raw_row.get("method_label", "").strip(),
+                    "solver": raw_row.get("solver", "").strip(),
+                    "solver_sampling_steps": _parse_int(
+                        raw_row.get("solver_sampling_steps", "")
+                    ),
+                    "solver_eta": _parse_float(raw_row.get("solver_eta", "")),
+                    "solver_nfe": _parse_int(raw_row.get("solver_nfe", "")),
                     "sigma_estimation_mode": raw_row.get(
                         "sigma_estimation_mode", ""
                     ).strip(),
@@ -109,6 +124,14 @@ def _format_eta(eta: float) -> str:
 def _series_key(row):
     if row["mode"] == "fixed_N":
         return ("baseline",)
+    if row["mode"] == "solver_baseline":
+        return (
+            "solver",
+            row["method_label"],
+            row["solver"],
+            row["solver_sampling_steps"],
+            row["solver_eta"],
+        )
     return (
         "adaptive",
         row["sigma_estimation_mode"],
@@ -135,7 +158,61 @@ def _build_b1_color_map(rows):
     return {b1: cmap(i / denom) for i, b1 in enumerate(b1_values)}
 
 
-def _plot_schedule(ax, schedule_rows, b1_colors):
+def _format_solver_label(series_key):
+    _, method_label, solver, solver_sampling_steps, solver_eta = series_key
+    if solver and solver_sampling_steps is not None:
+        solver_label = solver.upper() if solver == "ddim" else solver.replace("_", " ")
+        label = f"{solver_label} {solver_sampling_steps}"
+        if solver_eta is not None:
+            label += f" eta={_format_eta(solver_eta)}"
+        return label
+    return method_label or "solver baseline"
+
+
+def _build_solver_style_map(rows):
+    solver_keys = sorted(
+        {_series_key(row) for row in rows if row["mode"] == "solver_baseline"}
+    )
+    if not solver_keys:
+        return {}
+
+    cmap = plt.get_cmap("tab10") if len(solver_keys) <= 10 else plt.get_cmap("tab20")
+    return {
+        key: (
+            cmap(i % cmap.N),
+            SOLVER_LINESTYLES[i % len(SOLVER_LINESTYLES)],
+            SOLVER_MARKERS[i % len(SOLVER_MARKERS)],
+            _format_solver_label(key),
+        )
+        for i, key in enumerate(solver_keys)
+    }
+
+
+def _solver_style_from_key(series_key, solver_styles):
+    return solver_styles.get(
+        series_key,
+        ("#7f7f7f", "--", "x", _format_solver_label(series_key)),
+    )
+
+
+def _fill_std_interval(ax, x_values, y_values, std_values, color, zorder):
+    if any(std_ks is None for std_ks in std_values):
+        return
+
+    lower = [max(y - std_ks, 1e-12) for y, std_ks in zip(y_values, std_values)]
+    upper = [y + std_ks for y, std_ks in zip(y_values, std_values)]
+    ax.fill_between(
+        x_values,
+        lower,
+        upper,
+        color=color,
+        alpha=0.16,
+        linewidth=0,
+        zorder=zorder,
+    )
+
+
+def _plot_schedule(ax, schedule_rows, b1_colors, solver_styles, show_std):
     grouped = defaultdict(list)
     for row in schedule_rows:
         grouped[_series_key(row)].append(row)
@@ -144,8 +221,11 @@ def _plot_schedule(ax, schedule_rows, b1_colors):
         points = sorted(series_rows, key=lambda row: row["B"])
         x_values = [row["B"] for row in points]
         y_values = [row["mean_ks"] for row in points]
+        std_values = [row["std_ks"] for row in points]
 
         if series_key[0] == "baseline":
+            if show_std:
+                _fill_std_interval(ax, x_values, y_values, std_values, "black", 2)
             ax.plot(
                 x_values,
                 y_values,
@@ -158,10 +238,30 @@ def _plot_schedule(ax, schedule_rows, b1_colors):
             )
             continue
 
+        if series_key[0] == "solver":
+            color, linestyle, marker, _ = _solver_style_from_key(
+                series_key, solver_styles
+            )
+            if show_std:
+                _fill_std_interval(ax, x_values, y_values, std_values, color, 3)
+            ax.plot(
+                x_values,
+                y_values,
+                color=color,
+                linestyle=linestyle,
+                marker=marker,
+                linewidth=2.0,
+                markersize=5,
+                zorder=4,
+            )
+            continue
+
         _, sigma_estimation_mode, reuse_phase1_samples, B1 = series_key
         color = b1_colors.get(B1, "#1f77b4")
         linestyle = ":" if sigma_estimation_mode == "pilot_tree" else "-"
         marker = "s" if reuse_phase1_samples else "o"
+        if show_std:
+            _fill_std_interval(ax, x_values, y_values, std_values, color, 1)
         ax.plot(
             x_values,
             y_values,
@@ -180,7 +280,7 @@ def _plot_schedule(ax, schedule_rows, b1_colors):
     ax.xaxis.set_major_formatter(formatter)
 
 
-def _make_legends(fig, b1_colors):
+def _make_legends(fig, b1_colors, rows, solver_styles):
     semantic_handles = [
         Line2D([0], [0], color="black", linestyle="-", marker="o", linewidth=2.2),
         Line2D([0], [0], color="0.35", linestyle="-", linewidth=1.8),
@@ -195,12 +295,41 @@ def _make_legends(fig, b1_colors):
         "fresh samples",
         "reuse phase-1 samples",
     ]
+
+    solver_keys = []
+    seen_solver_labels = set()
+    for row in rows:
+        if row["mode"] != "solver_baseline":
+            continue
+        key = _series_key(row)
+        if key[1] in seen_solver_labels:
+            continue
+        seen_solver_labels.add(key[1])
+        solver_keys.append(key)
+
+    for solver_key in sorted(solver_keys):
+        color, linestyle, marker, label = _solver_style_from_key(
+            solver_key, solver_styles
+        )
+        semantic_handles.append(
+            Line2D(
+                [0],
+                [0],
+                color=color,
+                linestyle=linestyle,
+                marker=marker,
+                linewidth=2.0,
+                markersize=6,
+            )
+        )
+        semantic_labels.append(label)
+
     fig.legend(
         semantic_handles,
         semantic_labels,
         loc="upper center",
         bbox_to_anchor=(0.5, 1.02),
-        ncol=3,
+        ncol=4,
         frameon=False,
     )
 
@@ -238,6 +367,7 @@ def main():
         schedule_groups[_schedule_key(row)].append(row)
 
     b1_colors = _build_b1_color_map(rows)
+    solver_styles = _build_solver_style_map(rows)
 
     n_schedules = len(schedules)
     ncols = min(2, n_schedules)
@@ -252,7 +382,13 @@ def main():
     axes_flat = axes.flatten()
 
     for ax, schedule in zip(axes_flat, schedules):
-        _plot_schedule(ax, schedule_groups[schedule], b1_colors)
+        _plot_schedule(
+            ax,
+            schedule_groups[schedule],
+            b1_colors,
+            solver_styles,
+            args.std,
+        )
         sampling_steps, eta = schedule
         ax.set_title(f"steps={sampling_steps}, eta={_format_eta(eta)}")
 
@@ -266,7 +402,7 @@ def main():
     if args.title:
         fig.suptitle(args.title)
 
-    _make_legends(fig, b1_colors)
+    _make_legends(fig, b1_colors, rows, solver_styles)
 
     output_path = args.output or _default_output_path(args.csv_file)
     output_dir = os.path.dirname(output_path)

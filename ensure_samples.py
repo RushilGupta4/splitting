@@ -33,7 +33,7 @@ def parse_args():
     parser.add_argument(
         "--batch_size",
         type=int,
-        default=10000,
+        default=50000,
         help="Sampling batch size used while building the reference cache",
     )
     parser.add_argument(
@@ -66,7 +66,9 @@ def reference_samples_filename(sampling_steps: int, eta: float) -> str:
     return f"samples_steps{int(sampling_steps)}_eta{_format_eta_for_filename(eta)}.pt"
 
 
-def reference_samples_path(checkpoint_path: str, sampling_steps: int, eta: float) -> str:
+def reference_samples_path(
+    checkpoint_path: str, sampling_steps: int, eta: float
+) -> str:
     checkpoint_dir = os.path.dirname(checkpoint_path) or "."
     return os.path.join(checkpoint_dir, reference_samples_filename(sampling_steps, eta))
 
@@ -79,7 +81,9 @@ def extract_reference_samples_tensor(payload) -> torch.Tensor:
     samples = payload.get("samples") if isinstance(payload, dict) else payload
     samples = torch.as_tensor(samples)
     if samples.ndim != 2 or samples.shape[1] != 2:
-        raise ValueError(f"Expected samples of shape [N, 2], got {tuple(samples.shape)}")
+        raise ValueError(
+            f"Expected samples of shape [N, 2], got {tuple(samples.shape)}"
+        )
     return samples
 
 
@@ -112,7 +116,9 @@ def _generate_reference_samples(
     remaining = int(num_samples)
 
     with torch.inference_mode():
-        for _ in tqdm(range(0, num_samples, batch_size), desc=f"Reference {sampling_steps}:{eta}"):
+        for _ in tqdm(
+            range(0, num_samples, batch_size), desc=f"Reference {sampling_steps}:{eta}"
+        ):
             current_batch = min(batch_size, remaining)
             x_T = torch.randn(current_batch, input_dim, device=device)
             generated = ddim.sample_loop(model, x_T, ddim.T, 0)
@@ -170,7 +176,10 @@ def main():
         pairs_to_build.append((sampling_steps, eta, path))
 
     if not pairs_to_build:
-        log.info("All requested reference sample files already satisfy num_base_samples=%d", args.num_base_samples)
+        log.info(
+            "All requested reference sample files already satisfy num_base_samples=%d",
+            args.num_base_samples,
+        )
         return
 
     model, _, data_mean, data_std = _load_model_and_stats(args)

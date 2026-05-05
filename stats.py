@@ -11,14 +11,6 @@ import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 from matplotlib.ticker import ScalarFormatter
 
-
-MODE_ROWS = [
-    ("pilot_tree", False),
-    ("pilot_tree", True),
-    ("independent", False),
-    ("independent", True),
-]
-
 PLOT_SPECS = {
     "optimal_b1": {
         "filename_suffix": "optimal_B1",
@@ -33,6 +25,11 @@ PLOT_SPECS = {
         "title": "Percent Change in KS",
     },
 }
+
+ADAPTIVE_LINESTYLES = ("-", "--", ":", "-.")
+ADAPTIVE_MARKERS = ("o", "s", "D", "^", "v", "P")
+SOLVER_LINESTYLES = ("--", "-.", ":", (0, (3, 1, 1, 1)))
+SOLVER_MARKERS = ("^", "D", "x", "P", "v", "*", "h")
 
 
 def parse_args():
@@ -132,12 +129,7 @@ def _load_rows(csv_path: str):
             eta = _parse_float(raw_row.get("eta", ""))
             mode = raw_row.get("mode", "").strip()
 
-            if (
-                mean_ks is None
-                or B is None
-                or sampling_steps is None
-                or eta is None
-            ):
+            if mean_ks is None or B is None or sampling_steps is None or eta is None:
                 continue
 
             if mode == "fixed_N":
@@ -149,10 +141,44 @@ def _load_rows(csv_path: str):
                         "eta": eta,
                         "mean_ks": mean_ks,
                         "mode": mode,
+                        "method_label": raw_row.get("method_label", "").strip(),
+                        "solver": "",
+                        "solver_sampling_steps": None,
+                        "solver_eta": None,
+                        "solver_nfe": None,
                         "sigma_estimation_mode": "",
                         "reuse_phase1_samples": None,
                         "N_i": [],
+                        "N_i_std": [],
+                        "N_i_count": None,
                         "mode_key": None,
+                    }
+                )
+                continue
+
+            if mode == "solver_baseline":
+                method_label = raw_row.get("method_label", "").strip()
+                rows.append(
+                    {
+                        "B": B,
+                        "B1": None,
+                        "sampling_steps": sampling_steps,
+                        "eta": eta,
+                        "mean_ks": mean_ks,
+                        "mode": mode,
+                        "method_label": method_label,
+                        "solver": raw_row.get("solver", "").strip(),
+                        "solver_sampling_steps": _parse_int(
+                            raw_row.get("solver_sampling_steps", "")
+                        ),
+                        "solver_eta": _parse_float(raw_row.get("solver_eta", "")),
+                        "solver_nfe": _parse_int(raw_row.get("solver_nfe", "")),
+                        "sigma_estimation_mode": "",
+                        "reuse_phase1_samples": None,
+                        "N_i": [],
+                        "N_i_std": [],
+                        "N_i_count": None,
+                        "mode_key": ("solver", method_label),
                     }
                 )
                 continue
@@ -167,11 +193,7 @@ def _load_rows(csv_path: str):
                 reuse_raw = raw_row.get("reuse_pilot_samples", "")
             reuse_phase1_samples = _parse_bool(reuse_raw or "")
 
-            if (
-                B1 is None
-                or not sigma_estimation_mode
-                or reuse_phase1_samples is None
-            ):
+            if B1 is None or not sigma_estimation_mode or reuse_phase1_samples is None:
                 continue
 
             row = {
@@ -181,9 +203,16 @@ def _load_rows(csv_path: str):
                 "eta": eta,
                 "mean_ks": mean_ks,
                 "mode": mode,
+                "method_label": raw_row.get("method_label", "").strip(),
+                "solver": "",
+                "solver_sampling_steps": None,
+                "solver_eta": None,
+                "solver_nfe": None,
                 "sigma_estimation_mode": sigma_estimation_mode,
                 "reuse_phase1_samples": reuse_phase1_samples,
                 "N_i": _parse_float_list(raw_row.get("N_i", "")),
+                "N_i_std": _parse_float_list(raw_row.get("N_i_std", "")),
+                "N_i_count": _parse_int(raw_row.get("N_i_count", "")),
             }
             row["mode_key"] = _mode_key(row)
             rows.append(row)
@@ -215,18 +244,79 @@ def _baseline_rows(rows):
     return [row for row in rows if row["mode"] == "fixed_N"]
 
 
+def _solver_rows(rows):
+    return [row for row in rows if row["mode"] == "solver_baseline"]
+
+
 def _mode_title(mode_key):
     sigma_estimation_mode, reuse_phase1_samples = mode_key
     reuse_label = "reuse" if reuse_phase1_samples else "fresh"
     return f"{sigma_estimation_mode} {reuse_label}"
 
 
-def _mode_style(mode_key):
-    sigma_estimation_mode, reuse_phase1_samples = mode_key
-    color = "#ff7f0e" if sigma_estimation_mode == "pilot_tree" else "#1f77b4"
-    linestyle = "--" if reuse_phase1_samples else "-"
-    marker = "s" if reuse_phase1_samples else "o"
-    return color, linestyle, marker
+def _mode_keys(rows):
+    return sorted({row["mode_key"] for row in _adaptive_rows(rows)})
+
+
+def _build_mode_style_map(rows):
+    mode_keys = _mode_keys(rows)
+    if not mode_keys:
+        return {}
+
+    cmap = plt.get_cmap("tab10") if len(mode_keys) <= 10 else plt.get_cmap("tab20")
+    return {
+        mode_key: (
+            cmap(i % cmap.N),
+            ADAPTIVE_LINESTYLES[i % len(ADAPTIVE_LINESTYLES)],
+            ADAPTIVE_MARKERS[i % len(ADAPTIVE_MARKERS)],
+        )
+        for i, mode_key in enumerate(mode_keys)
+    }
+
+
+def _mode_style(mode_key, mode_styles):
+    return mode_styles.get(mode_key, ("#7f7f7f", "-", "o"))
+
+
+def _format_solver_label(row):
+    solver = row.get("solver")
+    solver_sampling_steps = row.get("solver_sampling_steps")
+    solver_eta = row.get("solver_eta")
+    if solver and solver_sampling_steps is not None:
+        solver_label = solver.upper() if solver == "ddim" else solver.replace("_", " ")
+        label = f"{solver_label} {solver_sampling_steps}"
+        if solver_eta is not None:
+            label += f" eta={_format_eta(solver_eta)}"
+        return label
+    return row.get("method_label") or "solver baseline"
+
+
+def _build_solver_style_map(rows):
+    solver_rows_by_label = {}
+    for row in _solver_rows(rows):
+        solver_rows_by_label.setdefault(row["method_label"], row)
+
+    if not solver_rows_by_label:
+        return {}
+
+    labels = sorted(solver_rows_by_label)
+    cmap = plt.get_cmap("tab10") if len(labels) <= 10 else plt.get_cmap("tab20")
+    return {
+        method_label: (
+            cmap(i % cmap.N),
+            SOLVER_LINESTYLES[i % len(SOLVER_LINESTYLES)],
+            SOLVER_MARKERS[i % len(SOLVER_MARKERS)],
+            _format_solver_label(solver_rows_by_label[method_label]),
+        )
+        for i, method_label in enumerate(labels)
+    }
+
+
+def _solver_style(method_label: str, solver_styles):
+    return solver_styles.get(
+        method_label,
+        ("#7f7f7f", "--", "x", method_label or "solver baseline"),
+    )
 
 
 def _optimal_rows(rows):
@@ -234,7 +324,10 @@ def _optimal_rows(rows):
     for row in rows:
         group_key = (_schedule_key(row), row["mode_key"], row["B"])
         best = best_by_group.get(group_key)
-        if best is None or (row["mean_ks"], row["B1"]) < (best["mean_ks"], best["B1"]):
+        if best is None or (row["mean_ks"], row["B1"]) < (
+            best["mean_ks"],
+            best["B1"],
+        ):
             best_by_group[group_key] = row
     return best_by_group
 
@@ -273,6 +366,16 @@ def _baseline_by_schedule_and_budget(rows):
     return baseline_by_group
 
 
+def _solver_by_schedule_budget_and_label(rows):
+    solver_by_group = {}
+    for row in rows:
+        group_key = (_schedule_key(row), row["B"], row["method_label"])
+        best = solver_by_group.get(group_key)
+        if best is None or row["mean_ks"] < best["mean_ks"]:
+            solver_by_group[group_key] = row
+    return solver_by_group
+
+
 def _make_subplot_grid(count: int, max_cols: int = 2):
     ncols = min(max_cols, count)
     nrows = math.ceil(count / ncols)
@@ -290,11 +393,11 @@ def _apply_scalar_formatters(ax, format_x: bool = True, format_y: bool = True):
         ax.yaxis.set_major_formatter(y_formatter)
 
 
-def _make_legend(fig):
+def _make_legend(fig, mode_keys, mode_styles):
     handles = []
     labels = []
-    for mode_key in MODE_ROWS:
-        color, linestyle, marker = _mode_style(mode_key)
+    for mode_key in mode_keys:
+        color, linestyle, marker = _mode_style(mode_key, mode_styles)
         handles.append(
             Line2D(
                 [0],
@@ -308,6 +411,9 @@ def _make_legend(fig):
         )
         labels.append(_mode_title(mode_key))
 
+    if not handles:
+        return
+
     fig.legend(
         handles,
         labels,
@@ -318,15 +424,15 @@ def _make_legend(fig):
     )
 
 
-def _plot_optimal_b1_panel(ax, selected_rows):
+def _plot_optimal_b1_panel(ax, selected_rows, mode_keys, mode_styles):
     plotted_any = False
-    for mode_key in MODE_ROWS:
+    for mode_key in mode_keys:
         points = [row for row in selected_rows if row["mode_key"] == mode_key]
         points.sort(key=lambda row: row["B"])
         if not points:
             continue
 
-        color, linestyle, marker = _mode_style(mode_key)
+        color, linestyle, marker = _mode_style(mode_key, mode_styles)
         x_values = [row["B"] for row in points]
         y_values = [row["B1"] for row in points]
         ax.plot(
@@ -346,8 +452,9 @@ def _plot_optimal_b1_panel(ax, selected_rows):
     ax.grid(alpha=0.25)
 
 
-def _plot_optimal_b1(rows, title_prefix: str | None):
+def _plot_optimal_b1(rows, title_prefix: str | None, mode_styles, solver_styles):
     rows = _adaptive_rows(rows)
+    mode_keys = _mode_keys(rows)
     schedules = sorted({_schedule_key(row) for row in rows})
     selected = _optimal_rows(rows)
     selected_by_schedule = _selected_rows_by_schedule(selected)
@@ -363,7 +470,12 @@ def _plot_optimal_b1(rows, title_prefix: str | None):
     axes_flat = axes.flatten()
 
     for ax, schedule in zip(axes_flat, schedules):
-        _plot_optimal_b1_panel(ax, selected_by_schedule.get(schedule, []))
+        _plot_optimal_b1_panel(
+            ax,
+            selected_by_schedule.get(schedule, []),
+            mode_keys,
+            mode_styles,
+        )
         ax.set_title(_format_schedule(schedule))
         ax.set_xlabel("B")
         _apply_scalar_formatters(ax, format_x=True, format_y=True)
@@ -377,13 +489,13 @@ def _plot_optimal_b1(rows, title_prefix: str | None):
     if title_prefix:
         fig.suptitle(f"{title_prefix}: {PLOT_SPECS['optimal_b1']['title']}")
 
-    _make_legend(fig)
+    _make_legend(fig, mode_keys, mode_styles)
     return fig
 
 
-def _plot_optimal_ni_panel(ax, selected_rows, max_levels: int):
+def _plot_optimal_ni_panel(ax, selected_rows, max_levels: int, mode_keys, mode_styles):
     plotted_any = False
-    for mode_key in MODE_ROWS:
+    for mode_key in mode_keys:
         matching_rows = [row for row in selected_rows if row["mode_key"] == mode_key]
         if not matching_rows:
             continue
@@ -392,8 +504,20 @@ def _plot_optimal_ni_panel(ax, selected_rows, max_levels: int):
         if not row["N_i"]:
             continue
 
-        color, linestyle, marker = _mode_style(mode_key)
+        color, linestyle, marker = _mode_style(mode_key, mode_styles)
         x_values = list(range(1, len(row["N_i"]) + 1))
+        ni_std = row.get("N_i_std") or []
+        if len(ni_std) == len(row["N_i"]):
+            lower = [max(0.0, mean - std) for mean, std in zip(row["N_i"], ni_std)]
+            upper = [mean + std for mean, std in zip(row["N_i"], ni_std)]
+            ax.fill_between(
+                x_values,
+                lower,
+                upper,
+                color=color,
+                alpha=0.16,
+                linewidth=0,
+            )
         ax.plot(
             x_values,
             row["N_i"],
@@ -414,8 +538,9 @@ def _plot_optimal_ni_panel(ax, selected_rows, max_levels: int):
     _apply_scalar_formatters(ax, format_x=False, format_y=True)
 
 
-def _plot_optimal_ni(rows, title_prefix: str | None):
+def _plot_optimal_ni(rows, title_prefix: str | None, mode_styles, solver_styles):
     rows = _adaptive_rows(rows)
+    mode_keys = _mode_keys(rows)
     schedules = sorted({_schedule_key(row) for row in rows})
     budgets = sorted({row["B"] for row in rows})
     selected = _optimal_rows(rows)
@@ -433,7 +558,13 @@ def _plot_optimal_ni(rows, title_prefix: str | None):
         for col_idx, budget in enumerate(budgets):
             ax = axes[row_idx][col_idx]
             panel_rows = selected_by_schedule_and_budget.get((schedule, budget), [])
-            _plot_optimal_ni_panel(ax, panel_rows, max_levels)
+            _plot_optimal_ni_panel(
+                ax,
+                panel_rows,
+                max_levels,
+                mode_keys,
+                mode_styles,
+            )
 
             if row_idx == 0:
                 ax.set_title(f"B={budget}")
@@ -445,31 +576,49 @@ def _plot_optimal_ni(rows, title_prefix: str | None):
     if title_prefix:
         fig.suptitle(f"{title_prefix}: {PLOT_SPECS['optimal_ni']['title']}")
 
-    _make_legend(fig)
+    _make_legend(fig, mode_keys, mode_styles)
     return fig
 
 
-def _plot_percent_change_panel(ax, schedule, baseline_by_group, best_adaptive_by_group):
+def _percent_change_points(schedule, baseline_by_group, candidate_by_budget):
     budgets = sorted(
         B
         for group_schedule, B in baseline_by_group
-        if group_schedule == schedule and (schedule, B) in best_adaptive_by_group
+        if group_schedule == schedule and B in candidate_by_budget
     )
     x_values = []
     y_values = []
     for budget in budgets:
         baseline = baseline_by_group[(schedule, budget)]
-        best_adaptive = best_adaptive_by_group[(schedule, budget)]
+        candidate = candidate_by_budget[budget]
         if baseline["mean_ks"] == 0:
             continue
 
         x_values.append(budget)
         percent_change = (
-            100.0
-            * (baseline["mean_ks"] - best_adaptive["mean_ks"])
-            / baseline["mean_ks"]
+            100.0 * (baseline["mean_ks"] - candidate["mean_ks"]) / baseline["mean_ks"]
         )
         y_values.append(percent_change)
+    return x_values, y_values
+
+
+def _plot_percent_change_panel(
+    ax,
+    schedule,
+    baseline_by_group,
+    best_adaptive_by_group,
+    solver_by_group,
+    solver_styles,
+):
+    plotted_any = False
+    adaptive_candidates = {
+        B: row
+        for (group_schedule, B), row in best_adaptive_by_group.items()
+        if group_schedule == schedule
+    }
+    x_values, y_values = _percent_change_points(
+        schedule, baseline_by_group, adaptive_candidates
+    )
 
     if x_values:
         ax.plot(
@@ -480,8 +629,54 @@ def _plot_percent_change_panel(ax, schedule, baseline_by_group, best_adaptive_by
             marker="o",
             linewidth=1.8,
             markersize=5,
+            label="best adaptive",
         )
+        for x_value, y_value in zip(x_values, y_values):
+            ax.annotate(
+                f"{y_value:.1f}%",
+                (x_value, y_value),
+                textcoords="offset points",
+                xytext=(0, 6),
+                ha="center",
+                fontsize=8,
+                color="#2ca02c",
+            )
+        plotted_any = True
+
+    solver_labels = sorted(
+        {
+            method_label
+            for group_schedule, _, method_label in solver_by_group
+            if group_schedule == schedule
+        }
+    )
+    for method_label in solver_labels:
+        solver_candidates = {
+            B: row
+            for (group_schedule, B, group_method_label), row in solver_by_group.items()
+            if group_schedule == schedule and group_method_label == method_label
+        }
+        x_values, y_values = _percent_change_points(
+            schedule, baseline_by_group, solver_candidates
+        )
+        if not x_values:
+            continue
+        color, linestyle, marker, label = _solver_style(method_label, solver_styles)
+        ax.plot(
+            x_values,
+            y_values,
+            color=color,
+            linestyle=linestyle,
+            marker=marker,
+            linewidth=1.8,
+            markersize=5,
+            label=label,
+        )
+        plotted_any = True
+
+    if plotted_any:
         ax.axhline(0.0, color="0.35", linestyle="--", linewidth=1.0)
+        ax.legend(frameon=False, fontsize=8)
     else:
         ax.text(0.5, 0.5, "no data", ha="center", va="center", transform=ax.transAxes)
 
@@ -489,10 +684,11 @@ def _plot_percent_change_panel(ax, schedule, baseline_by_group, best_adaptive_by
     _apply_scalar_formatters(ax, format_x=True, format_y=True)
 
 
-def _plot_percent_change(rows, title_prefix: str | None):
+def _plot_percent_change(rows, title_prefix: str | None, mode_styles, solver_styles):
     schedules = sorted({_schedule_key(row) for row in rows})
     baseline_by_group = _baseline_by_schedule_and_budget(_baseline_rows(rows))
     best_adaptive_by_group = _best_adaptive_by_schedule_and_budget(_adaptive_rows(rows))
+    solver_by_group = _solver_by_schedule_budget_and_label(_solver_rows(rows))
 
     nrows, ncols = _make_subplot_grid(len(schedules), max_cols=2)
     fig, axes = plt.subplots(
@@ -505,7 +701,14 @@ def _plot_percent_change(rows, title_prefix: str | None):
     axes_flat = axes.flatten()
 
     for ax, schedule in zip(axes_flat, schedules):
-        _plot_percent_change_panel(ax, schedule, baseline_by_group, best_adaptive_by_group)
+        _plot_percent_change_panel(
+            ax,
+            schedule,
+            baseline_by_group,
+            best_adaptive_by_group,
+            solver_by_group,
+            solver_styles,
+        )
         ax.set_title(_format_schedule(schedule))
         ax.set_xlabel("B")
 
@@ -539,6 +742,8 @@ def main():
     rows = _load_rows(args.csv_file)
     if not rows:
         raise ValueError("No valid rows found in CSV after filtering")
+    mode_styles = _build_mode_style_map(rows)
+    solver_styles = _build_solver_style_map(rows)
 
     plotters = {
         "optimal_b1": _plot_optimal_b1,
@@ -548,7 +753,7 @@ def main():
 
     output_paths = []
     for plot_name in plot_names:
-        fig = plotters[plot_name](rows, args.title)
+        fig = plotters[plot_name](rows, args.title, mode_styles, solver_styles)
         output_path = _default_output_path(args.csv_file, plot_name)
         _save_figure(fig, output_path, has_title=bool(args.title))
         output_paths.append(output_path)

@@ -22,13 +22,17 @@ from infer import (
     prepare_reference_cdf_state,
     run_estimate_and_sample,
     run_fixed_N_sampling,
+    run_solver_baseline_sampling,
     warm_reference_ks_kernel,
 )
 
 log = logging.getLogger("compare")
 
-SIGMA_MODES = ("pilot_tree", "independent")
+# SIGMA_MODES = ("pilot_tree", "independent")
+SIGMA_MODES = ("pilot_tree",)
+# SIGMA_MODES = ("independent",)
 REUSE_FLAGS = (False, True)
+SUPPORTED_SOLVERS = ("ddim", "dpmpp_2m")
 
 CSV_FIELDS = [
     "record_id",
@@ -36,11 +40,20 @@ CSV_FIELDS = [
     "B1",
     "sampling_steps",
     "eta",
+    "reference_mode",
+    "reference_sampling_steps",
+    "reference_eta",
+    "solver",
+    "solver_sampling_steps",
+    "solver_eta",
+    "solver_nfe",
     "method_label",
     "mode",
     "sigma_estimation_mode",
     "reuse_phase1_samples",
     "N_i",
+    "N_i_std",
+    "N_i_count",
     "n0",
     "expected_total_samples",
     "used_B1",
@@ -57,6 +70,10 @@ BEST_RECORD_FIELDS = (
     "B",
     "sampling_steps",
     "eta",
+    "reference_mode",
+    "solver",
+    "solver_sampling_steps",
+    "solver_eta",
     "method_label",
     "B1",
     "mean_ks",
@@ -89,6 +106,23 @@ def parse_args():
         type=str,
         required=True,
         help="Comma-separated 'steps:eta' pairs, e.g. '1000:1.0,500:1.0'",
+    )
+    parser.add_argument(
+        "--solver_baselines",
+        type=str,
+        # default="ddim_40_eta0,dpmpp_2m_40,dpmpp_2m_100,dpmpp_2m_200",
+        default="dpmpp_2m_40",
+        help=(
+            "Comma-separated solver baselines in '<solver>_<steps>' or "
+            "'<solver>_<steps>_eta<eta>' format. Supported solvers: "
+            f"{', '.join(SUPPORTED_SOLVERS)}. Use '' to disable."
+        ),
+    )
+    parser.add_argument(
+        "--reference_mode",
+        choices=("samples", "true_dist"),
+        default="samples",
+        help="samples uses cached DDPM/DDIM reference samples; true_dist uses the exact target CDF.",
     )
     parser.add_argument("--n_runs", type=int, default=100)
     parser.add_argument("--T", type=int, default=1000)
@@ -138,10 +172,75 @@ def _parse_step_eta_pairs(raw: str) -> List[Tuple[int, float]]:
     return pairs
 
 
+def _parse_solver_baseline_name(name: str) -> Dict[str, Any]:
+    for solver in sorted(SUPPORTED_SOLVERS, key=len, reverse=True):
+        prefix = f"{solver}_"
+        if not name.startswith(prefix):
+            continue
+
+        remainder = name[len(prefix) :]
+        parts = remainder.split("_")
+        if len(parts) not in (1, 2):
+            break
+
+        try:
+            solver_sampling_steps = int(parts[0])
+        except ValueError as exc:
+            raise ValueError(
+                f"Solver baseline '{name}' must use integer sampling steps"
+            ) from exc
+        if solver_sampling_steps < 1:
+            raise ValueError(f"Solver baseline '{name}' must use sampling steps >= 1")
+
+        solver_eta = 0.0
+        if len(parts) == 2:
+            eta_part = parts[1]
+            if not eta_part.startswith("eta") or eta_part == "eta":
+                break
+            try:
+                solver_eta = float(eta_part[3:])
+            except ValueError as exc:
+                raise ValueError(
+                    f"Solver baseline '{name}' must use numeric eta in '_eta<eta>'"
+                ) from exc
+
+        return {
+            "mode": "solver_baseline",
+            "method_label": name,
+            "solver": solver,
+            "solver_sampling_steps": solver_sampling_steps,
+            "solver_eta": solver_eta,
+        }
+
+    supported = ", ".join(SUPPORTED_SOLVERS)
+    raise ValueError(
+        f"Unknown solver baseline '{name}'. Expected '<solver>_<steps>' or "
+        f"'<solver>_<steps>_eta<eta>' with supported solvers: {supported}"
+    )
+
+
+def _parse_solver_baselines(raw: str) -> List[Dict[str, Any]]:
+    names = [x.strip() for x in raw.split(",") if x.strip()]
+    return [_parse_solver_baseline_name(name) for name in names]
+
+
+def _unique_step_eta_pairs(pairs: List[Tuple[int, float]]) -> List[Tuple[int, float]]:
+    seen = set()
+    unique = []
+    for steps, eta in pairs:
+        key = (int(steps), float(eta))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(key)
+    return unique
+
+
 def _build_trial_specs(
     B_list: List[int],
     B1_list: List[int],
     step_eta_pairs: List[Tuple[int, float]],
+    solver_baselines: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
     """Every experiment (baseline + adaptive variants) as a flat list of spec dicts."""
     specs: List[Dict[str, Any]] = []
@@ -153,6 +252,12 @@ def _build_trial_specs(
                 "B1": None,
                 "sampling_steps": steps,
                 "eta": eta,
+                "reference_sampling_steps": steps,
+                "reference_eta": eta,
+                "solver": None,
+                "solver_sampling_steps": None,
+                "solver_eta": None,
+                "solver_nfe": None,
                 "sigma_estimation_mode": None,
                 "reuse_phase1_samples": None,
                 "method_label": "all_ones_baseline",
@@ -161,6 +266,9 @@ def _build_trial_specs(
         for B1, sigma_mode, reuse in itertools.product(
             B1_list, SIGMA_MODES, REUSE_FLAGS
         ):
+            if B1 >= B:
+                log.info("Skipping config with B1=%s >= B=%s", B1, B)
+                continue
             specs.append(
                 {
                     "mode": "estimate_and_sample",
@@ -168,11 +276,29 @@ def _build_trial_specs(
                     "B1": B1,
                     "sampling_steps": steps,
                     "eta": eta,
+                    "reference_sampling_steps": steps,
+                    "reference_eta": eta,
+                    "solver": None,
+                    "solver_sampling_steps": None,
+                    "solver_eta": None,
+                    "solver_nfe": None,
                     "sigma_estimation_mode": sigma_mode,
                     "reuse_phase1_samples": reuse,
                     "method_label": f"{sigma_mode}_{'reuse' if reuse else 'fresh'}",
                 }
             )
+        for solver_spec in solver_baselines:
+            spec = dict(solver_spec)
+            spec["B"] = B
+            spec["B1"] = None
+            spec["sampling_steps"] = steps
+            spec["eta"] = eta
+            spec["reference_sampling_steps"] = steps
+            spec["reference_eta"] = eta
+            spec["sigma_estimation_mode"] = None
+            spec["reuse_phase1_samples"] = None
+            spec["solver_nfe"] = int(spec["solver_sampling_steps"])
+            specs.append(spec)
     return specs
 
 
@@ -203,8 +329,27 @@ def _run_trial(
         n_runs=args.n_runs,
         seed=seed,
         device=args.device,
+        reference_mode=args.reference_mode,
         debug=args.debug,
     )
+    if spec["mode"] == "solver_baseline":
+        return run_solver_baseline_sampling(
+            model=model,
+            target_spec=target_spec,
+            data_mean=data_mean,
+            data_std=data_std,
+            reference_cdf_state=reference_cdf_state,
+            solver=spec["solver"],
+            B=spec["B"],
+            T=args.T,
+            sampling_steps=spec["solver_sampling_steps"],
+            eta=spec["solver_eta"],
+            n_runs=args.n_runs,
+            seed=seed,
+            device=args.device,
+            reference_mode=args.reference_mode,
+            debug=args.debug,
+        )
     if spec["mode"] == "fixed_N":
         return run_fixed_N_sampling(
             **common,
@@ -244,7 +389,7 @@ def _record_sort_key(record: Dict[str, Any]):
 
 
 def _compute_best_ids(records: List[Dict[str, Any]]) -> set:
-    grouped: Dict[Tuple[int, int, float], List[Dict[str, Any]]] = {}
+    grouped: Dict[Tuple[Any, ...], List[Dict[str, Any]]] = {}
     for record in records:
         key = (int(record["B"]), int(record["sampling_steps"]), float(record["eta"]))
         grouped.setdefault(key, []).append(record)
@@ -278,7 +423,17 @@ def _build_summary_rows(
     for record in sorted(records, key=_record_sort_key):
         row = {field: record.get(field, "") for field in CSV_FIELDS}
         row["B1"] = "" if record.get("B1") is None else record.get("B1")
+        row["reference_sampling_steps"] = record.get("reference_sampling_steps", "")
+        row["reference_eta"] = record.get("reference_eta", "")
+        row["solver"] = record.get("solver") or ""
+        row["solver_sampling_steps"] = record.get("solver_sampling_steps", "")
+        row["solver_eta"] = record.get("solver_eta", "")
+        row["solver_nfe"] = record.get("solver_nfe", "")
         row["N_i"] = ",".join(f"{float(x):.6g}" for x in (record.get("N_i") or []))
+        row["N_i_std"] = ",".join(
+            f"{float(x):.6g}" for x in (record.get("N_i_std") or [])
+        )
+        row["N_i_count"] = record.get("N_i_count", "")
         row["is_best_for_pair"] = record["record_id"] in best_ids
         rows.append(row)
     return rows
@@ -313,7 +468,14 @@ def _json_safe(value):
 
 
 def _build_config_payload(
-    args, B_list, B1_list, step_eta_pairs, split_percentages, x_grid, target_spec
+    args,
+    B_list,
+    B1_list,
+    step_eta_pairs,
+    solver_baselines,
+    split_percentages,
+    x_grid,
+    target_spec,
 ):
     config = {
         k: v
@@ -326,6 +488,7 @@ def _build_config_payload(
             "B_list",
             "B1_list",
             "step_eta_pairs",
+            "solver_baselines",
             "split_percentages",
             "x_grid",
         }
@@ -335,6 +498,8 @@ def _build_config_payload(
     config["step_eta_pairs"] = [
         {"sampling_steps": s, "eta": e} for s, e in step_eta_pairs
     ]
+    config["solver_baselines"] = [dict(spec) for spec in solver_baselines]
+    config["reference_mode"] = args.reference_mode
     config["split_percentages"] = split_percentages
     config["x_grid"] = x_grid
     config["target_spec"] = target_spec
@@ -377,8 +542,8 @@ def _load_reference_cdf_states(
                 )
 
         selected_samples = samples[:num_base_samples]
-        reference_cdf_states[(int(sampling_steps), float(eta))] = prepare_reference_cdf_state(
-            selected_samples
+        reference_cdf_states[(int(sampling_steps), float(eta))] = (
+            prepare_reference_cdf_state(selected_samples)
         )
         log.debug(
             "Loaded reference samples for steps=%s eta=%s from %s",
@@ -403,22 +568,24 @@ def main():
     B_list = _parse_int_list(args.B_list, "B_list")
     B1_list = _parse_int_list(args.B1_list, "B1_list")
     step_eta_pairs = _parse_step_eta_pairs(args.step_eta_pairs)
-    reference_cdf_states = _load_reference_cdf_states(
-        args.checkpoint, step_eta_pairs, args.num_base_samples
-    )
+    solver_baselines = _parse_solver_baselines(args.solver_baselines)
+    if args.reference_mode == "samples":
+        reference_cdf_states = _load_reference_cdf_states(
+            args.checkpoint,
+            _unique_step_eta_pairs(step_eta_pairs),
+            args.num_base_samples,
+        )
+    else:
+        reference_cdf_states = {}
     split_percentages = _parse_split_percentages(args.split_percentages)
     x_grid = _parse_x_grid(args.x_grid)
     if args.independent_n2 < 2:
         raise ValueError("independent_n2 must be at least 2")
-    for B1 in B1_list:
-        for B in B_list:
-            if B1 >= B:
-                raise ValueError(f"B1={B1} must be smaller than B={B}")
 
     model, target_spec, data_mean, data_std = _load_model_and_stats(args)
     log.debug("Loaded checkpoint %s onto %s", args.checkpoint, args.device)
 
-    trial_specs = _build_trial_specs(B_list, B1_list, step_eta_pairs)
+    trial_specs = _build_trial_specs(B_list, B1_list, step_eta_pairs, solver_baselines)
 
     records: List[Dict[str, Any]] = []
     for record_id, spec in enumerate(tqdm(trial_specs, desc="Compare sweep"), start=1):
@@ -427,15 +594,20 @@ def main():
         seed = args.seed + record_id
         log.debug("Trial %d: %s", record_id, spec)
         try:
+            reference_cdf_state = None
+            if args.reference_mode == "samples":
+                reference_key = (
+                    int(spec["reference_sampling_steps"]),
+                    float(spec["reference_eta"]),
+                )
+                reference_cdf_state = reference_cdf_states[reference_key]
             result = _run_trial(
                 spec,
                 model=model,
                 target_spec=target_spec,
                 data_mean=data_mean,
                 data_std=data_std,
-                reference_cdf_state=reference_cdf_states[
-                    (int(spec["sampling_steps"]), float(spec["eta"]))
-                ],
+                reference_cdf_state=reference_cdf_state,
                 args=args,
                 split_percentages=split_percentages,
                 x_grid=x_grid,
@@ -443,7 +615,21 @@ def main():
             )
         except Exception as exc:
             result = {**spec, "error": str(exc), "N_i": []}
-        result.update({"record_id": record_id, "method_label": spec["method_label"]})
+        result.update(
+            {
+                "record_id": record_id,
+                "method_label": spec["method_label"],
+                "sampling_steps": spec["sampling_steps"],
+                "eta": spec["eta"],
+                "reference_mode": args.reference_mode,
+                "reference_sampling_steps": spec.get("reference_sampling_steps"),
+                "reference_eta": spec.get("reference_eta"),
+                "solver": spec.get("solver"),
+                "solver_sampling_steps": spec.get("solver_sampling_steps"),
+                "solver_eta": spec.get("solver_eta"),
+                "solver_nfe": spec.get("solver_nfe"),
+            }
+        )
         records.append(result)
 
     best_ids = _compute_best_ids(records)
@@ -457,6 +643,7 @@ def main():
             B_list,
             B1_list,
             step_eta_pairs,
+            solver_baselines,
             split_percentages,
             x_grid,
             target_spec,

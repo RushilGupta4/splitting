@@ -13,6 +13,7 @@ from utils import (
     get_checkpoint_normalization_stats,
     get_checkpoint_target_spec,
     infer_input_dim_from_checkpoint,
+    mixture_lower_orthant_cdf,
     validate_split_percentages,
 )
 
@@ -245,6 +246,36 @@ def compute_reference_ks_distance(samples, reference_cdf_state: Dict[str, Any]):
     return ks_distance, empirical_cdf, reference_cdf
 
 
+def compute_target_ks_distance(samples, target_spec: Dict[str, Any]):
+    """Compute 2D lower-orthant KS distance against the exact target CDF."""
+    samples_np = _coerce_samples_np(samples)
+    candidate_points = np.unique(samples_np, axis=0)
+    sample_cdf_state = _prepare_empirical_cdf_state(samples_np)
+    empirical_cdf = _empirical_lower_orthant_cdf_from_state(
+        sample_cdf_state, candidate_points
+    )
+    target_cdf = mixture_lower_orthant_cdf(candidate_points, target_spec)
+    ks_distance = float(np.max(np.abs(empirical_cdf - target_cdf)))
+    return ks_distance, empirical_cdf, target_cdf
+
+
+def _compute_ks_distance(
+    samples,
+    target_spec: Dict[str, Any],
+    reference_mode: str,
+    reference_cdf_state: Dict[str, Any] | None,
+):
+    if reference_mode == "samples":
+        if reference_cdf_state is None:
+            raise ValueError(
+                "reference_cdf_state is required when reference_mode='samples'"
+            )
+        return compute_reference_ks_distance(samples, reference_cdf_state)
+    if reference_mode == "true_dist":
+        return compute_target_ks_distance(samples, target_spec)
+    raise ValueError(f"Unknown reference_mode '{reference_mode}'")
+
+
 def _sample_loop(ddim: DDIM, model, x: torch.Tensor, start_t: int, end_t: int):
     if x.shape[0] == 0:
         return x
@@ -444,8 +475,11 @@ def _derive_independent_counts(
             else:
                 upper = mid
 
-        inner_count = max(1, int(lower))
         outer_count = max(1, int(lower * lower))
+        # For the final sigma block, t_next == 0, so inner repeats are exact
+        # zero-step duplicates. They do not change the sigma estimate but would
+        # overweight those x0 samples when reuse_phase1_samples=True.
+        inner_count = 1 if segment3 == 0 else max(1, int(lower))
         used_budget = _independent_sigma_cost(
             ddim, t_curr, t_next, outer_count, independent_n2, inner_count
         )
@@ -940,7 +974,7 @@ def _solve_optimal_split_factors(
         }
 
     M_candidate = sigmas_at_j / total
-    kkt_tol = 1e-7
+    kkt_tol = 1e-8
     zero_levels = M_candidate <= 0.0
     kkt_feasible = not (
         np.any(zero_levels) and np.any(sigma2_matrix[:, zero_levels] > 0.0)
@@ -1190,7 +1224,8 @@ def _run_single_sampling_trial(
     split_factors: Sequence[float],
     data_mean: torch.Tensor,
     data_std: torch.Tensor,
-    reference_cdf_state: Dict[str, Any],
+    reference_cdf_state: Dict[str, Any] | None,
+    reference_mode: str,
     phase1_x0_samples: torch.Tensor | None = None,
 ):
     sampling_start = time.perf_counter()
@@ -1212,8 +1247,8 @@ def _run_single_sampling_trial(
     ks_start = time.perf_counter()
     ks_distance = float("nan")
     if ks_samples.shape[0] > 0:
-        ks_distance, _, _ = compute_reference_ks_distance(
-            ks_samples, reference_cdf_state
+        ks_distance, _, _ = _compute_ks_distance(
+            ks_samples, target_spec, reference_mode, reference_cdf_state
         )
     phase2_ks_time = time.perf_counter() - ks_start
 
@@ -1281,6 +1316,198 @@ def _summarize_sampling_trials(trial_results: Sequence[Dict[str, Any]]):
     }
 
 
+def _sample_dpmpp_2m(model, x: torch.Tensor, T: int, sampling_steps: int):
+    from diffusers import DPMSolverMultistepScheduler
+
+    scheduler = DPMSolverMultistepScheduler(
+        num_train_timesteps=T,
+        beta_start=1e-4,
+        beta_end=0.02,
+        beta_schedule="linear",
+        prediction_type="epsilon",
+        algorithm_type="dpmsolver++",
+        solver_order=2,
+    )
+    scheduler.set_timesteps(sampling_steps, device=x.device)
+
+    with torch.inference_mode():
+        for t in scheduler.timesteps:
+            t_value = int(t.item()) if isinstance(t, torch.Tensor) else int(t)
+            t_tensor = torch.full(
+                (x.shape[0],), t_value, device=x.device, dtype=torch.long
+            )
+            eps_pred = model(x, t_tensor)
+            x = scheduler.step(eps_pred, t, x).prev_sample
+    return x
+
+
+def _sample_full_solver(
+    model,
+    solver: str,
+    x: torch.Tensor,
+    *,
+    T: int,
+    sampling_steps: int,
+    eta: float,
+    device: str,
+):
+    if solver == "ddim":
+        ddim = DDIM(T=T, device=device, eta=eta, sampling_steps=sampling_steps)
+        return ddim.sample_loop(model, x, ddim.T, 0)
+    if solver == "dpmpp_2m":
+        return _sample_dpmpp_2m(model, x, T=T, sampling_steps=sampling_steps)
+    raise ValueError(f"Unknown solver baseline '{solver}'")
+
+
+def _run_single_solver_baseline_trial(
+    model,
+    target_spec: Dict[str, Any],
+    data_mean: torch.Tensor,
+    data_std: torch.Tensor,
+    reference_cdf_state: Dict[str, Any] | None,
+    *,
+    solver: str,
+    B: int,
+    T: int,
+    sampling_steps: int,
+    eta: float,
+    reference_mode: str,
+    device: str,
+):
+    input_dim = _model_input_dim(model)
+    n0 = int(B // sampling_steps)
+    if n0 < 1:
+        raise ValueError(
+            f"Budget B={B} is too small for solver baseline with {sampling_steps} steps"
+        )
+
+    sampling_start = time.perf_counter()
+    x = torch.randn(n0, input_dim, device=device)
+    samples = _sample_full_solver(
+        model,
+        solver,
+        x,
+        T=T,
+        sampling_steps=sampling_steps,
+        eta=eta,
+        device=device,
+    )
+    samples = denormalize(samples, data_mean, data_std)
+    _sync_device(device)
+    phase2_sampling_time = time.perf_counter() - sampling_start
+
+    ks_start = time.perf_counter()
+    ks_distance, _, _ = _compute_ks_distance(
+        samples, target_spec, reference_mode, reference_cdf_state
+    )
+    phase2_ks_time = time.perf_counter() - ks_start
+
+    return {
+        "ks_distance": float(ks_distance),
+        "realized_cost": int(n0 * sampling_steps),
+        "leaf_count": int(samples.shape[0]),
+        "phase2_sampling_time": float(phase2_sampling_time),
+        "phase2_ks_time": float(phase2_ks_time),
+        "samples": samples.cpu().numpy(),
+    }
+
+
+def run_solver_baseline_sampling(
+    model,
+    target_spec: Dict[str, Any],
+    data_mean: torch.Tensor,
+    data_std: torch.Tensor,
+    reference_cdf_state: Dict[str, Any] | None,
+    *,
+    solver: str,
+    B: int,
+    T: int,
+    sampling_steps: int,
+    eta: float = 0.0,
+    n_runs: int,
+    seed: int | None,
+    device: str,
+    reference_mode: str = "samples",
+    debug: bool = False,
+):
+    if sampling_steps < 1:
+        raise ValueError("sampling_steps must be at least 1")
+    if seed is not None:
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+
+    n0 = int(B // sampling_steps)
+    if n0 < 1:
+        raise ValueError(
+            f"Budget B={B} is too small for solver baseline with {sampling_steps} steps"
+        )
+
+    _debug_log(
+        debug,
+        "Starting solver baseline "
+        f"with solver={solver}, B={B}, sampling_steps={sampling_steps}, eta={eta}",
+    )
+    _debug_log(
+        debug,
+        "Solver baseline sampling setup: "
+        f"n0={n0}, expected_cost_per_root={sampling_steps:.6f}, "
+        f"expected_total_samples={float(n0):.6f}",
+    )
+
+    trial_results = []
+    for run_idx in tqdm(range(n_runs), desc="Runs", leave=False):
+        if seed is not None:
+            run_seed = seed + run_idx
+            torch.manual_seed(run_seed)
+            np.random.seed(run_seed)
+        trial_results.append(
+            _run_single_solver_baseline_trial(
+                model=model,
+                target_spec=target_spec,
+                data_mean=data_mean,
+                data_std=data_std,
+                reference_cdf_state=reference_cdf_state,
+                solver=solver,
+                B=B,
+                T=T,
+                sampling_steps=sampling_steps,
+                eta=eta,
+                reference_mode=reference_mode,
+                device=device,
+            )
+        )
+
+    if not trial_results:
+        raise ValueError("n_runs must be at least 1")
+
+    stats = _summarize_sampling_trials(trial_results)
+    _debug_log(
+        debug,
+        f"Solver baseline sampling complete: mean_ks={stats['mean_ks']:.6f}, "
+        f"extinction_rate={stats['extinction_rate']:.6f}",
+    )
+    expected_total_samples = float(n0)
+    return {
+        "mode": "solver_baseline",
+        "solver": solver,
+        "B": int(B),
+        "B1": 0,
+        "used_B1": 0,
+        "B2": int(B),
+        "sampling_steps": int(sampling_steps),
+        "eta": float(eta),
+        "reference_mode": reference_mode,
+        "solver_nfe": int(sampling_steps),
+        "N_i": [],
+        "n0": int(n0),
+        "final_root_count": int(n0),
+        "expected_cost_per_root": float(sampling_steps),
+        "expected_total_samples": expected_total_samples,
+        "target_spec": target_spec,
+        **stats,
+    }
+
+
 def _mean_scalar(values: Sequence[float | int]):
     if not values:
         return float("nan")
@@ -1291,6 +1518,12 @@ def _mean_vector(values: Sequence[Sequence[float | int]]):
     if not values:
         return []
     return np.mean(np.asarray(values, dtype=float), axis=0).tolist()
+
+
+def _std_vector(values: Sequence[Sequence[float | int]]):
+    if not values:
+        return []
+    return np.std(np.asarray(values, dtype=float), axis=0).tolist()
 
 
 def _mean_grid(values: Sequence[Sequence[Sequence[float]]]):
@@ -1378,7 +1611,7 @@ def _summarize_allocation_messages(messages: Sequence[str]):
 def _active_grid_points_from_dual_weights(
     dual_weights: Sequence[float], x_grid: Sequence[float], grid_shape: Sequence[int]
 ):
-    simplex_tol = 1e-8
+    simplex_tol = 1e-9
     return [
         {
             "point": _grid_index_to_point(point_idx, x_grid, grid_shape),
@@ -1399,7 +1632,8 @@ def _run_sampling_trials(
     split_factors: Sequence[float],
     data_mean: torch.Tensor,
     data_std: torch.Tensor,
-    reference_cdf_state: Dict[str, Any],
+    reference_cdf_state: Dict[str, Any] | None,
+    reference_mode: str,
     debug: bool = False,
 ):
     ks_distances = []
@@ -1424,6 +1658,7 @@ def _run_sampling_trials(
             data_mean=data_mean,
             data_std=data_std,
             reference_cdf_state=reference_cdf_state,
+            reference_mode=reference_mode,
         )
         realized_costs.append(trial_result["realized_cost"])
         leaf_counts.append(trial_result["leaf_count"])
@@ -1468,7 +1703,7 @@ def _run_single_estimate_and_sample_trial(
     target_spec: Dict[str, Any],
     data_mean: torch.Tensor,
     data_std: torch.Tensor,
-    reference_cdf_state: Dict[str, Any],
+    reference_cdf_state: Dict[str, Any] | None,
     *,
     B: int,
     B1: int,
@@ -1482,6 +1717,7 @@ def _run_single_estimate_and_sample_trial(
     reuse_phase1_samples: bool,
     seed: int | None,
     device: str,
+    reference_mode: str,
     debug: bool = False,
 ):
     if seed is not None:
@@ -1619,6 +1855,7 @@ def _run_single_estimate_and_sample_trial(
         data_mean=data_mean,
         data_std=data_std,
         reference_cdf_state=reference_cdf_state,
+        reference_mode=reference_mode,
         phase1_x0_samples=phase1_samples_for_ks,
     )
 
@@ -1665,7 +1902,7 @@ def run_estimate_and_sample(
     target_spec: Dict[str, Any],
     data_mean: torch.Tensor,
     data_std: torch.Tensor,
-    reference_cdf_state: Dict[str, Any],
+    reference_cdf_state: Dict[str, Any] | None,
     *,
     B: int,
     B1: int,
@@ -1680,6 +1917,7 @@ def run_estimate_and_sample(
     n_runs: int,
     seed: int | None,
     device: str,
+    reference_mode: str = "samples",
     debug: bool = False,
 ):
     if B1 < 0:
@@ -1716,6 +1954,7 @@ def run_estimate_and_sample(
                 reuse_phase1_samples=reuse_phase1_samples,
                 seed=run_seed,
                 device=device,
+                reference_mode=reference_mode,
                 debug=debug,
             )
         )
@@ -1747,6 +1986,7 @@ def run_estimate_and_sample(
         "B1": int(B1),
         "sampling_steps": int(sampling_steps),
         "eta": float(eta),
+        "reference_mode": reference_mode,
         "split_percentages": [float(x) for x in split_percentages],
         "split_step_points": trial_results[0]["resolved_step_points"],
         "split_points": trial_results[0]["split_points"],
@@ -1790,6 +2030,8 @@ def run_estimate_and_sample(
             ]
         ),
         "N_i": _mean_vector([trial["N_i"] for trial in trial_results]),
+        "N_i_std": _std_vector([trial["N_i"] for trial in trial_results]),
+        "N_i_count": int(len(trial_results)),
         "n0": _mean_scalar([trial["n0"] for trial in trial_results]),
         "final_root_count": _mean_scalar(
             [trial["final_root_count"] for trial in trial_results]
@@ -1824,7 +2066,7 @@ def run_fixed_N_sampling(
     target_spec: Dict[str, Any],
     data_mean: torch.Tensor,
     data_std: torch.Tensor,
-    reference_cdf_state: Dict[str, Any],
+    reference_cdf_state: Dict[str, Any] | None,
     *,
     B: int,
     T: int,
@@ -1835,6 +2077,7 @@ def run_fixed_N_sampling(
     n_runs: int,
     seed: int | None,
     device: str,
+    reference_mode: str = "samples",
     debug: bool = False,
 ):
     if seed is not None:
@@ -1879,6 +2122,7 @@ def run_fixed_N_sampling(
         data_mean=data_mean,
         data_std=data_std,
         reference_cdf_state=reference_cdf_state,
+        reference_mode=reference_mode,
         debug=debug,
     )
     _debug_log(
@@ -1894,6 +2138,7 @@ def run_fixed_N_sampling(
         "B2": int(B),
         "sampling_steps": int(sampling_steps),
         "eta": float(eta),
+        "reference_mode": reference_mode,
         "split_percentages": [float(x) for x in split_percentages],
         "split_step_points": [int(x) for x in resolved_step_points],
         "split_points": [int(x) for x in split_points],
