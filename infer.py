@@ -1,5 +1,6 @@
 import math
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Sequence, Tuple
 
 import numpy as np
@@ -13,9 +14,13 @@ from utils import (
     get_checkpoint_normalization_stats,
     get_checkpoint_target_spec,
     infer_input_dim_from_checkpoint,
-    mixture_lower_orthant_cdf,
     validate_split_percentages,
 )
+
+KS_QUADRATURE_POINTS = 96
+KS_QUAD_NODES, KS_QUAD_WEIGHTS = np.polynomial.legendre.leggauss(KS_QUADRATURE_POINTS)
+KS_QUAD_NODES = np.ascontiguousarray(KS_QUAD_NODES, dtype=np.float64)
+KS_QUAD_WEIGHTS = np.ascontiguousarray(KS_QUAD_WEIGHTS, dtype=np.float64)
 
 
 class DDIM:
@@ -60,7 +65,7 @@ class DDIM:
     def segment_cost(self, start_t: int, end_t: int) -> int:
         return sum(1 for t in self.timesteps if end_t <= t < start_t)
 
-    def p_sample(self, model, x_t, t, t_prev):
+    def p_sample(self, model, x_t, t, t_prev, generator: torch.Generator | None = None):
         batch_size = x_t.shape[0]
         t_tensor = torch.full((batch_size,), t, device=self.device, dtype=torch.long)
         eps_pred = model(x_t, t_tensor)
@@ -95,13 +100,20 @@ class DDIM:
             + sqrt_one_minus_alpha_bar_t_prev_minus_sigma_sq * eps_pred
         )
 
-        if t_prev >= 0 and sigma > 0:
-            noise = torch.randn_like(x_t)
+        if t_prev >= 0 and self.eta > 0:
+            noise = torch.randn(
+                x_t.shape,
+                device=x_t.device,
+                dtype=x_t.dtype,
+                generator=generator,
+            )
             x_prev = x_prev + sigma * noise
 
         return x_prev
 
-    def sample_loop(self, model, x_T, start_t, end_t):
+    def sample_loop(
+        self, model, x_T, start_t, end_t, generator: torch.Generator | None = None
+    ):
         x = x_T
         relevant_timesteps = [t for t in self.timesteps if end_t <= t < start_t]
 
@@ -111,7 +123,7 @@ class DDIM:
                     t_prev = relevant_timesteps[i + 1]
                 else:
                     t_prev = end_t - 1
-                x = self.p_sample(model, x, t, t_prev)
+                x = self.p_sample(model, x, t, t_prev, generator=generator)
 
         return x
 
@@ -126,6 +138,118 @@ def _coerce_samples_np(samples) -> np.ndarray:
     return samples_np
 
 
+def _coerce_samples_tensor(samples, device=None) -> torch.Tensor:
+    if isinstance(samples, torch.Tensor):
+        tensor = samples.detach()
+        if device is not None:
+            tensor = tensor.to(device=device)
+    else:
+        tensor = torch.as_tensor(samples, device=device)
+    tensor = tensor.to(dtype=torch.float32).reshape(-1, 2).contiguous()
+    if tensor.ndim != 2 or tensor.shape[1] != 2:
+        raise ValueError(f"Expected samples of shape [N, 2], got {tuple(tensor.shape)}")
+    return tensor
+
+
+def _empirical_lower_orthant_cdf_torch(
+    samples: torch.Tensor,
+    points: torch.Tensor,
+    *,
+    max_pairs: int = 16_000_000,
+) -> torch.Tensor:
+    samples = _coerce_samples_tensor(samples, device=points.device)
+    points = _coerce_samples_tensor(points, device=samples.device)
+    if points.shape[0] == 0:
+        return torch.empty(0, device=samples.device, dtype=torch.float32)
+    if samples.shape[0] == 0:
+        raise ValueError("Cannot compute an empirical CDF from zero samples")
+
+    counts = torch.zeros(points.shape[0], device=samples.device, dtype=torch.float32)
+    query_chunk = max(
+        1, min(points.shape[0], int(max_pairs // max(samples.shape[0], 1)))
+    )
+    for q_start in range(0, points.shape[0], query_chunk):
+        q_end = min(q_start + query_chunk, points.shape[0])
+        query = points[q_start:q_end]
+        sample_chunk = max(1, int(max_pairs // max(query.shape[0], 1)))
+        chunk_counts = torch.zeros(
+            query.shape[0], device=samples.device, dtype=torch.float32
+        )
+        for s_start in range(0, samples.shape[0], sample_chunk):
+            s_end = min(s_start + sample_chunk, samples.shape[0])
+            sample = samples[s_start:s_end]
+            in_lower_orthant = (
+                sample[:, 0].unsqueeze(0) <= query[:, 0].unsqueeze(1)
+            ) & (sample[:, 1].unsqueeze(0) <= query[:, 1].unsqueeze(1))
+            chunk_counts += in_lower_orthant.sum(dim=1, dtype=torch.float32)
+        counts[q_start:q_end] = chunk_counts
+    return counts / float(samples.shape[0])
+
+
+def _standard_normal_cdf_torch(values: torch.Tensor) -> torch.Tensor:
+    return 0.5 * (1.0 + torch.erf(values / math.sqrt(2.0)))
+
+
+def _bivariate_normal_lower_orthant_cdf_torch(
+    points: torch.Tensor,
+    mean: torch.Tensor,
+    covariance: torch.Tensor,
+    *,
+    quadrature_points: int = 96,
+) -> torch.Tensor:
+    dtype = points.dtype
+    device = points.device
+    std = torch.sqrt(torch.diag(covariance).clamp_min(torch.finfo(dtype).eps))
+    rho = (covariance[0, 1] / (std[0] * std[1])).clamp(-0.999999, 0.999999)
+    a = (points[:, 0] - mean[0]) / std[0]
+    b = (points[:, 1] - mean[1]) / std[1]
+
+    lower = torch.full_like(a, -12.0)
+    empty_mask = a <= lower
+    upper = torch.maximum(a, lower)
+    nodes_np, weights_np = np.polynomial.legendre.leggauss(quadrature_points)
+    nodes = torch.as_tensor(nodes_np, device=device, dtype=dtype)
+    weights = torch.as_tensor(weights_np, device=device, dtype=dtype)
+
+    half_width = 0.5 * (upper - lower)
+    midpoint = 0.5 * (upper + lower)
+    x = midpoint.unsqueeze(1) + half_width.unsqueeze(1) * nodes.unsqueeze(0)
+    normal_density = torch.exp(-0.5 * x * x) / math.sqrt(2.0 * math.pi)
+    conditional_arg = (b.unsqueeze(1) - rho * x) / torch.sqrt(1.0 - rho * rho)
+    integrand = normal_density * _standard_normal_cdf_torch(conditional_arg)
+    cdf = half_width * torch.sum(weights.unsqueeze(0) * integrand, dim=1)
+    return torch.where(empty_mask, torch.zeros_like(cdf), cdf.clamp(0.0, 1.0))
+
+
+def _mixture_lower_orthant_cdf_torch(
+    points: torch.Tensor,
+    target_spec: Dict[str, Any],
+    *,
+    chunk_size: int = 8192,
+) -> torch.Tensor:
+    points = _coerce_samples_tensor(points)
+    weights = torch.as_tensor(
+        target_spec["weights"], device=points.device, dtype=points.dtype
+    )
+    means = torch.as_tensor(
+        target_spec["means"], device=points.device, dtype=points.dtype
+    )
+    covariances = torch.as_tensor(
+        target_spec["covariances"], device=points.device, dtype=points.dtype
+    )
+    out = torch.empty(points.shape[0], device=points.device, dtype=points.dtype)
+    for start in range(0, points.shape[0], chunk_size):
+        end = min(start + chunk_size, points.shape[0])
+        chunk = points[start:end]
+        cdf = torch.zeros(chunk.shape[0], device=points.device, dtype=points.dtype)
+        for weight, mean, covariance in zip(weights, means, covariances):
+            cdf = cdf + weight * _bivariate_normal_lower_orthant_cdf_torch(
+                chunk, mean, covariance
+            )
+        out[start:end] = cdf
+    return out
+
+
 def _prepare_empirical_cdf_state(samples) -> Dict[str, Any]:
     samples_np = _coerce_samples_np(samples)
     if samples_np.shape[0] == 0:
@@ -135,6 +259,7 @@ def _prepare_empirical_cdf_state(samples) -> Dict[str, Any]:
     x_order = np.argsort(samples_np[:, 0], kind="mergesort")
     return {
         "count": int(samples_np.shape[0]),
+        "samples": _coerce_samples_tensor(samples).detach().cpu(),
         "x_sorted": np.ascontiguousarray(samples_np[x_order, 0], dtype=np.float64),
         "y_ranks_sorted": np.ascontiguousarray(
             y_ranks[x_order].astype(np.int64) + 1, dtype=np.int64
@@ -218,6 +343,409 @@ def _empirical_lower_orthant_cdf_from_state(
     )
 
 
+@njit(cache=True, nogil=True)
+def _segment_tree_update(
+    sums: np.ndarray,
+    max_prefix: np.ndarray,
+    min_prefix: np.ndarray,
+    size: int,
+    index: int,
+    delta: float,
+):
+    pos = size + index
+    sums[pos] += delta
+    max_prefix[pos] = max(0.0, sums[pos])
+    min_prefix[pos] = min(0.0, sums[pos])
+    pos //= 2
+    while pos >= 1:
+        left = pos * 2
+        right = left + 1
+        sums[pos] = sums[left] + sums[right]
+        max_prefix[pos] = max(max_prefix[left], sums[left] + max_prefix[right])
+        min_prefix[pos] = min(min_prefix[left], sums[left] + min_prefix[right])
+        pos //= 2
+
+
+@njit(cache=True, nogil=True)
+def _exact_two_sample_lower_orthant_ks_numba(
+    x_a: np.ndarray,
+    y_rank_a: np.ndarray,
+    x_b: np.ndarray,
+    y_rank_b: np.ndarray,
+    n_y: int,
+) -> float:
+    size = 1
+    while size < n_y:
+        size *= 2
+
+    tree_len = 2 * size
+    sums = np.zeros(tree_len, dtype=np.float64)
+    max_prefix = np.zeros(tree_len, dtype=np.float64)
+    min_prefix = np.zeros(tree_len, dtype=np.float64)
+
+    n_a = x_a.shape[0]
+    n_b = x_b.shape[0]
+    weight_a = 1.0 / float(n_a)
+    weight_b = -1.0 / float(n_b)
+    i = 0
+    j = 0
+    best = 0.0
+
+    while i < n_a or j < n_b:
+        if j >= n_b or (i < n_a and x_a[i] <= x_b[j]):
+            current_x = x_a[i]
+        else:
+            current_x = x_b[j]
+
+        while i < n_a and x_a[i] == current_x:
+            _segment_tree_update(
+                sums, max_prefix, min_prefix, size, int(y_rank_a[i]), weight_a
+            )
+            i += 1
+
+        while j < n_b and x_b[j] == current_x:
+            _segment_tree_update(
+                sums, max_prefix, min_prefix, size, int(y_rank_b[j]), weight_b
+            )
+            j += 1
+
+        if max_prefix[1] > best:
+            best = max_prefix[1]
+        if -min_prefix[1] > best:
+            best = -min_prefix[1]
+
+    return best
+
+
+def _sorted_empirical_ks_inputs(samples: np.ndarray, union_y: np.ndarray):
+    samples_np = np.ascontiguousarray(
+        np.asarray(samples, dtype=np.float64).reshape(-1, 2)
+    )
+    if samples_np.shape[0] == 0:
+        raise ValueError("Cannot compute KS distance from zero samples")
+    order = np.argsort(samples_np[:, 0], kind="mergesort")
+    x_sorted = np.ascontiguousarray(samples_np[order, 0], dtype=np.float64)
+    y_ranks = np.searchsorted(union_y, samples_np[order, 1]).astype(np.int64)
+    return x_sorted, np.ascontiguousarray(y_ranks, dtype=np.int64)
+
+
+def _exact_two_sample_lower_orthant_ks_from_state(
+    samples, reference_cdf_state: Dict[str, Any]
+) -> float:
+    samples_np = _coerce_samples_np(samples)
+    if samples_np.shape[0] == 0:
+        raise ValueError("Cannot compute KS distance from zero samples")
+
+    ref_count = int(reference_cdf_state["count"])
+    if ref_count == 0:
+        raise ValueError("Cannot compute KS distance against zero reference samples")
+
+    ref_y_values = np.asarray(reference_cdf_state["y_values"], dtype=np.float64)
+    union_y = np.unique(np.concatenate([samples_np[:, 1], ref_y_values]))
+    x_a, y_rank_a = _sorted_empirical_ks_inputs(samples_np, union_y)
+
+    ref_rank_map = np.searchsorted(union_y, ref_y_values).astype(np.int64)
+    y_rank_b = ref_rank_map[
+        np.asarray(reference_cdf_state["y_ranks_sorted"], dtype=np.int64) - 1
+    ]
+    x_b = np.ascontiguousarray(reference_cdf_state["x_sorted"], dtype=np.float64)
+    y_rank_b = np.ascontiguousarray(y_rank_b, dtype=np.int64)
+
+    return float(
+        _exact_two_sample_lower_orthant_ks_numba(
+            x_a, y_rank_a, x_b, y_rank_b, int(union_y.shape[0])
+        )
+    )
+
+
+def _mixture_marginal_cdf_torch(
+    values: torch.Tensor, target_spec: Dict[str, Any], dim: int
+) -> torch.Tensor:
+    values = values.reshape(-1)
+    weights = torch.as_tensor(
+        target_spec["weights"], device=values.device, dtype=values.dtype
+    )
+    means = torch.as_tensor(
+        target_spec["means"], device=values.device, dtype=values.dtype
+    )[:, dim]
+    covariances = torch.as_tensor(
+        target_spec["covariances"], device=values.device, dtype=values.dtype
+    )
+    std = torch.sqrt(covariances[:, dim, dim].clamp_min(torch.finfo(values.dtype).eps))
+    z = (values.unsqueeze(1) - means.unsqueeze(0)) / std.unsqueeze(0)
+    return torch.sum(weights.unsqueeze(0) * _standard_normal_cdf_torch(z), dim=1)
+
+
+def _target_spec_arrays(target_spec: Dict[str, Any]):
+    weights = np.ascontiguousarray(target_spec["weights"], dtype=np.float64)
+    means = np.ascontiguousarray(target_spec["means"], dtype=np.float64)
+    covariances = np.ascontiguousarray(target_spec["covariances"], dtype=np.float64)
+    return weights, means, covariances
+
+
+@njit(cache=True, nogil=True)
+def _standard_normal_cdf_numba(value: float) -> float:
+    return 0.5 * (1.0 + math.erf(value / math.sqrt(2.0)))
+
+
+@njit(cache=True, nogil=True)
+def _bivariate_normal_lower_orthant_cdf_numba(
+    x_value: float,
+    y_value: float,
+    mean0: float,
+    mean1: float,
+    cov00: float,
+    cov01: float,
+    cov11: float,
+    quad_nodes: np.ndarray,
+    quad_weights: np.ndarray,
+) -> float:
+    eps = 1e-15
+    std0 = math.sqrt(max(cov00, eps))
+    std1 = math.sqrt(max(cov11, eps))
+    rho = cov01 / (std0 * std1)
+    if rho < -0.999999:
+        rho = -0.999999
+    elif rho > 0.999999:
+        rho = 0.999999
+
+    a = (x_value - mean0) / std0
+    b = (y_value - mean1) / std1
+    lower = -12.0
+    if a <= lower:
+        return 0.0
+
+    half_width = 0.5 * (a - lower)
+    midpoint = 0.5 * (a + lower)
+    denom = math.sqrt(1.0 - rho * rho)
+    total = 0.0
+    for idx in range(quad_nodes.shape[0]):
+        z = midpoint + half_width * quad_nodes[idx]
+        normal_density = math.exp(-0.5 * z * z) / math.sqrt(2.0 * math.pi)
+        conditional_arg = (b - rho * z) / denom
+        total += (
+            quad_weights[idx]
+            * normal_density
+            * _standard_normal_cdf_numba(conditional_arg)
+        )
+    cdf = half_width * total
+    if cdf < 0.0:
+        return 0.0
+    if cdf > 1.0:
+        return 1.0
+    return cdf
+
+
+@njit(cache=True, nogil=True)
+def _mixture_lower_orthant_cdf_numba(
+    x_value: float,
+    y_value: float,
+    weights: np.ndarray,
+    means: np.ndarray,
+    covariances: np.ndarray,
+    quad_nodes: np.ndarray,
+    quad_weights: np.ndarray,
+) -> float:
+    total = 0.0
+    for idx in range(weights.shape[0]):
+        total += weights[idx] * _bivariate_normal_lower_orthant_cdf_numba(
+            x_value,
+            y_value,
+            means[idx, 0],
+            means[idx, 1],
+            covariances[idx, 0, 0],
+            covariances[idx, 0, 1],
+            covariances[idx, 1, 1],
+            quad_nodes,
+            quad_weights,
+        )
+    if total < 0.0:
+        return 0.0
+    if total > 1.0:
+        return 1.0
+    return total
+
+
+@njit(cache=True, nogil=True)
+def _mixture_marginal_cdf_numba(
+    value: float,
+    dim: int,
+    weights: np.ndarray,
+    means: np.ndarray,
+    covariances: np.ndarray,
+) -> float:
+    total = 0.0
+    for idx in range(weights.shape[0]):
+        variance = covariances[idx, dim, dim]
+        std = math.sqrt(max(variance, 1e-15))
+        total += weights[idx] * _standard_normal_cdf_numba(
+            (value - means[idx, dim]) / std
+        )
+    if total < 0.0:
+        return 0.0
+    if total > 1.0:
+        return 1.0
+    return total
+
+
+@njit(cache=True, nogil=True)
+def _exact_empirical_target_lower_orthant_ks_numba(
+    x_values: np.ndarray,
+    x_counts: np.ndarray,
+    y_values: np.ndarray,
+    y_ranks_by_x: np.ndarray,
+    weights: np.ndarray,
+    means: np.ndarray,
+    covariances: np.ndarray,
+    quad_nodes: np.ndarray,
+    quad_weights: np.ndarray,
+    n_samples: int,
+) -> float:
+    counts_by_y = np.zeros(y_values.shape[0], dtype=np.int64)
+    group_counts_by_y = np.zeros(y_values.shape[0], dtype=np.int64)
+    inv_n = 1.0 / float(n_samples)
+    best = 0.0
+    cursor = 0
+
+    for x_idx in range(x_values.shape[0]):
+        x_value = x_values[x_idx]
+        x_count = int(x_counts[x_idx])
+        before_total = cursor
+
+        for offset in range(x_count):
+            y_rank = int(y_ranks_by_x[cursor + offset])
+            counts_by_y[y_rank] += 1
+            group_counts_by_y[y_rank] += 1
+
+        cursor += x_count
+        marginal_x = _mixture_marginal_cdf_numba(
+            x_value, 0, weights, means, covariances
+        )
+        diff = abs(before_total * inv_n - marginal_x)
+        if diff > best:
+            best = diff
+        diff = abs(cursor * inv_n - marginal_x)
+        if diff > best:
+            best = diff
+
+        prefix_after = 0
+        group_prefix = 0
+        for y_idx in range(y_values.shape[0]):
+            current_y_count = counts_by_y[y_idx]
+            current_group_count = group_counts_by_y[y_idx]
+            prefix_after += current_y_count
+            group_prefix += current_group_count
+
+            prefix_before = prefix_after - group_prefix
+            prefix_after_y_before = prefix_after - current_y_count
+            prefix_before_y_before = prefix_before - (
+                current_y_count - current_group_count
+            )
+            target_cdf = _mixture_lower_orthant_cdf_numba(
+                x_value,
+                y_values[y_idx],
+                weights,
+                means,
+                covariances,
+                quad_nodes,
+                quad_weights,
+            )
+
+            diff = abs(prefix_after * inv_n - target_cdf)
+            if diff > best:
+                best = diff
+            diff = abs(prefix_before * inv_n - target_cdf)
+            if diff > best:
+                best = diff
+            diff = abs(prefix_after_y_before * inv_n - target_cdf)
+            if diff > best:
+                best = diff
+            diff = abs(prefix_before_y_before * inv_n - target_cdf)
+            if diff > best:
+                best = diff
+
+        for offset in range(x_count):
+            group_counts_by_y[int(y_ranks_by_x[cursor - x_count + offset])] = 0
+
+    prefix_y = 0
+    for y_idx in range(y_values.shape[0]):
+        prefix_y += counts_by_y[y_idx]
+        target_marginal = _mixture_marginal_cdf_numba(
+            y_values[y_idx], 1, weights, means, covariances
+        )
+        diff = abs(prefix_y * inv_n - target_marginal)
+        if diff > best:
+            best = diff
+        diff = abs((prefix_y - counts_by_y[y_idx]) * inv_n - target_marginal)
+        if diff > best:
+            best = diff
+
+    return best
+
+
+def _exact_empirical_target_lower_orthant_ks(
+    samples,
+    target_spec: Dict[str, Any],
+    device: torch.device | None = None,
+) -> float:
+    samples_np = _coerce_samples_np(samples)
+    n_samples = int(samples_np.shape[0])
+    if n_samples == 0:
+        raise ValueError("Cannot compute KS distance from zero samples")
+
+    x_values, x_counts = np.unique(samples_np[:, 0], return_counts=True)
+    y_values, y_inverse = np.unique(samples_np[:, 1], return_inverse=True)
+    x_order = np.argsort(samples_np[:, 0], kind="mergesort")
+    y_ranks_by_x = np.ascontiguousarray(y_inverse[x_order], dtype=np.int64)
+    weights, means, covariances = _target_spec_arrays(target_spec)
+    return float(
+        _exact_empirical_target_lower_orthant_ks_numba(
+            np.ascontiguousarray(x_values, dtype=np.float64),
+            np.ascontiguousarray(x_counts, dtype=np.int64),
+            np.ascontiguousarray(y_values, dtype=np.float64),
+            y_ranks_by_x,
+            weights,
+            means,
+            covariances,
+            KS_QUAD_NODES,
+            KS_QUAD_WEIGHTS,
+            n_samples,
+        )
+    )
+
+
+def _warm_target_ks_kernel(target_spec: Dict[str, Any]):
+    weights, means, covariances = _target_spec_arrays(target_spec)
+    _exact_empirical_target_lower_orthant_ks_numba(
+        np.ascontiguousarray([0.0], dtype=np.float64),
+        np.ascontiguousarray([1], dtype=np.int64),
+        np.ascontiguousarray([0.0], dtype=np.float64),
+        np.ascontiguousarray([0], dtype=np.int64),
+        weights,
+        means,
+        covariances,
+        KS_QUAD_NODES,
+        KS_QUAD_WEIGHTS,
+        1,
+    )
+
+
+def _warm_ks_kernel_for_mode(
+    reference_mode: str,
+    target_spec: Dict[str, Any],
+):
+    if reference_mode == "true_dist":
+        _warm_target_ks_kernel(target_spec)
+    elif reference_mode in {"true_samples", "ddpm_samples"}:
+        _exact_two_sample_lower_orthant_ks_numba(
+            np.ascontiguousarray([0.0], dtype=np.float64),
+            np.ascontiguousarray([0], dtype=np.int64),
+            np.ascontiguousarray([0.0], dtype=np.float64),
+            np.ascontiguousarray([0], dtype=np.int64),
+            1,
+        )
+
+
 def warm_reference_ks_kernel(reference_cdf_state: Dict[str, Any]):
     sample_x = reference_cdf_state["x_sorted"][0]
     sample_y = reference_cdf_state["y_values"][0]
@@ -229,34 +757,30 @@ def warm_reference_ks_kernel(reference_cdf_state: Dict[str, Any]):
         warm_points,
         int(reference_cdf_state["count"]),
     )
+    _exact_two_sample_lower_orthant_ks_numba(
+        np.ascontiguousarray([sample_x], dtype=np.float64),
+        np.ascontiguousarray([0], dtype=np.int64),
+        np.ascontiguousarray([sample_x], dtype=np.float64),
+        np.ascontiguousarray([0], dtype=np.int64),
+        1,
+    )
 
 
 def compute_reference_ks_distance(samples, reference_cdf_state: Dict[str, Any]):
-    """Compute 2D lower-orthant KS distance against a cached empirical reference."""
-    samples_np = _coerce_samples_np(samples)
-    candidate_points = np.unique(samples_np, axis=0)
-    sample_cdf_state = _prepare_empirical_cdf_state(samples_np)
-    empirical_cdf = _empirical_lower_orthant_cdf_from_state(
-        sample_cdf_state, candidate_points
+    """Compute exact 2D lower-orthant KS distance against empirical samples."""
+    ks_distance = _exact_two_sample_lower_orthant_ks_from_state(
+        samples, reference_cdf_state
     )
-    reference_cdf = _empirical_lower_orthant_cdf_from_state(
-        reference_cdf_state, candidate_points
-    )
-    ks_distance = float(np.max(np.abs(empirical_cdf - reference_cdf)))
-    return ks_distance, empirical_cdf, reference_cdf
+    empty = torch.empty(0)
+    return ks_distance, empty, empty
 
 
 def compute_target_ks_distance(samples, target_spec: Dict[str, Any]):
-    """Compute 2D lower-orthant KS distance against the exact target CDF."""
+    """Compute exact 2D lower-orthant KS distance against the target CDF."""
     samples_np = _coerce_samples_np(samples)
-    candidate_points = np.unique(samples_np, axis=0)
-    sample_cdf_state = _prepare_empirical_cdf_state(samples_np)
-    empirical_cdf = _empirical_lower_orthant_cdf_from_state(
-        sample_cdf_state, candidate_points
-    )
-    target_cdf = mixture_lower_orthant_cdf(candidate_points, target_spec)
-    ks_distance = float(np.max(np.abs(empirical_cdf - target_cdf)))
-    return ks_distance, empirical_cdf, target_cdf
+    ks_distance = _exact_empirical_target_lower_orthant_ks(samples_np, target_spec)
+    empty = torch.empty(0)
+    return ks_distance, empty, empty
 
 
 def _compute_ks_distance(
@@ -265,10 +789,10 @@ def _compute_ks_distance(
     reference_mode: str,
     reference_cdf_state: Dict[str, Any] | None,
 ):
-    if reference_mode == "samples":
+    if reference_mode in {"true_samples", "ddpm_samples"}:
         if reference_cdf_state is None:
             raise ValueError(
-                "reference_cdf_state is required when reference_mode='samples'"
+                f"reference_cdf_state is required when reference_mode='{reference_mode}'"
             )
         return compute_reference_ks_distance(samples, reference_cdf_state)
     if reference_mode == "true_dist":
@@ -276,10 +800,17 @@ def _compute_ks_distance(
     raise ValueError(f"Unknown reference_mode '{reference_mode}'")
 
 
-def _sample_loop(ddim: DDIM, model, x: torch.Tensor, start_t: int, end_t: int):
+def _sample_loop(
+    ddim: DDIM,
+    model,
+    x: torch.Tensor,
+    start_t: int,
+    end_t: int,
+    generator: torch.Generator | None = None,
+):
     if x.shape[0] == 0:
         return x
-    return ddim.sample_loop(model, x, start_t, end_t)
+    return ddim.sample_loop(model, x, start_t, end_t, generator=generator)
 
 
 def _parse_split_percentages(split_percentages_str: str) -> List[float]:
@@ -300,6 +831,26 @@ def _parse_x_grid(x_grid_str: str) -> List[float]:
 def _debug_log(enabled: bool, message: str):
     if enabled:
         print(f"[debug] {message}")
+
+
+def _make_torch_generator(seed: int | None, device: str):
+    if seed is None:
+        return None
+    generator = torch.Generator(device=torch.device(device))
+    generator.manual_seed(int(seed))
+    return generator
+
+
+PHASE2_SEED_OFFSET = 1_000_000
+
+
+def _iter_run_chunks(n_runs: int, n_parallel: int):
+    if n_runs < 1:
+        raise ValueError("n_runs must be at least 1")
+    if n_parallel < 1:
+        raise ValueError("n_parallel must be at least 1")
+    for start in range(0, n_runs, n_parallel):
+        yield start, min(start + n_parallel, n_runs)
 
 
 def _resolve_split_percentages(
@@ -344,11 +895,13 @@ def _load_model_and_stats(args):
     ).to(args.device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
-    if hasattr(torch, "compile"):
+    if hasattr(torch, "compile") and not getattr(args, "no_compile", False):
         model = torch.compile(model, dynamic=True)
         _debug_log(
             getattr(args, "debug", False), "Compiled denoiser with torch.compile"
         )
+    elif getattr(args, "no_compile", False):
+        _debug_log(getattr(args, "debug", False), "Skipped torch.compile")
 
     target_spec = get_checkpoint_target_spec(checkpoint)
     data_mean, data_std = get_checkpoint_normalization_stats(
@@ -499,7 +1052,12 @@ def _derive_independent_counts(
     return budget_per_sigma, counts_by_sigma, int(total_used_B1)
 
 
-def _sample_branch_counts(num_parents: int, branching_factor: float, device: str):
+def _sample_branch_counts(
+    num_parents: int,
+    branching_factor: float,
+    device: str,
+    generator: torch.Generator | None = None,
+):
     if branching_factor <= 1.0:
         raise ValueError("Branching factor must be > 1 so parents can have children")
 
@@ -507,9 +1065,9 @@ def _sample_branch_counts(num_parents: int, branching_factor: float, device: str
     extra_prob = branching_factor - base_copies
     counts = torch.full((num_parents,), base_copies, device=device, dtype=torch.long)
     if extra_prob > 0.0:
-        counts = counts + (torch.rand(num_parents, device=device) < extra_prob).to(
-            torch.long
-        )
+        counts = counts + (
+            torch.rand(num_parents, device=device, generator=generator) < extra_prob
+        ).to(torch.long)
     return counts
 
 
@@ -532,42 +1090,64 @@ def _actual_pilot_cost(
     return int(cost)
 
 
-def _build_pilot_tree(
+def _build_pilot_tree_batch(
     model,
     ddim: DDIM,
+    chunk_size: int,
     pilot_roots: int,
     split_points: Sequence[int],
     m_pilot: float,
+    generator: torch.Generator | None = None,
 ):
     input_dim = _model_input_dim(model)
-    root_x_T = torch.randn(pilot_roots, input_dim, device=ddim.device)
-    x = root_x_T
-    level_counts = []
+    x = torch.randn(
+        chunk_size * pilot_roots,
+        input_dim,
+        device=ddim.device,
+        generator=generator,
+    )
+    run_ids = torch.repeat_interleave(
+        torch.arange(chunk_size, device=ddim.device, dtype=torch.long),
+        pilot_roots,
+    )
     child_counts_by_level = []
+    parent_run_ids_by_level = []
+    used_B1_by_run = torch.zeros(chunk_size, device=ddim.device, dtype=torch.long)
 
     for idx, split_point in enumerate(split_points):
-        child_counts = _sample_branch_counts(x.shape[0], m_pilot, ddim.device)
-        child_counts_by_level.append(child_counts.cpu())
+        parent_run_ids = run_ids
+        child_counts = _sample_branch_counts(
+            x.shape[0], m_pilot, ddim.device, generator=generator
+        )
+        child_counts_by_level.append(child_counts)
+        parent_run_ids_by_level.append(parent_run_ids)
         x = _repeat_by_counts(x, child_counts)
+        run_ids = run_ids.repeat_interleave(child_counts, dim=0)
         start_t = ddim.T if idx == 0 else split_points[idx - 1]
-        x = _sample_loop(ddim, model, x, start_t, split_point)
-        level_counts.append(int(x.shape[0]))
+        x = _sample_loop(ddim, model, x, start_t, split_point, generator=generator)
+        used_B1_by_run = used_B1_by_run + torch.bincount(
+            run_ids, minlength=chunk_size
+        ) * int(ddim.segment_cost(start_t, split_point))
 
-    child_counts = _sample_branch_counts(x.shape[0], m_pilot, ddim.device)
-    child_counts_by_level.append(child_counts.cpu())
+    parent_run_ids = run_ids
+    child_counts = _sample_branch_counts(
+        x.shape[0], m_pilot, ddim.device, generator=generator
+    )
+    child_counts_by_level.append(child_counts)
+    parent_run_ids_by_level.append(parent_run_ids)
     x = _repeat_by_counts(x, child_counts)
-    x = _sample_loop(ddim, model, x, split_points[-1], 0)
+    run_ids = run_ids.repeat_interleave(child_counts, dim=0)
+    x = _sample_loop(ddim, model, x, split_points[-1], 0, generator=generator)
+    used_B1_by_run = used_B1_by_run + torch.bincount(
+        run_ids, minlength=chunk_size
+    ) * int(ddim.segment_cost(split_points[-1], 0))
 
-    leaf_x0 = x
-    leaf_count = int(leaf_x0.shape[0])
-    actual_cost = _actual_pilot_cost(ddim, split_points, level_counts, leaf_count)
     return (
-        root_x_T,
-        leaf_x0,
-        level_counts,
-        leaf_count,
+        x,
+        run_ids,
         child_counts_by_level,
-        actual_cost,
+        parent_run_ids_by_level,
+        used_B1_by_run.detach().cpu().tolist(),
     )
 
 
@@ -598,9 +1178,116 @@ def _segment_mean_and_unbiased_var(values: torch.Tensor, counts: torch.Tensor):
     return means, variances[valid_mask]
 
 
+def _segment_mean_and_unbiased_var_all(values: torch.Tensor, counts: torch.Tensor):
+    counts = counts.to(device=values.device, dtype=torch.long)
+    means = torch.segment_reduce(values, reduce="mean", lengths=counts)
+    sums = torch.segment_reduce(values, reduce="sum", lengths=counts)
+    sums_sq = torch.segment_reduce(values * values, reduce="sum", lengths=counts)
+    count_values = counts.to(dtype=values.dtype).unsqueeze(1)
+    denom = torch.clamp(count_values - 1.0, min=1.0)
+    variances = (sums_sq - (sums * sums) / count_values) / denom
+    variances = torch.clamp(variances, min=0.0)
+    valid_mask = counts >= 2
+    return means, variances, valid_mask
+
+
+def _grouped_mean(values: torch.Tensor, group_ids: torch.Tensor, num_groups: int):
+    if values.ndim != 2:
+        raise ValueError(f"values must be 2D, got shape {tuple(values.shape)}")
+    group_ids = group_ids.to(device=values.device, dtype=torch.long)
+    sums = torch.zeros(
+        num_groups, values.shape[1], device=values.device, dtype=values.dtype
+    )
+    sums.index_add_(0, group_ids, values)
+    counts = torch.bincount(group_ids, minlength=num_groups).to(
+        device=values.device, dtype=values.dtype
+    )
+    safe_counts = counts.clamp_min(1.0).unsqueeze(1)
+    return sums / safe_counts, counts
+
+
+def _grouped_unbiased_var(
+    values: torch.Tensor, group_ids: torch.Tensor, num_groups: int
+):
+    if values.ndim != 2:
+        raise ValueError(f"values must be 2D, got shape {tuple(values.shape)}")
+    group_ids = group_ids.to(device=values.device, dtype=torch.long)
+    sums = torch.zeros(
+        num_groups, values.shape[1], device=values.device, dtype=values.dtype
+    )
+    sums_sq = torch.zeros_like(sums)
+    sums.index_add_(0, group_ids, values)
+    sums_sq.index_add_(0, group_ids, values * values)
+    counts = torch.bincount(group_ids, minlength=num_groups).to(
+        device=values.device, dtype=values.dtype
+    )
+    safe_counts = counts.clamp_min(1.0).unsqueeze(1)
+    denom = torch.clamp(safe_counts - 1.0, min=1.0)
+    variances = (sums_sq - (sums * sums) / safe_counts) / denom
+    variances = torch.where(
+        (counts >= 2).unsqueeze(1),
+        torch.clamp(variances, min=0.0),
+        torch.zeros_like(variances),
+    )
+    means = sums / safe_counts
+    return variances, means, counts
+
+
 def _grid_tensor_to_nested_list(values: torch.Tensor, x_grid: Sequence[float]):
     grid_size = len(x_grid)
     return values.reshape(grid_size, grid_size).detach().cpu().tolist()
+
+
+def _sigma_estimate_from_flat(
+    sigma_time: int,
+    sigma2_flat: torch.Tensor,
+    sigma_flat: torch.Tensor,
+    p_hat_mean_flat: torch.Tensor,
+    x_grid: Sequence[float],
+):
+    sigma2_grid = _grid_tensor_to_nested_list(sigma2_flat, x_grid)
+    sigma_grid = _grid_tensor_to_nested_list(sigma_flat, x_grid)
+    p_hat_mean_grid = _grid_tensor_to_nested_list(p_hat_mean_flat, x_grid)
+    sigma2_array = np.array(sigma2_grid, dtype=float)
+    max_index = np.unravel_index(np.argmax(sigma2_array), sigma2_array.shape)
+    return {
+        "time": int(sigma_time),
+        "x_grid": list(x_grid),
+        "sigma2_grid": sigma2_grid,
+        "sigma_grid": sigma_grid,
+        "p_hat_mean_grid": p_hat_mean_grid,
+        "sigma2_max": float(sigma2_array[max_index]),
+        "sigma": float(math.sqrt(max(float(sigma2_array[max_index]), 0.0))),
+        "max_location": [
+            float(x_grid[max_index[0]]),
+            float(x_grid[max_index[1]]),
+        ],
+    }
+
+
+def _tau_estimate_from_flat(
+    tau2_flat: torch.Tensor,
+    tau_flat: torch.Tensor,
+    tau_mean_flat: torch.Tensor,
+    x_grid: Sequence[float],
+):
+    tau2_grid = _grid_tensor_to_nested_list(tau2_flat, x_grid)
+    tau_grid = _grid_tensor_to_nested_list(tau_flat, x_grid)
+    tau_mean_grid = _grid_tensor_to_nested_list(tau_mean_flat, x_grid)
+    tau2_array = np.array(tau2_grid, dtype=float)
+    tau_max_index = np.unravel_index(np.argmax(tau2_array), tau2_array.shape)
+    return {
+        "x_grid": list(x_grid),
+        "tau2_grid": tau2_grid,
+        "tau_grid": tau_grid,
+        "p_hat_mean_grid": tau_mean_grid,
+        "tau2_max": float(tau2_array[tau_max_index]),
+        "tau": float(math.sqrt(max(float(tau2_array[tau_max_index]), 0.0))),
+        "max_location": [
+            float(x_grid[tau_max_index[0]]),
+            float(x_grid[tau_max_index[1]]),
+        ],
+    }
 
 
 def _estimate_sigmas_from_tree(
@@ -699,151 +1386,119 @@ def _estimate_sigmas_from_tree(
     return estimates, tau_estimate
 
 
-def _sync_device(device):
-    if torch.cuda.is_available() and str(device).startswith("cuda"):
-        torch.cuda.synchronize(torch.device(device))
-
-
-def _estimate_sigmas_independently(
-    model,
-    ddim: DDIM,
+def _estimate_sigmas_from_tree_batch(
+    leaf_x0: torch.Tensor,
+    leaf_run_ids: torch.Tensor,
     sigma_times: Sequence[int],
-    counts_by_sigma: Sequence[Dict[str, int]],
+    child_counts_by_level: Sequence[torch.Tensor],
+    parent_run_ids_by_level: Sequence[torch.Tensor],
     x_grid: Sequence[float],
-    data_mean: torch.Tensor,
-    data_std: torch.Tensor,
-    collect_phase1_samples: bool = False,
+    chunk_size: int,
 ):
-    estimates = []
-    next_times = list(sigma_times[1:]) + [0]
-    if len(counts_by_sigma) != len(sigma_times):
-        raise ValueError(
-            f"counts_by_sigma must have length {len(sigma_times)}, got {len(counts_by_sigma)}"
+    num_levels = len(sigma_times)
+    if len(child_counts_by_level) != num_levels:
+        raise ValueError("child_counts_by_level must match sigma_times length")
+    if len(parent_run_ids_by_level) != num_levels:
+        raise ValueError("parent_run_ids_by_level must match sigma_times length")
+
+    current = _rectangle_indicator_grid(leaf_x0, x_grid)
+    current_run_ids = leaf_run_ids.to(device=current.device, dtype=torch.long)
+    grid_size = len(x_grid)
+    num_grid_points = grid_size * grid_size
+    sigma2_by_level = [None] * num_levels
+    sigma_by_level = [None] * num_levels
+    mean_by_level = [None] * num_levels
+
+    for rev_idx in range(num_levels - 1, -1, -1):
+        counts = child_counts_by_level[rev_idx].to(
+            device=current.device, dtype=torch.long
         )
-    used_B1 = 0
-    input_dim = _model_input_dim(model)
-    tau2_grid = []
-    tau_grid = []
-    tau_mean_grid = []
-    phase1_samples = []
-    sampling_time = 0.0
-    aggregation_time = 0.0
-
-    for idx, ((t_curr, t_next), count_spec) in enumerate(
-        zip(zip(sigma_times, next_times), counts_by_sigma)
-    ):
-        outer_count = int(count_spec["outer_count"])
-        middle_count = int(count_spec["middle_count"])
-        inner_count = int(count_spec["inner_count"])
-        sampling_start = time.perf_counter()
-        root_x_T = torch.randn(outer_count, input_dim, device=ddim.device)
-
-        x_curr = _sample_loop(ddim, model, root_x_T, ddim.T, t_curr)
-
-        middle_counts = torch.full(
-            (x_curr.shape[0],), middle_count, device=ddim.device, dtype=torch.long
+        parent_run_ids = parent_run_ids_by_level[rev_idx].to(
+            device=current.device, dtype=torch.long
         )
-        x_curr_rep = _repeat_by_counts(x_curr, middle_counts)
-        x_next = _sample_loop(ddim, model, x_curr_rep, t_curr, t_next)
+        if counts.shape[0] != parent_run_ids.shape[0]:
+            raise ValueError("Pilot tree parent run ids do not match child counts")
 
-        inner_counts = torch.full(
-            (x_next.shape[0],), inner_count, device=ddim.device, dtype=torch.long
-        )
-        x_next_rep = _repeat_by_counts(x_next, inner_counts)
-        x_0 = _sample_loop(ddim, model, x_next_rep, t_next, 0)
-        x_0 = denormalize(x_0, data_mean, data_std)
-        _sync_device(ddim.device)
-        sampling_time += time.perf_counter() - sampling_start
-
-        if collect_phase1_samples:
-            phase1_samples.append(x_0)
-
-        used_B1 += _independent_sigma_cost(
-            ddim, t_curr, t_next, outer_count, middle_count, inner_count
+        child_means, child_vars, valid_mask = _segment_mean_and_unbiased_var_all(
+            current, counts
         )
 
-        aggregation_start = time.perf_counter()
-        indicators = _rectangle_indicator_grid(x_0, x_grid)
-        num_grid_points = indicators.shape[1]
-        indicators = indicators.reshape(
-            outer_count, middle_count, inner_count, num_grid_points
+        sigma2_flat, _ = _grouped_mean(
+            child_vars[valid_mask], parent_run_ids[valid_mask], chunk_size
         )
-        middle_means = indicators.mean(dim=2)
-        if middle_count < 2:
-            raise ValueError("Independent sigma estimation needs middle_count >= 2")
+        mean_flat, _ = _grouped_mean(child_means, parent_run_ids, chunk_size)
+        sigma2_by_level[rev_idx] = sigma2_flat
+        sigma_by_level[rev_idx] = torch.sqrt(torch.clamp(sigma2_flat, min=0.0))
+        mean_by_level[rev_idx] = mean_flat
+        current = child_means
+        current_run_ids = parent_run_ids
 
-        p_hat_mean_flat = middle_means.mean(dim=(0, 1))
-        outer_vars = torch.clamp(middle_means.var(dim=1, unbiased=True), min=0.0)
-        sigma2_flat = outer_vars.mean(dim=0)
-        sigma_flat = torch.sqrt(torch.clamp(sigma2_flat, min=0.0))
-        outer_means = middle_means.mean(dim=1)
-        if outer_means.shape[0] >= 2:
-            tau2_flat = torch.clamp(outer_means.var(dim=0, unbiased=True), min=0.0)
-        else:
-            tau2_flat = torch.zeros(num_grid_points, device=x_0.device, dtype=x_0.dtype)
-        tau_flat = torch.sqrt(torch.clamp(tau2_flat, min=0.0))
-        tau_mean_flat = outer_means.mean(dim=0)
+    tau2_by_run, tau_mean_by_run, _ = _grouped_unbiased_var(
+        current, current_run_ids, chunk_size
+    )
+    tau_by_run = torch.sqrt(torch.clamp(tau2_by_run, min=0.0))
 
-        sigma2_grid = _grid_tensor_to_nested_list(sigma2_flat, x_grid)
-        sigma_grid = _grid_tensor_to_nested_list(sigma_flat, x_grid)
-        p_hat_mean_grid = _grid_tensor_to_nested_list(p_hat_mean_flat, x_grid)
-        tau2_rows_local = _grid_tensor_to_nested_list(tau2_flat, x_grid)
-        tau_rows_local = _grid_tensor_to_nested_list(tau_flat, x_grid)
-        tau_mean_rows_local = _grid_tensor_to_nested_list(tau_mean_flat, x_grid)
+    sigma2_np = torch.stack(sigma2_by_level, dim=1).detach().cpu().numpy()
+    sigma_np = torch.stack(sigma_by_level, dim=1).detach().cpu().numpy()
+    mean_np = torch.stack(mean_by_level, dim=1).detach().cpu().numpy()
+    tau2_np = tau2_by_run.detach().cpu().numpy()
+    tau_np = tau_by_run.detach().cpu().numpy()
+    tau_mean_np = tau_mean_by_run.detach().cpu().numpy()
 
-        if idx == 0:
-            tau2_grid = tau2_rows_local
-            tau_grid = tau_rows_local
-            tau_mean_grid = tau_mean_rows_local
+    sigma_estimates_by_run = []
+    tau_estimates = []
+    for run_idx in range(chunk_size):
+        run_estimates = []
+        for level_idx, sigma_time in enumerate(sigma_times):
+            sigma2_grid = (
+                sigma2_np[run_idx, level_idx].reshape(grid_size, grid_size).tolist()
+            )
+            sigma_grid = (
+                sigma_np[run_idx, level_idx].reshape(grid_size, grid_size).tolist()
+            )
+            p_hat_mean_grid = (
+                mean_np[run_idx, level_idx].reshape(grid_size, grid_size).tolist()
+            )
+            sigma2_array = np.asarray(sigma2_grid, dtype=float)
+            max_index = np.unravel_index(np.argmax(sigma2_array), sigma2_array.shape)
+            run_estimates.append(
+                {
+                    "time": int(sigma_time),
+                    "x_grid": list(x_grid),
+                    "sigma2_grid": sigma2_grid,
+                    "sigma_grid": sigma_grid,
+                    "p_hat_mean_grid": p_hat_mean_grid,
+                    "sigma2_max": float(sigma2_array[max_index]),
+                    "sigma": float(math.sqrt(max(float(sigma2_array[max_index]), 0.0))),
+                    "max_location": [
+                        float(x_grid[max_index[0]]),
+                        float(x_grid[max_index[1]]),
+                    ],
+                }
+            )
 
-        sigma2_array = np.array(sigma2_grid, dtype=float)
-        max_index = np.unravel_index(np.argmax(sigma2_array), sigma2_array.shape)
-        estimates.append(
+        tau2_grid = tau2_np[run_idx].reshape(grid_size, grid_size).tolist()
+        tau_grid = tau_np[run_idx].reshape(grid_size, grid_size).tolist()
+        tau_mean_grid = tau_mean_np[run_idx].reshape(grid_size, grid_size).tolist()
+        tau2_array = np.asarray(tau2_grid, dtype=float)
+        tau_max_index = np.unravel_index(np.argmax(tau2_array), tau2_array.shape)
+        tau_estimates.append(
             {
-                "time": t_curr,
                 "x_grid": list(x_grid),
-                "sigma2_grid": sigma2_grid,
-                "sigma_grid": sigma_grid,
-                "p_hat_mean_grid": p_hat_mean_grid,
-                "sigma2_max": float(sigma2_array[max_index]),
-                "sigma": float(math.sqrt(max(float(sigma2_array[max_index]), 0.0))),
+                "tau2_grid": tau2_grid,
+                "tau_grid": tau_grid,
+                "p_hat_mean_grid": tau_mean_grid,
+                "tau2_max": float(tau2_array[tau_max_index]),
+                "tau": float(math.sqrt(max(float(tau2_array[tau_max_index]), 0.0))),
                 "max_location": [
-                    float(x_grid[max_index[0]]),
-                    float(x_grid[max_index[1]]),
+                    float(x_grid[tau_max_index[0]]),
+                    float(x_grid[tau_max_index[1]]),
                 ],
             }
         )
-        _sync_device(ddim.device)
-        aggregation_time += time.perf_counter() - aggregation_start
+        sigma_estimates_by_run.append(run_estimates)
 
-    tau2_array = np.array(tau2_grid, dtype=float)
-    tau_max_index = np.unravel_index(np.argmax(tau2_array), tau2_array.shape)
-    tau_estimate = {
-        "x_grid": list(x_grid),
-        "tau2_grid": tau2_grid,
-        "tau_grid": tau_grid,
-        "p_hat_mean_grid": tau_mean_grid,
-        "tau2_max": float(tau2_array[tau_max_index]),
-        "tau": float(math.sqrt(max(float(tau2_array[tau_max_index]), 0.0))),
-        "max_location": [
-            float(x_grid[tau_max_index[0]]),
-            float(x_grid[tau_max_index[1]]),
-        ],
-    }
-
-    if phase1_samples:
-        phase1_x0 = torch.cat(phase1_samples, dim=0)
-    else:
-        phase1_x0 = torch.empty((0, input_dim), device=ddim.device)
-
-    return (
-        phase1_x0,
-        estimates,
-        tau_estimate,
-        int(used_B1),
-        sampling_time,
-        aggregation_time,
-    )
+    return sigma_estimates_by_run, tau_estimates
 
 
 def _build_sigma2_matrix(
@@ -896,6 +1551,15 @@ def _build_sigma2_matrix(
     return np.stack(sigma2_columns, axis=1), grid_shape
 
 
+def _segment_costs(ddim: DDIM, split_points: Sequence[int]) -> List[float]:
+    start_points = [ddim.T] + list(split_points)
+    end_points = list(split_points) + [0]
+    return [
+        float(ddim.segment_cost(start_t, end_t))
+        for start_t, end_t in zip(start_points, end_points)
+    ]
+
+
 def _grid_index_to_point(
     flat_index: int, x_grid: Sequence[float], grid_shape: Sequence[int]
 ):
@@ -908,6 +1572,7 @@ def _solve_optimal_split_factors(
     sigma_estimates: Sequence[Dict[str, Any]],
     tau_estimate: Dict[str, Any],
     x_grid: Sequence[float],
+    cost_weights: Sequence[float],
 ):
     t_matrix_start = time.perf_counter()
     sigma2_matrix, grid_shape = _build_sigma2_matrix(sigma_estimates, tau_estimate)
@@ -915,6 +1580,34 @@ def _solve_optimal_split_factors(
     t_opt_start = time.perf_counter()
     num_points, num_levels = sigma2_matrix.shape
     weight_floor = 1e-12
+
+    cost_weights_array = np.asarray(cost_weights, dtype=float)
+    if cost_weights_array.shape != (num_levels,):
+        raise ValueError(
+            "cost_weights must have one entry per allocation level. "
+            f"Expected {(num_levels,)}, got {cost_weights_array.shape}."
+        )
+    if not np.isfinite(cost_weights_array).all() or np.any(cost_weights_array <= 0.0):
+        raise ValueError("cost_weights must contain finite positive values")
+    cost_weights_array = cost_weights_array / float(cost_weights_array.sum())
+
+    weighted_sigma2_matrix = sigma2_matrix * cost_weights_array[None, :]
+
+    def allocation_from_simplex_weights(simplex_weights: np.ndarray):
+        simplex_weights = np.asarray(simplex_weights, dtype=float)
+        simplex_weights = np.maximum(simplex_weights, weight_floor)
+        simplex_weights /= float(simplex_weights.sum())
+        allocation_weights = simplex_weights / cost_weights_array
+        allocation_weights /= float(cost_weights_array @ allocation_weights)
+        return allocation_weights
+
+    def split_factors_from_allocation(allocation_weights: np.ndarray):
+        return allocation_weights[1:] / allocation_weights[:-1]
+
+    def worst_case_objective(allocation_weights: np.ndarray):
+        return float(
+            np.max(np.sum(sigma2_matrix / allocation_weights[None, :], axis=1))
+        )
 
     if num_levels < 2:
         sigma2_max = float(np.max(sigma2_matrix))
@@ -941,20 +1634,21 @@ def _solve_optimal_split_factors(
         }
 
     # Fast path: single worst-case grid point t* = argmax_j sum_k sigma_k(j)
-    # gives M_k ∝ sigma_k(t*) in closed form. KKT check confirms whether this
-    # is globally optimal; if not, fall back to SLSQP on the dual simplex.
-    sigma_matrix = np.sqrt(np.maximum(sigma2_matrix, 0.0))
+    # gives y_k ∝ sqrt(cost_k * sigma2_k(t*)) in closed form, where
+    # y_k = cost_k * M_k and sum_k y_k = 1. KKT check confirms whether this is
+    # globally optimal; if not, fall back to SLSQP on the dual simplex.
+    sigma_matrix = np.sqrt(np.maximum(weighted_sigma2_matrix, 0.0))
     row_sums = sigma_matrix.sum(axis=1)
     j_star = int(np.argmax(row_sums))
     sigmas_at_j = sigma_matrix[j_star]
     total = float(sigmas_at_j.sum())
 
     if total <= 0.0:
-        uniform_M = np.full(num_levels, 1.0 / num_levels, dtype=float)
+        allocation_weights = np.ones(num_levels, dtype=float)
         dual_weights = np.full(num_points, 1.0 / num_points, dtype=float)
         return {
-            "split_factors": (uniform_M[1:] / uniform_M[:-1]).tolist(),
-            "allocation_weights": uniform_M.tolist(),
+            "split_factors": split_factors_from_allocation(allocation_weights).tolist(),
+            "allocation_weights": allocation_weights.tolist(),
             "dual_weights": dual_weights.tolist(),
             "dual_status": 0,
             "dual_success": True,
@@ -973,16 +1667,18 @@ def _solve_optimal_split_factors(
             "optimize_time": time.perf_counter() - t_opt_start,
         }
 
-    M_candidate = sigmas_at_j / total
-    kkt_tol = 1e-8
-    zero_levels = M_candidate <= 0.0
+    y_candidate = sigmas_at_j / total
+    kkt_tol = 1e-7
+    zero_levels = y_candidate <= 0.0
     kkt_feasible = not (
-        np.any(zero_levels) and np.any(sigma2_matrix[:, zero_levels] > 0.0)
+        np.any(zero_levels) and np.any(weighted_sigma2_matrix[:, zero_levels] > 0.0)
     )
     if kkt_feasible:
-        safe_M = np.where(M_candidate > 0.0, M_candidate, 1.0)
+        safe_y = np.where(y_candidate > 0.0, y_candidate, 1.0)
         per_level = np.where(
-            M_candidate[None, :] > 0.0, sigma2_matrix / safe_M[None, :], 0.0
+            y_candidate[None, :] > 0.0,
+            weighted_sigma2_matrix / safe_y[None, :],
+            0.0,
         )
         worst_case_values = per_level.sum(axis=1)
         best = float(worst_case_values[j_star])
@@ -993,12 +1689,13 @@ def _solve_optimal_split_factors(
         kkt_passes = False
 
     if kkt_passes:
-        M_out = np.maximum(M_candidate, weight_floor)
-        M_out /= M_out.sum()
-        split_factors = M_out[1:] / M_out[:-1]
+        y_out = np.maximum(y_candidate, weight_floor)
+        y_out /= y_out.sum()
+        M_out = allocation_from_simplex_weights(y_out)
+        split_factors = split_factors_from_allocation(M_out)
         dual_weights = np.zeros(num_points, dtype=float)
         dual_weights[j_star] = 1.0
-        worst_case = float(np.sum(sigma2_matrix[j_star] / M_out))
+        worst_case = worst_case_objective(M_out)
         return {
             "split_factors": split_factors.tolist(),
             "allocation_weights": M_out.tolist(),
@@ -1018,8 +1715,67 @@ def _solve_optimal_split_factors(
             "optimize_time": time.perf_counter() - t_opt_start,
         }
 
+    if num_levels == 2:
+        # One split point leaves only one scalar allocation variable. Avoid the
+        # high-dimensional SLSQP dual over all grid points; directly minimize the
+        # convex primal max_j a_j / y_0 + b_j / (1 - y_0), where y_k = c_k M_k.
+        a = weighted_sigma2_matrix[:, 0]
+        b = weighted_sigma2_matrix[:, 1]
+        lo = weight_floor
+        hi = 1.0 - weight_floor
+
+        def objective(y0: float):
+            return float(np.max(a / y0 + b / (1.0 - y0)))
+
+        inv_phi = (math.sqrt(5.0) - 1.0) / 2.0
+        c = hi - inv_phi * (hi - lo)
+        d = lo + inv_phi * (hi - lo)
+        f_c = objective(c)
+        f_d = objective(d)
+        for _ in range(100):
+            if f_c <= f_d:
+                hi = d
+                d = c
+                f_d = f_c
+                c = hi - inv_phi * (hi - lo)
+                f_c = objective(c)
+            else:
+                lo = c
+                c = d
+                f_c = f_d
+                d = lo + inv_phi * (hi - lo)
+                f_d = objective(d)
+
+        y0 = 0.5 * (lo + hi)
+        y_out = np.array([y0, 1.0 - y0], dtype=float)
+        M_out = allocation_from_simplex_weights(y_out)
+        worst_case_values = np.sum(sigma2_matrix / M_out[None, :], axis=1)
+        worst_case = float(np.max(worst_case_values))
+        active_index = int(np.argmax(worst_case_values))
+        dual_weights = np.zeros(num_points, dtype=float)
+        dual_weights[active_index] = 1.0
+        split_factors = split_factors_from_allocation(M_out)
+        return {
+            "split_factors": split_factors.tolist(),
+            "allocation_weights": M_out.tolist(),
+            "dual_weights": dual_weights.tolist(),
+            "dual_status": 0,
+            "dual_success": True,
+            "dual_message": "Fast two-level primal search",
+            "dual_objective": worst_case,
+            "worst_case_simplex_objective": worst_case,
+            "active_grid_points": [
+                {
+                    "point": _grid_index_to_point(active_index, x_grid, grid_shape),
+                    "weight": 1.0,
+                }
+            ],
+            "matrix_build_time": matrix_build_time,
+            "optimize_time": time.perf_counter() - t_opt_start,
+        }
+
     # KKT failed: the worst-case is a mixture. Fall back to SLSQP on the dual
-    # problem max_mu (sum_k sqrt(mu^T sigma2[:, k]))^2 over the simplex,
+    # problem max_mu (sum_k sqrt(mu^T (cost_k * sigma2[:, k])))^2 over the simplex,
     # warm-started from a single-atom point at j_star.
     try:
         from scipy.optimize import minimize
@@ -1029,15 +1785,15 @@ def _solve_optimal_split_factors(
         ) from exc
 
     c_floor = 1e-15
-    simplex_tol = 1e-9
+    simplex_tol = 1e-8
 
     def _phi_and_grad(mu: np.ndarray):
-        c = sigma2_matrix.T @ mu
+        c = weighted_sigma2_matrix.T @ mu
         c_safe = np.maximum(c, c_floor)
         sqrt_c = np.sqrt(c_safe)
         sum_sqrt_c = float(np.sum(sqrt_c))
         phi = sum_sqrt_c**2
-        grad = sum_sqrt_c * np.sum(sigma2_matrix / sqrt_c[None, :], axis=1)
+        grad = sum_sqrt_c * np.sum(weighted_sigma2_matrix / sqrt_c[None, :], axis=1)
         return phi, grad, c
 
     def objective(mu: np.ndarray):
@@ -1078,15 +1834,14 @@ def _solve_optimal_split_factors(
     dual_weights /= dual_weight_sum
 
     _, _, c_opt = _phi_and_grad(dual_weights)
-    primal_weights = np.sqrt(np.maximum(c_opt, 0.0))
-    if primal_weights.sum() <= 0.0:
-        primal_weights = np.full(num_levels, 1.0 / num_levels, dtype=float)
+    simplex_weights = np.sqrt(np.maximum(c_opt, 0.0))
+    if simplex_weights.sum() <= 0.0:
+        simplex_weights = np.full(num_levels, 1.0 / num_levels, dtype=float)
     else:
-        primal_weights /= primal_weights.sum()
-    primal_weights = np.maximum(primal_weights, weight_floor)
-    primal_weights /= primal_weights.sum()
+        simplex_weights /= simplex_weights.sum()
+    primal_weights = allocation_from_simplex_weights(simplex_weights)
 
-    split_factors = primal_weights[1:] / primal_weights[:-1]
+    split_factors = split_factors_from_allocation(primal_weights)
     worst_case_simplex_objective = float(
         np.max(np.sum(sigma2_matrix / primal_weights[None, :], axis=1))
     )
@@ -1136,64 +1891,97 @@ def _expected_cost_per_root(
     return cost
 
 
-def _probabilistic_split(x: torch.Tensor, split_factor: float):
+def _probabilistic_split_with_run_ids(
+    x: torch.Tensor,
+    run_ids: torch.Tensor,
+    split_factors_by_run: torch.Tensor,
+    generator: torch.Generator | None = None,
+):
     if x.shape[0] == 0:
-        return x
-    if split_factor < 0:
-        raise ValueError(f"split_factor must be nonnegative, got {split_factor}")
-    if abs(split_factor - 1.0) < 1e-12:
-        return x
+        return x, run_ids
 
-    if split_factor > 1.0:
-        base_copies = math.floor(split_factor)
-        extra_prob = split_factor - base_copies
-        pieces = []
+    particle_factors = split_factors_by_run[run_ids]
+    base_copies = torch.floor(particle_factors).to(dtype=torch.long)
+    extra_probs = particle_factors - base_copies.to(dtype=particle_factors.dtype)
+    has_extra = (
+        torch.rand(x.shape[0], device=x.device, generator=generator) < extra_probs
+    )
+    counts = base_copies + has_extra.to(dtype=torch.long)
 
-        if base_copies > 0:
-            pieces.append(x.repeat_interleave(base_copies, dim=0))
-
-        if extra_prob > 0:
-            extra_mask = torch.rand(x.shape[0], device=x.device) < extra_prob
-            if extra_mask.any():
-                pieces.append(x[extra_mask])
-
-        if pieces:
-            return torch.cat(pieces, dim=0)
-
-        return x.new_empty((0, x.shape[1]))
-
-    keep_mask = torch.rand(x.shape[0], device=x.device) < split_factor
-    return x[keep_mask]
+    return x.repeat_interleave(counts, dim=0), run_ids.repeat_interleave(counts, dim=0)
 
 
-def run_probabilistic_inference(
+def _run_probabilistic_inference_batch(
     model,
     ddim: DDIM,
-    n0: int,
+    n0_by_run: Sequence[int],
     split_points: Sequence[int],
-    split_factors: Sequence[float],
+    split_factors_by_run: Sequence[Sequence[float]],
     data_mean: torch.Tensor,
     data_std: torch.Tensor,
+    generator: torch.Generator | None = None,
 ):
-    input_dim = int(torch.as_tensor(data_mean).numel())
-    x = torch.randn(n0, input_dim, device=ddim.device)
+    if len(n0_by_run) == 0:
+        return [], [], 0.0
+    if len(n0_by_run) != len(split_factors_by_run):
+        raise ValueError("n0_by_run and split_factors_by_run must have the same length")
+    if any(int(n0) < 1 for n0 in n0_by_run):
+        raise ValueError("all n0 values must be at least 1")
 
-    realized_cost = x.shape[0] * ddim.segment_cost(ddim.T, split_points[0])
-    x = _sample_loop(ddim, model, x, ddim.T, split_points[0])
+    input_dim = int(torch.as_tensor(data_mean).numel())
+    n0_tensor = torch.as_tensor(n0_by_run, device=ddim.device, dtype=torch.long)
+
+    num_runs = int(n0_tensor.numel())
+    run_ids = torch.repeat_interleave(
+        torch.arange(num_runs, device=ddim.device, dtype=torch.long), n0_tensor
+    )
+    x = torch.randn(
+        int(n0_tensor.sum().item()), input_dim, device=ddim.device, generator=generator
+    )
+
+    realized_costs = n0_tensor * int(ddim.segment_cost(ddim.T, split_points[0]))
+    sampling_start = time.perf_counter()
+    x = _sample_loop(ddim, model, x, ddim.T, split_points[0], generator=generator)
+
+    split_factors_array = np.asarray(split_factors_by_run, dtype=float)
+    if not np.isfinite(split_factors_array).all() or np.any(split_factors_array < 0.0):
+        raise ValueError("split_factors_by_run must contain finite nonnegative values")
+    split_factors_tensor = torch.as_tensor(
+        split_factors_array, device=ddim.device, dtype=x.dtype
+    )
+    if split_factors_tensor.shape != (num_runs, len(split_points)):
+        raise ValueError(
+            "split_factors_by_run must have shape "
+            f"({num_runs}, {len(split_points)}), got {tuple(split_factors_tensor.shape)}"
+        )
 
     for idx, split_point in enumerate(split_points):
-        x = _probabilistic_split(x, split_factors[idx])
+        x, run_ids = _probabilistic_split_with_run_ids(
+            x,
+            run_ids,
+            split_factors_tensor[:, idx],
+            generator=generator,
+        )
 
         if idx + 1 < len(split_points):
             end_t = split_points[idx + 1]
         else:
             end_t = 0
 
-        realized_cost += x.shape[0] * ddim.segment_cost(split_point, end_t)
-        x = _sample_loop(ddim, model, x, split_point, end_t)
+        current_counts = torch.bincount(run_ids, minlength=num_runs)
+        realized_costs = realized_costs + current_counts * int(
+            ddim.segment_cost(split_point, end_t)
+        )
+        x = _sample_loop(ddim, model, x, split_point, end_t, generator=generator)
 
     x = denormalize(x, data_mean, data_std)
-    return x, int(realized_cost)
+    sampling_time = time.perf_counter() - sampling_start
+
+    samples_by_run = []
+    for run_idx in range(num_runs):
+        samples_by_run.append(x[run_ids == run_idx])
+
+    return samples_by_run, realized_costs.detach().cpu().tolist(), sampling_time
 
 
 def _summarize_results(ks_distances: np.ndarray):
@@ -1215,34 +2003,41 @@ def _summarize_results(ks_distances: np.ndarray):
     }
 
 
-def _run_single_sampling_trial(
-    model,
+def _build_sampling_trial_result(
+    samples: torch.Tensor,
+    realized_cost: int,
+    phase2_sampling_time: float,
     target_spec: Dict[str, Any],
-    ddim: DDIM,
-    n0: int,
-    split_points: Sequence[int],
-    split_factors: Sequence[float],
-    data_mean: torch.Tensor,
-    data_std: torch.Tensor,
     reference_cdf_state: Dict[str, Any] | None,
     reference_mode: str,
     phase1_x0_samples: torch.Tensor | None = None,
 ):
-    sampling_start = time.perf_counter()
-    samples, realized_cost = run_probabilistic_inference(
-        model=model,
-        ddim=ddim,
-        n0=n0,
-        split_points=split_points,
-        split_factors=split_factors,
-        data_mean=data_mean,
-        data_std=data_std,
+    return _build_sampling_trial_result_from_tensor(
+        samples=samples,
+        realized_cost=realized_cost,
+        phase2_sampling_time=phase2_sampling_time,
+        target_spec=target_spec,
+        reference_cdf_state=reference_cdf_state,
+        reference_mode=reference_mode,
+        phase1_x0_samples=phase1_x0_samples,
     )
-    phase2_sampling_time = time.perf_counter() - sampling_start
-    leaf_count = int(samples.shape[0])
-    ks_samples = samples
-    if phase1_x0_samples is not None and phase1_x0_samples.shape[0] > 0:
-        ks_samples = torch.cat([phase1_x0_samples, samples], dim=0)
+
+
+def _build_sampling_trial_result_from_array(
+    samples_np: np.ndarray,
+    realized_cost: int,
+    phase2_sampling_time: float,
+    target_spec: Dict[str, Any],
+    reference_cdf_state: Dict[str, Any] | None,
+    reference_mode: str,
+    phase1_x0_samples: torch.Tensor | np.ndarray | None = None,
+):
+    samples_np = _coerce_samples_np(samples_np)
+    leaf_count = int(samples_np.shape[0])
+    ks_samples = samples_np
+    if phase1_x0_samples is not None and int(phase1_x0_samples.shape[0]) > 0:
+        phase1_np = _coerce_samples_np(phase1_x0_samples)
+        ks_samples = np.concatenate([phase1_np, samples_np], axis=0)
 
     ks_start = time.perf_counter()
     ks_distance = float("nan")
@@ -1258,8 +2053,133 @@ def _run_single_sampling_trial(
         "leaf_count": leaf_count,
         "phase2_sampling_time": float(phase2_sampling_time),
         "phase2_ks_time": float(phase2_ks_time),
-        "samples": samples.cpu().numpy(),
+        "samples": samples_np,
     }
+
+
+def _build_sampling_trial_result_from_tensor(
+    samples: torch.Tensor,
+    realized_cost: int,
+    phase2_sampling_time: float,
+    target_spec: Dict[str, Any],
+    reference_cdf_state: Dict[str, Any] | None,
+    reference_mode: str,
+    phase1_x0_samples: torch.Tensor | np.ndarray | None = None,
+):
+    return _build_sampling_trial_result_from_array(
+        samples_np=_coerce_samples_np(samples),
+        realized_cost=realized_cost,
+        phase2_sampling_time=phase2_sampling_time,
+        target_spec=target_spec,
+        reference_cdf_state=reference_cdf_state,
+        reference_mode=reference_mode,
+        phase1_x0_samples=phase1_x0_samples,
+    )
+
+
+def _build_sampling_trial_results_parallel(
+    samples_by_run: Sequence[torch.Tensor | np.ndarray],
+    realized_costs: Sequence[int | float],
+    phase2_sampling_time: float,
+    target_spec: Dict[str, Any],
+    reference_cdf_state: Dict[str, Any] | None,
+    reference_mode: str,
+    *,
+    phase1_x0_samples_by_run: Sequence[torch.Tensor | np.ndarray | None] | None = None,
+    max_workers: int = 1,
+):
+    if phase1_x0_samples_by_run is None:
+        phase1_x0_samples_by_run = [None] * len(samples_by_run)
+    if len(samples_by_run) != len(realized_costs):
+        raise ValueError("samples_by_run and realized_costs must have the same length")
+    if len(samples_by_run) != len(phase1_x0_samples_by_run):
+        raise ValueError("phase1_x0_samples_by_run must match samples_by_run length")
+
+    work_items = list(zip(samples_by_run, realized_costs, phase1_x0_samples_by_run))
+    worker_count = max(1, min(int(max_workers), len(work_items)))
+    if worker_count == 1:
+        return [
+            _build_sampling_trial_result_from_array(
+                samples_np=_coerce_samples_np(samples),
+                realized_cost=int(realized_cost),
+                phase2_sampling_time=phase2_sampling_time,
+                target_spec=target_spec,
+                reference_cdf_state=reference_cdf_state,
+                reference_mode=reference_mode,
+                phase1_x0_samples=phase1_x0_samples,
+            )
+            for samples, realized_cost, phase1_x0_samples in work_items
+        ]
+    trial_results = [None] * len(work_items)
+    _warm_ks_kernel_for_mode(reference_mode, target_spec)
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = []
+        _submit_sampling_trial_result_futures(
+            executor=executor,
+            futures=futures,
+            run_indices=range(len(work_items)),
+            samples_by_run=samples_by_run,
+            realized_costs=realized_costs,
+            phase2_sampling_time=phase2_sampling_time,
+            target_spec=target_spec,
+            reference_cdf_state=reference_cdf_state,
+            reference_mode=reference_mode,
+            phase1_x0_samples_by_run=phase1_x0_samples_by_run,
+        )
+        _collect_sampling_trial_result_futures(trial_results, futures)
+    return trial_results
+
+
+def _submit_sampling_trial_result_futures(
+    executor: ThreadPoolExecutor,
+    futures: List[Tuple[int, Any]],
+    run_indices: Sequence[int],
+    samples_by_run: Sequence[torch.Tensor | np.ndarray],
+    realized_costs: Sequence[int | float],
+    phase2_sampling_time: float,
+    target_spec: Dict[str, Any],
+    reference_cdf_state: Dict[str, Any] | None,
+    reference_mode: str,
+    *,
+    phase1_x0_samples_by_run: Sequence[torch.Tensor | np.ndarray | None] | None = None,
+):
+    run_indices = list(run_indices)
+    if phase1_x0_samples_by_run is None:
+        phase1_x0_samples_by_run = [None] * len(samples_by_run)
+    if len(samples_by_run) != len(realized_costs):
+        raise ValueError("samples_by_run and realized_costs must have the same length")
+    if len(samples_by_run) != len(phase1_x0_samples_by_run):
+        raise ValueError("phase1_x0_samples_by_run must match samples_by_run length")
+    if len(samples_by_run) != len(run_indices):
+        raise ValueError("run_indices must match samples_by_run length")
+
+    samples_cpu = [_coerce_samples_np(samples) for samples in samples_by_run]
+    phase1_cpu = [
+        None if samples is None else _coerce_samples_np(samples)
+        for samples in phase1_x0_samples_by_run
+    ]
+    for local_idx, run_idx in enumerate(run_indices):
+        future = executor.submit(
+            _build_sampling_trial_result_from_array,
+            samples_cpu[local_idx],
+            int(realized_costs[local_idx]),
+            phase2_sampling_time,
+            target_spec,
+            reference_cdf_state,
+            reference_mode,
+            phase1_cpu[local_idx],
+        )
+        futures.append((int(run_idx), future))
+
+
+def _collect_sampling_trial_result_futures(
+    trial_results: List[Dict[str, Any] | None],
+    futures: Sequence[Tuple[int, Any]],
+    *,
+    desc: str = "KS",
+):
+    for run_idx, future in tqdm(futures, desc=desc, leave=False):
+        trial_results[run_idx] = future.result()
 
 
 def _summarize_sampling_trials(trial_results: Sequence[Dict[str, Any]]):
@@ -1329,13 +2249,18 @@ def _sample_dpmpp_2m(model, x: torch.Tensor, T: int, sampling_steps: int):
         solver_order=2,
     )
     scheduler.set_timesteps(sampling_steps, device=x.device)
+    # Avoid scheduler step-index initialization from a CUDA scalar timestep; that
+    # path can synchronize every step. The scheduler increments this internally.
+    scheduler._step_index = 0
 
     with torch.inference_mode():
         for t in scheduler.timesteps:
-            t_value = int(t.item()) if isinstance(t, torch.Tensor) else int(t)
-            t_tensor = torch.full(
-                (x.shape[0],), t_value, device=x.device, dtype=torch.long
-            )
+            if isinstance(t, torch.Tensor):
+                t_tensor = t.to(device=x.device, dtype=torch.long).expand(x.shape[0])
+            else:
+                t_tensor = torch.full(
+                    (x.shape[0],), int(t), device=x.device, dtype=torch.long
+                )
             eps_pred = model(x, t_tensor)
             x = scheduler.step(eps_pred, t, x).prev_sample
     return x
@@ -1350,39 +2275,33 @@ def _sample_full_solver(
     sampling_steps: int,
     eta: float,
     device: str,
+    generator: torch.Generator | None = None,
 ):
     if solver == "ddim":
         ddim = DDIM(T=T, device=device, eta=eta, sampling_steps=sampling_steps)
-        return ddim.sample_loop(model, x, ddim.T, 0)
+        return ddim.sample_loop(model, x, ddim.T, 0, generator=generator)
     if solver == "dpmpp_2m":
         return _sample_dpmpp_2m(model, x, T=T, sampling_steps=sampling_steps)
     raise ValueError(f"Unknown solver baseline '{solver}'")
 
 
-def _run_single_solver_baseline_trial(
+def _run_solver_baseline_batch(
     model,
-    target_spec: Dict[str, Any],
     data_mean: torch.Tensor,
     data_std: torch.Tensor,
-    reference_cdf_state: Dict[str, Any] | None,
     *,
     solver: str,
-    B: int,
+    chunk_size: int,
+    n0: int,
     T: int,
     sampling_steps: int,
     eta: float,
-    reference_mode: str,
     device: str,
+    generator: torch.Generator | None = None,
 ):
     input_dim = _model_input_dim(model)
-    n0 = int(B // sampling_steps)
-    if n0 < 1:
-        raise ValueError(
-            f"Budget B={B} is too small for solver baseline with {sampling_steps} steps"
-        )
-
     sampling_start = time.perf_counter()
-    x = torch.randn(n0, input_dim, device=device)
+    x = torch.randn(chunk_size * n0, input_dim, device=device, generator=generator)
     samples = _sample_full_solver(
         model,
         solver,
@@ -1391,25 +2310,12 @@ def _run_single_solver_baseline_trial(
         sampling_steps=sampling_steps,
         eta=eta,
         device=device,
+        generator=generator,
     )
     samples = denormalize(samples, data_mean, data_std)
-    _sync_device(device)
-    phase2_sampling_time = time.perf_counter() - sampling_start
-
-    ks_start = time.perf_counter()
-    ks_distance, _, _ = _compute_ks_distance(
-        samples, target_spec, reference_mode, reference_cdf_state
-    )
-    phase2_ks_time = time.perf_counter() - ks_start
-
-    return {
-        "ks_distance": float(ks_distance),
-        "realized_cost": int(n0 * sampling_steps),
-        "leaf_count": int(samples.shape[0]),
-        "phase2_sampling_time": float(phase2_sampling_time),
-        "phase2_ks_time": float(phase2_ks_time),
-        "samples": samples.cpu().numpy(),
-    }
+    sampling_time = time.perf_counter() - sampling_start
+    samples = _coerce_samples_tensor(samples, device=device).reshape(chunk_size, n0, -1)
+    return [samples[i] for i in range(chunk_size)], sampling_time
 
 
 def run_solver_baseline_sampling(
@@ -1427,14 +2333,14 @@ def run_solver_baseline_sampling(
     n_runs: int,
     seed: int | None,
     device: str,
-    reference_mode: str = "samples",
+    reference_mode: str = "ddpm_samples",
     debug: bool = False,
+    n_parallel: int = 1,
+    run_start_index: int = 0,
+    return_trial_results: bool = False,
 ):
     if sampling_steps < 1:
         raise ValueError("sampling_steps must be at least 1")
-    if seed is not None:
-        torch.manual_seed(seed)
-        np.random.seed(seed)
 
     n0 = int(B // sampling_steps)
     if n0 < 1:
@@ -1454,31 +2360,45 @@ def run_solver_baseline_sampling(
         f"expected_total_samples={float(n0):.6f}",
     )
 
-    trial_results = []
-    for run_idx in tqdm(range(n_runs), desc="Runs", leave=False):
-        if seed is not None:
-            run_seed = seed + run_idx
-            torch.manual_seed(run_seed)
-            np.random.seed(run_seed)
-        trial_results.append(
-            _run_single_solver_baseline_trial(
+    trial_results = [None] * n_runs
+    chunks = list(_iter_run_chunks(n_runs, n_parallel))
+    ks_futures = []
+    _warm_ks_kernel_for_mode(reference_mode, target_spec)
+    ks_workers = max(1, min(int(n_parallel), n_runs))
+    with ThreadPoolExecutor(max_workers=ks_workers) as ks_executor:
+        for start, end in tqdm(chunks, desc="Runs", leave=False):
+            chunk_size = end - start
+            run_seed = (
+                None
+                if seed is None
+                else seed + PHASE2_SEED_OFFSET + run_start_index + start
+            )
+            samples_by_run, sampling_time = _run_solver_baseline_batch(
                 model=model,
-                target_spec=target_spec,
                 data_mean=data_mean,
                 data_std=data_std,
-                reference_cdf_state=reference_cdf_state,
                 solver=solver,
-                B=B,
+                chunk_size=chunk_size,
+                n0=n0,
                 T=T,
                 sampling_steps=sampling_steps,
                 eta=eta,
-                reference_mode=reference_mode,
                 device=device,
+                generator=_make_torch_generator(run_seed, device),
             )
-        )
-
-    if not trial_results:
-        raise ValueError("n_runs must be at least 1")
+            phase2_sampling_time = sampling_time / chunk_size
+            _submit_sampling_trial_result_futures(
+                executor=ks_executor,
+                futures=ks_futures,
+                run_indices=range(start, end),
+                samples_by_run=samples_by_run,
+                realized_costs=[int(n0 * sampling_steps)] * chunk_size,
+                phase2_sampling_time=phase2_sampling_time,
+                target_spec=target_spec,
+                reference_cdf_state=reference_cdf_state,
+                reference_mode=reference_mode,
+            )
+        _collect_sampling_trial_result_futures(trial_results, ks_futures)
 
     stats = _summarize_sampling_trials(trial_results)
     _debug_log(
@@ -1487,7 +2407,7 @@ def run_solver_baseline_sampling(
         f"extinction_rate={stats['extinction_rate']:.6f}",
     )
     expected_total_samples = float(n0)
-    return {
+    result = {
         "mode": "solver_baseline",
         "solver": solver,
         "B": int(B),
@@ -1506,6 +2426,9 @@ def run_solver_baseline_sampling(
         "target_spec": target_spec,
         **stats,
     }
+    if return_trial_results:
+        result["trial_results"] = trial_results
+    return result
 
 
 def _mean_scalar(values: Sequence[float | int]):
@@ -1611,7 +2534,7 @@ def _summarize_allocation_messages(messages: Sequence[str]):
 def _active_grid_points_from_dual_weights(
     dual_weights: Sequence[float], x_grid: Sequence[float], grid_shape: Sequence[int]
 ):
-    simplex_tol = 1e-9
+    simplex_tol = 1e-8
     return [
         {
             "point": _grid_index_to_point(point_idx, x_grid, grid_shape),
@@ -1634,32 +2557,62 @@ def _run_sampling_trials(
     data_std: torch.Tensor,
     reference_cdf_state: Dict[str, Any] | None,
     reference_mode: str,
+    seed: int | None = None,
     debug: bool = False,
+    n_parallel: int = 1,
+    run_start_index: int = 0,
+    return_trial_results: bool = False,
 ):
-    ks_distances = []
-    realized_costs = []
-    leaf_counts = []
-    extinction_count = 0
-    samples_by_run = []
-
     _debug_log(
         debug,
         f"Sampling phase: running {n_runs} trials with n0={n0} and split factors {list(split_factors)}",
     )
 
-    for _ in tqdm(range(n_runs), desc="Runs", leave=False):
-        trial_result = _run_single_sampling_trial(
-            model=model,
-            target_spec=target_spec,
-            ddim=ddim,
-            n0=n0,
-            split_points=split_points,
-            split_factors=split_factors,
-            data_mean=data_mean,
-            data_std=data_std,
-            reference_cdf_state=reference_cdf_state,
-            reference_mode=reference_mode,
-        )
+    trial_results = [None] * n_runs
+    chunks = list(_iter_run_chunks(n_runs, n_parallel))
+    ks_futures = []
+    _warm_ks_kernel_for_mode(reference_mode, target_spec)
+    ks_workers = max(1, min(int(n_parallel), n_runs))
+    with ThreadPoolExecutor(max_workers=ks_workers) as ks_executor:
+        for start, end in tqdm(chunks, desc="Runs", leave=False):
+            chunk_size = end - start
+            run_seed = (
+                None
+                if seed is None
+                else seed + PHASE2_SEED_OFFSET + run_start_index + start
+            )
+            samples_by_run, realized_costs, sampling_time = (
+                _run_probabilistic_inference_batch(
+                    model=model,
+                    ddim=ddim,
+                    n0_by_run=[n0] * chunk_size,
+                    split_points=split_points,
+                    split_factors_by_run=[split_factors] * chunk_size,
+                    data_mean=data_mean,
+                    data_std=data_std,
+                    generator=_make_torch_generator(run_seed, ddim.device),
+                )
+            )
+            phase2_sampling_time = sampling_time / chunk_size
+            _submit_sampling_trial_result_futures(
+                executor=ks_executor,
+                futures=ks_futures,
+                run_indices=range(start, end),
+                samples_by_run=samples_by_run,
+                realized_costs=realized_costs,
+                phase2_sampling_time=phase2_sampling_time,
+                target_spec=target_spec,
+                reference_cdf_state=reference_cdf_state,
+                reference_mode=reference_mode,
+            )
+        _collect_sampling_trial_result_futures(trial_results, ks_futures)
+
+    ks_distances = []
+    realized_costs = []
+    leaf_counts = []
+    extinction_count = 0
+    samples_by_run = []
+    for trial_result in trial_results:
         realized_costs.append(trial_result["realized_cost"])
         leaf_counts.append(trial_result["leaf_count"])
         samples_by_run.append(trial_result["samples"])
@@ -1677,7 +2630,7 @@ def _run_sampling_trials(
     stats = _summarize_results(ks_distances)
     extinction_rate = extinction_count / max(n_runs, 1)
 
-    return {
+    result = {
         "mean_ks": stats["mean_ks"],
         "std_ks": stats["std_ks"],
         "var_ks": stats["var_ks"],
@@ -1696,16 +2649,112 @@ def _run_sampling_trials(
         "extinction_rate": float(extinction_rate),
         "samples": samples_by_run,
     }
+    if return_trial_results:
+        result["trial_results"] = trial_results
+    return result
 
 
-def _run_single_estimate_and_sample_trial(
+def _run_pilot_tree_phase1_sampling_batch(
     model,
-    target_spec: Dict[str, Any],
     data_mean: torch.Tensor,
     data_std: torch.Tensor,
-    reference_cdf_state: Dict[str, Any] | None,
     *,
-    B: int,
+    B1: int,
+    T: int,
+    sampling_steps: int,
+    eta: float,
+    split_percentages: Sequence[float],
+    x_grid: Sequence[float],
+    reuse_phase1_samples: bool,
+    device: str,
+    chunk_size: int,
+    debug: bool = False,
+    generator: torch.Generator | None = None,
+):
+    ddim = DDIM(T=T, device=device, eta=eta, sampling_steps=sampling_steps)
+    resolved_step_points, split_points = _resolve_split_percentages(
+        ddim, split_percentages
+    )
+    sigma_times = [T] + list(split_points)
+    pilot_scale, pilot_roots, derived_m_pilot = _derive_pilot_tree_shape(
+        ddim=ddim,
+        split_points=split_points,
+        B1=B1,
+    )
+
+    _debug_log(
+        debug,
+        "Phase 1 batch (pilot tree): "
+        f"chunk_size={chunk_size}, pilot_scale={pilot_scale:.6f}, "
+        f"pilot_roots={pilot_roots}, derived_m_pilot={derived_m_pilot:.6f}",
+    )
+
+    diffusion_start = time.perf_counter()
+    (
+        leaf_x0,
+        leaf_run_ids,
+        child_counts_by_level,
+        parent_run_ids_by_level,
+        used_B1_by_run,
+    ) = _build_pilot_tree_batch(
+        model=model,
+        ddim=ddim,
+        chunk_size=chunk_size,
+        pilot_roots=pilot_roots,
+        split_points=split_points,
+        m_pilot=derived_m_pilot,
+        generator=generator,
+    )
+    leaf_x0 = denormalize(leaf_x0, data_mean, data_std)
+    diffusion_time = (time.perf_counter() - diffusion_start) / chunk_size
+
+    estimation_start = time.perf_counter()
+    sigma_estimates_by_run, tau_estimates = _estimate_sigmas_from_tree_batch(
+        leaf_x0=leaf_x0,
+        leaf_run_ids=leaf_run_ids,
+        sigma_times=sigma_times,
+        child_counts_by_level=child_counts_by_level,
+        parent_run_ids_by_level=parent_run_ids_by_level,
+        x_grid=x_grid,
+        chunk_size=chunk_size,
+    )
+    estimation_time = (time.perf_counter() - estimation_start) / chunk_size
+
+    phase1_x0_by_run = [None] * chunk_size
+    if reuse_phase1_samples:
+        leaf_counts_by_run = (
+            torch.bincount(leaf_run_ids, minlength=chunk_size).detach().cpu().tolist()
+        )
+        phase1_x0_by_run = [
+            _coerce_samples_np(run_samples)
+            for run_samples in torch.split(leaf_x0, leaf_counts_by_run)
+        ]
+
+    phase1_payloads = []
+    for run_idx in range(chunk_size):
+        phase1_payloads.append(
+            {
+                "resolved_step_points": [int(x) for x in resolved_step_points],
+                "split_points": [int(x) for x in split_points],
+                "sigma_times": [int(x) for x in sigma_times],
+                "sigma_estimates": sigma_estimates_by_run[run_idx],
+                "tau_estimate": tau_estimates[run_idx],
+                "used_B1": int(used_B1_by_run[run_idx]),
+                "phase1_x0_samples": phase1_x0_by_run[run_idx],
+                "phase1_diffusion_time": float(diffusion_time),
+                "phase1_estimation_time": float(estimation_time),
+                "pilot_roots": int(pilot_roots),
+                "m_pilot": float(derived_m_pilot),
+            }
+        )
+    return phase1_payloads
+
+
+def _run_independent_phase1_sampling_batch(
+    model,
+    data_mean: torch.Tensor,
+    data_std: torch.Tensor,
+    *,
     B1: int,
     T: int,
     sampling_steps: int,
@@ -1713,167 +2762,186 @@ def _run_single_estimate_and_sample_trial(
     split_percentages: Sequence[float],
     x_grid: Sequence[float],
     independent_n2: int,
-    sigma_estimation_mode: str,
     reuse_phase1_samples: bool,
-    seed: int | None,
     device: str,
-    reference_mode: str,
+    chunk_size: int,
     debug: bool = False,
+    generator: torch.Generator | None = None,
 ):
-    if seed is not None:
-        torch.manual_seed(seed)
-        np.random.seed(seed)
-
     ddim = DDIM(T=T, device=device, eta=eta, sampling_steps=sampling_steps)
     resolved_step_points, split_points = _resolve_split_percentages(
         ddim, split_percentages
     )
     sigma_times = [T] + list(split_points)
-
-    derived_m_pilot = None
-    phase1_metadata: Dict[str, Any]
-
-    if sigma_estimation_mode == "pilot_tree":
-        pilot_scale, pilot_roots, derived_m_pilot = _derive_pilot_tree_shape(
-            ddim=ddim,
-            split_points=split_points,
-            B1=B1,
-        )
-
-        _debug_log(
-            debug,
-            "Phase 1 (pilot tree): "
-            f"pilot_scale={pilot_scale:.6f}, pilot_levels={len(sigma_times)}, "
-            f"pilot_roots={pilot_roots}, derived_m_pilot={derived_m_pilot:.6f}",
-        )
-        diffusion_start = time.perf_counter()
-        (
-            _,
-            phase1_x0_samples,
-            _,
-            _,
-            child_counts_by_level,
-            used_B1,
-        ) = _build_pilot_tree(
-            model=model,
-            ddim=ddim,
-            pilot_roots=pilot_roots,
-            split_points=split_points,
-            m_pilot=derived_m_pilot,
-        )
-        phase1_x0_samples = denormalize(phase1_x0_samples, data_mean, data_std)
-        _sync_device(ddim.device)
-        diffusion_time = time.perf_counter() - diffusion_start
-
-        _debug_log(debug, "Estimating sigma_k grids from pilot tree leaves")
-        estimation_start = time.perf_counter()
-        sigma_estimates, tau_estimate = _estimate_sigmas_from_tree(
-            leaf_x0=phase1_x0_samples,
-            sigma_times=sigma_times,
-            child_counts_by_level=child_counts_by_level,
-            x_grid=x_grid,
-        )
-        _sync_device(ddim.device)
-        estimation_time = time.perf_counter() - estimation_start
-        phase1_metadata = {
-            "pilot_roots": int(pilot_roots),
-            "m_pilot": float(derived_m_pilot),
-        }
-    else:
-        _, independent_counts_by_sigma, _ = _derive_independent_counts(
-            ddim=ddim,
-            sigma_times=sigma_times,
-            B1=B1,
-            independent_n2=independent_n2,
-        )
-
-        _debug_log(
-            debug,
-            "Phase 1 (independent): " f"counts_by_sigma={independent_counts_by_sigma}",
-        )
-        _debug_log(debug, "Estimating sigma_k grids independently")
-        (
-            phase1_x0_samples,
-            sigma_estimates,
-            tau_estimate,
-            used_B1,
-            diffusion_time,
-            estimation_time,
-        ) = _estimate_sigmas_independently(
-            model=model,
-            ddim=ddim,
-            sigma_times=sigma_times,
-            counts_by_sigma=independent_counts_by_sigma,
-            x_grid=x_grid,
-            data_mean=data_mean,
-            data_std=data_std,
-            collect_phase1_samples=reuse_phase1_samples,
-        )
-        phase1_metadata = {
-            "pilot_roots": int(independent_counts_by_sigma[0]["outer_count"]),
-            "m_pilot": None,
-        }
-    B2 = B - used_B1
-    _debug_log(debug, f"Phase 1 complete: used_B1={used_B1}, remaining B2={B2}")
-    _debug_log(debug, "Estimating optimal normalized M_k on the simplex")
-    allocation_result = _solve_optimal_split_factors(
-        sigma_estimates=sigma_estimates,
-        tau_estimate=tau_estimate,
-        x_grid=x_grid,
+    _, counts_by_sigma, _ = _derive_independent_counts(
+        ddim=ddim,
+        sigma_times=sigma_times,
+        B1=B1,
+        independent_n2=independent_n2,
     )
-    split_factors = allocation_result["split_factors"]
     _debug_log(
         debug,
-        "Found optimal normalized M_k="
-        f"{allocation_result['allocation_weights']} and derived N_i={split_factors}",
+        "Phase 1 batch (independent): "
+        f"chunk_size={chunk_size}, counts_by_sigma={counts_by_sigma}",
     )
-    expected_cost_per_root = _expected_cost_per_root(ddim, split_points, split_factors)
+
+    input_dim = _model_input_dim(model)
+    next_times = list(sigma_times[1:]) + [0]
+    sigma_estimates_by_run = [[] for _ in range(chunk_size)]
+    tau_estimates = [None] * chunk_size
+    phase1_samples_by_run = [[] for _ in range(chunk_size)]
+    used_B1 = 0
+    diffusion_time = 0.0
+    estimation_time_by_run = [0.0] * chunk_size
+
+    for idx, ((t_curr, t_next), count_spec) in enumerate(
+        zip(zip(sigma_times, next_times), counts_by_sigma)
+    ):
+        outer_count = int(count_spec["outer_count"])
+        middle_count = int(count_spec["middle_count"])
+        inner_count = int(count_spec["inner_count"])
+        leaf_count_per_run = outer_count * middle_count * inner_count
+
+        sampling_start = time.perf_counter()
+        root_x_T = torch.randn(
+            chunk_size * outer_count,
+            input_dim,
+            device=device,
+            generator=generator,
+        )
+        x_curr = _sample_loop(
+            ddim, model, root_x_T, ddim.T, t_curr, generator=generator
+        )
+        middle_counts = torch.full(
+            (x_curr.shape[0],), middle_count, device=device, dtype=torch.long
+        )
+        x_curr_rep = _repeat_by_counts(x_curr, middle_counts)
+        x_next = _sample_loop(
+            ddim, model, x_curr_rep, t_curr, t_next, generator=generator
+        )
+        inner_counts = torch.full(
+            (x_next.shape[0],), inner_count, device=device, dtype=torch.long
+        )
+        x_next_rep = _repeat_by_counts(x_next, inner_counts)
+        x_0 = _sample_loop(ddim, model, x_next_rep, t_next, 0, generator=generator)
+        x_0 = denormalize(x_0, data_mean, data_std)
+        diffusion_time += (time.perf_counter() - sampling_start) / chunk_size
+
+        if reuse_phase1_samples:
+            x0_by_run = x_0.reshape(chunk_size, leaf_count_per_run, input_dim)
+            for run_idx in range(chunk_size):
+                phase1_samples_by_run[run_idx].append(x0_by_run[run_idx])
+
+        used_B1 += _independent_sigma_cost(
+            ddim, t_curr, t_next, outer_count, middle_count, inner_count
+        )
+
+        estimation_start = time.perf_counter()
+        indicators = _rectangle_indicator_grid(x_0, x_grid)
+        num_grid_points = indicators.shape[1]
+        indicators = indicators.reshape(
+            chunk_size, outer_count, middle_count, inner_count, num_grid_points
+        )
+        middle_means = indicators.mean(dim=3)
+        if middle_count < 2:
+            raise ValueError("Independent sigma estimation needs middle_count >= 2")
+
+        p_hat_mean = middle_means.mean(dim=(1, 2))
+        outer_vars = torch.clamp(middle_means.var(dim=2, unbiased=True), min=0.0)
+        sigma2 = outer_vars.mean(dim=1)
+        sigma = torch.sqrt(torch.clamp(sigma2, min=0.0))
+        outer_means = middle_means.mean(dim=2)
+        if outer_count >= 2:
+            tau2 = torch.clamp(outer_means.var(dim=1, unbiased=True), min=0.0)
+        else:
+            tau2 = torch.zeros(
+                chunk_size, num_grid_points, device=device, dtype=x_0.dtype
+            )
+        tau = torch.sqrt(torch.clamp(tau2, min=0.0))
+        tau_mean = outer_means.mean(dim=1)
+        estimation_elapsed = (time.perf_counter() - estimation_start) / chunk_size
+
+        for run_idx in range(chunk_size):
+            sigma_estimates_by_run[run_idx].append(
+                _sigma_estimate_from_flat(
+                    int(t_curr),
+                    sigma2[run_idx],
+                    sigma[run_idx],
+                    p_hat_mean[run_idx],
+                    x_grid,
+                )
+            )
+            estimation_time_by_run[run_idx] += estimation_elapsed
+            if idx == 0:
+                tau_estimates[run_idx] = _tau_estimate_from_flat(
+                    tau2[run_idx], tau[run_idx], tau_mean[run_idx], x_grid
+                )
+
+    phase1_payloads = []
+    for run_idx in range(chunk_size):
+        if reuse_phase1_samples and phase1_samples_by_run[run_idx]:
+            phase1_x0_samples = _coerce_samples_np(
+                torch.cat(phase1_samples_by_run[run_idx], dim=0)
+            )
+        else:
+            phase1_x0_samples = None
+        phase1_payloads.append(
+            {
+                "resolved_step_points": [int(x) for x in resolved_step_points],
+                "split_points": [int(x) for x in split_points],
+                "sigma_times": [int(x) for x in sigma_times],
+                "sigma_estimates": sigma_estimates_by_run[run_idx],
+                "tau_estimate": tau_estimates[run_idx],
+                "used_B1": int(used_B1),
+                "phase1_x0_samples": phase1_x0_samples,
+                "phase1_diffusion_time": float(diffusion_time),
+                "phase1_estimation_time": float(estimation_time_by_run[run_idx]),
+                "pilot_roots": int(counts_by_sigma[0]["outer_count"]),
+                "m_pilot": None,
+            }
+        )
+    return phase1_payloads
+
+
+def _solve_phase1_allocation(
+    payload: Dict[str, Any],
+    *,
+    B: int,
+    T: int,
+    sampling_steps: int,
+    eta: float,
+    x_grid: Sequence[float],
+):
+    ddim = DDIM(T=T, device="cpu", eta=eta, sampling_steps=sampling_steps)
+    segment_costs = _segment_costs(ddim, payload["split_points"])
+    segment_cost_sum = float(np.sum(segment_costs))
+    if segment_cost_sum <= 0.0:
+        raise ValueError("Segment costs must have positive total cost")
+    cost_weights = [float(cost / segment_cost_sum) for cost in segment_costs]
+
+    allocation_result = _solve_optimal_split_factors(
+        sigma_estimates=payload["sigma_estimates"],
+        tau_estimate=payload["tau_estimate"],
+        x_grid=x_grid,
+        cost_weights=cost_weights,
+    )
+    split_factors = allocation_result["split_factors"]
+    expected_cost_per_root = _expected_cost_per_root(
+        ddim, payload["split_points"], split_factors
+    )
+    B2 = B - int(payload["used_B1"])
     n0 = int(B2 // expected_cost_per_root)
     if n0 < 1:
         raise ValueError(
             f"Remaining budget B2={B2} is too small; expected cost per root is {expected_cost_per_root:.6f}"
         )
 
-    phase1_samples_for_ks = phase1_x0_samples if reuse_phase1_samples else None
-
     expected_total_samples = float(n0)
     for split_factor in split_factors:
         expected_total_samples *= split_factor
 
-    _debug_log(
-        debug,
-        "Phase 2 sampling setup: "
-        f"expected_cost_per_root={expected_cost_per_root:.6f}, n0={n0}, expected_total_samples={expected_total_samples:.6f}",
-    )
-    sampling_result = _run_single_sampling_trial(
-        model=model,
-        target_spec=target_spec,
-        ddim=ddim,
-        n0=n0,
-        split_points=split_points,
-        split_factors=split_factors,
-        data_mean=data_mean,
-        data_std=data_std,
-        reference_cdf_state=reference_cdf_state,
-        reference_mode=reference_mode,
-        phase1_x0_samples=phase1_samples_for_ks,
-    )
-
-    print(
-        f"[timings] diffusion={diffusion_time:.3f}s "
-        f"estimate_sigmas={estimation_time:.3f}s "
-        f"sigma_matrix={allocation_result['matrix_build_time']:.4f}s "
-        f"optimize_N_i={allocation_result['optimize_time']:.4f}s "
-        f"phase2_sampling={sampling_result['phase2_sampling_time']:.3f}s "
-        f"phase2_ks={sampling_result['phase2_ks_time']:.3f}s"
-    )
-
     return {
-        "resolved_step_points": [int(x) for x in resolved_step_points],
-        "split_points": [int(x) for x in split_points],
-        "sigma_times": [int(x) for x in sigma_times],
-        "sigma_estimates": sigma_estimates,
-        "tau_estimate": tau_estimate,
+        **payload,
         "optimal_M_k": [float(x) for x in allocation_result["allocation_weights"]],
         "allocation_dual_weights": [
             float(x) for x in allocation_result["dual_weights"]
@@ -1885,16 +2953,43 @@ def _run_single_estimate_and_sample_trial(
         "allocation_worst_case_simplex_objective": float(
             allocation_result["worst_case_simplex_objective"]
         ),
+        "allocation_segment_costs": [float(x) for x in segment_costs],
+        "allocation_cost_weights": [float(x) for x in cost_weights],
         "N_i": [float(x) for x in split_factors],
         "n0": int(n0),
         "final_root_count": int(n0),
         "expected_cost_per_root": float(expected_cost_per_root),
         "expected_total_samples": float(expected_total_samples),
-        "used_B1": int(used_B1),
         "B2": int(B2),
-        **phase1_metadata,
-        **sampling_result,
+        "phase1_sigma_matrix_time": float(allocation_result["matrix_build_time"]),
+        "phase1_optimize_time": float(allocation_result["optimize_time"]),
     }
+
+
+def _solve_phase1_allocations_threaded(
+    payloads: Sequence[Dict[str, Any]],
+    *,
+    B: int,
+    T: int,
+    sampling_steps: int,
+    eta: float,
+    x_grid: Sequence[float],
+):
+    if not payloads:
+        return []
+
+    def solve_one(payload):
+        return _solve_phase1_allocation(
+            payload,
+            B=B,
+            T=T,
+            sampling_steps=sampling_steps,
+            eta=eta,
+            x_grid=x_grid,
+        )
+
+    with ThreadPoolExecutor(max_workers=len(payloads)) as executor:
+        return list(executor.map(solve_one, payloads))
 
 
 def run_estimate_and_sample(
@@ -1917,8 +3012,11 @@ def run_estimate_and_sample(
     n_runs: int,
     seed: int | None,
     device: str,
-    reference_mode: str = "samples",
+    reference_mode: str = "ddpm_samples",
     debug: bool = False,
+    n_parallel: int = 1,
+    run_start_index: int = 0,
+    return_trial_results: bool = False,
 ):
     if B1 < 0:
         raise ValueError("B1 must be nonnegative")
@@ -1932,35 +3030,142 @@ def run_estimate_and_sample(
         "Starting estimate_and_sample run "
         f"with B={B}, B1={B1}, sampling_steps={sampling_steps}, eta={eta}",
     )
-    trial_results = []
-    for run_idx in tqdm(range(n_runs), desc="Runs", leave=False):
-        run_seed = None if seed is None else seed + run_idx
-        trial_results.append(
-            _run_single_estimate_and_sample_trial(
-                model=model,
-                target_spec=target_spec,
-                data_mean=data_mean,
-                data_std=data_std,
-                reference_cdf_state=reference_cdf_state,
-                B=B,
-                B1=B1,
-                T=T,
-                sampling_steps=sampling_steps,
-                eta=eta,
-                split_percentages=split_percentages,
-                x_grid=x_grid,
-                independent_n2=independent_n2,
-                sigma_estimation_mode=sigma_estimation_mode,
-                reuse_phase1_samples=reuse_phase1_samples,
-                seed=run_seed,
-                device=device,
-                reference_mode=reference_mode,
-                debug=debug,
-            )
-        )
 
-    if not trial_results:
-        raise ValueError("n_runs must be at least 1")
+    chunks = list(_iter_run_chunks(n_runs, n_parallel))
+    trial_results = [None] * n_runs
+    allocation_futures = []
+    allocation_workers = max(1, min(n_runs, n_parallel))
+
+    with ThreadPoolExecutor(max_workers=allocation_workers) as allocation_executor:
+        if sigma_estimation_mode == "pilot_tree":
+            for start, end in tqdm(chunks, desc="Phase 1", leave=False):
+                chunk_size = end - start
+                run_seed = None if seed is None else seed + run_start_index + start
+                phase1_payloads = _run_pilot_tree_phase1_sampling_batch(
+                    model=model,
+                    data_mean=data_mean,
+                    data_std=data_std,
+                    B1=B1,
+                    T=T,
+                    sampling_steps=sampling_steps,
+                    eta=eta,
+                    split_percentages=split_percentages,
+                    x_grid=x_grid,
+                    reuse_phase1_samples=reuse_phase1_samples,
+                    device=device,
+                    chunk_size=chunk_size,
+                    debug=debug,
+                    generator=_make_torch_generator(run_seed, device),
+                )
+                # Overlap CPU allocation solves with subsequent GPU Phase 1 chunks.
+                for local_idx, payload in enumerate(phase1_payloads):
+                    run_idx = start + local_idx
+                    future = allocation_executor.submit(
+                        _solve_phase1_allocation,
+                        payload,
+                        B=B,
+                        T=T,
+                        sampling_steps=sampling_steps,
+                        eta=eta,
+                        x_grid=x_grid,
+                    )
+                    allocation_futures.append((run_idx, future))
+        else:
+            for start, end in tqdm(chunks, desc="Phase 1", leave=False):
+                chunk_size = end - start
+                run_seed = None if seed is None else seed + run_start_index + start
+                phase1_payloads = _run_independent_phase1_sampling_batch(
+                    model=model,
+                    data_mean=data_mean,
+                    data_std=data_std,
+                    B1=B1,
+                    T=T,
+                    sampling_steps=sampling_steps,
+                    eta=eta,
+                    split_percentages=split_percentages,
+                    x_grid=x_grid,
+                    independent_n2=independent_n2,
+                    reuse_phase1_samples=reuse_phase1_samples,
+                    device=device,
+                    chunk_size=chunk_size,
+                    debug=debug,
+                    generator=_make_torch_generator(run_seed, device),
+                )
+                # Overlap CPU allocation solves with subsequent GPU Phase 1 chunks.
+                for local_idx, payload in enumerate(phase1_payloads):
+                    run_idx = start + local_idx
+                    future = allocation_executor.submit(
+                        _solve_phase1_allocation,
+                        payload,
+                        B=B,
+                        T=T,
+                        sampling_steps=sampling_steps,
+                        eta=eta,
+                        x_grid=x_grid,
+                    )
+                    allocation_futures.append((run_idx, future))
+
+        for run_idx, future in tqdm(
+            allocation_futures, desc="Optimize N_i", leave=False
+        ):
+            trial_results[run_idx] = future.result()
+
+    if any(trial is None for trial in trial_results):
+        raise RuntimeError("Phase 1 allocation did not produce all trial results")
+
+    ddim = DDIM(T=T, device=device, eta=eta, sampling_steps=sampling_steps)
+    ks_futures = []
+    _warm_ks_kernel_for_mode(reference_mode, target_spec)
+    ks_workers = max(1, min(int(n_parallel), n_runs))
+    with ThreadPoolExecutor(max_workers=ks_workers) as ks_executor:
+        for start, end in tqdm(chunks, desc="Phase 2", leave=False):
+            chunk = trial_results[start:end]
+            chunk_size = end - start
+            run_seed = (
+                None
+                if seed is None
+                else seed + PHASE2_SEED_OFFSET + run_start_index + start
+            )
+            samples_by_run, realized_costs, sampling_time = (
+                _run_probabilistic_inference_batch(
+                    model=model,
+                    ddim=ddim,
+                    n0_by_run=[int(trial["n0"]) for trial in chunk],
+                    split_points=chunk[0]["split_points"],
+                    split_factors_by_run=[trial["N_i"] for trial in chunk],
+                    data_mean=data_mean,
+                    data_std=data_std,
+                    generator=_make_torch_generator(run_seed, device),
+                )
+            )
+            phase2_sampling_time = sampling_time / chunk_size
+            _submit_sampling_trial_result_futures(
+                executor=ks_executor,
+                futures=ks_futures,
+                run_indices=range(start, end),
+                samples_by_run=samples_by_run,
+                realized_costs=realized_costs,
+                phase2_sampling_time=phase2_sampling_time,
+                target_spec=target_spec,
+                reference_cdf_state=reference_cdf_state,
+                reference_mode=reference_mode,
+                phase1_x0_samples_by_run=[
+                    trial.get("phase1_x0_samples") for trial in chunk
+                ],
+            )
+
+        for run_idx, future in tqdm(ks_futures, desc="KS", leave=False):
+            sampling_result = future.result()
+            trial = trial_results[run_idx]
+            trial.update(sampling_result)
+            print(
+                f"[timings] diffusion={trial['phase1_diffusion_time']:.3f}s "
+                f"estimate_sigmas={trial['phase1_estimation_time']:.3f}s "
+                f"sigma_matrix={trial['phase1_sigma_matrix_time']:.4f}s "
+                f"optimize_N_i={trial['phase1_optimize_time']:.4f}s "
+                f"phase2_sampling={sampling_result['phase2_sampling_time']:.3f}s "
+                f"phase2_ks={sampling_result['phase2_ks_time']:.3f}s"
+            )
 
     stats = _summarize_sampling_trials(trial_results)
     sigma_estimates = _average_sigma_estimates(
@@ -1980,7 +3185,7 @@ def run_estimate_and_sample(
         f"Sampling complete: mean_ks={stats['mean_ks']:.6f}, extinction_rate={stats['extinction_rate']:.6f}",
     )
 
-    return {
+    result = {
         "mode": "estimate_and_sample",
         "B": int(B),
         "B1": int(B1),
@@ -2029,6 +3234,8 @@ def run_estimate_and_sample(
                 for trial in trial_results
             ]
         ),
+        "allocation_segment_costs": trial_results[0]["allocation_segment_costs"],
+        "allocation_cost_weights": trial_results[0]["allocation_cost_weights"],
         "N_i": _mean_vector([trial["N_i"] for trial in trial_results]),
         "N_i_std": _std_vector([trial["N_i"] for trial in trial_results]),
         "N_i_count": int(len(trial_results)),
@@ -2059,6 +3266,9 @@ def run_estimate_and_sample(
         "B2": _mean_scalar([trial["B2"] for trial in trial_results]),
         **stats,
     }
+    if return_trial_results:
+        result["trial_results"] = trial_results
+    return result
 
 
 def run_fixed_N_sampling(
@@ -2077,13 +3287,12 @@ def run_fixed_N_sampling(
     n_runs: int,
     seed: int | None,
     device: str,
-    reference_mode: str = "samples",
+    reference_mode: str = "ddpm_samples",
     debug: bool = False,
+    n_parallel: int = 1,
+    run_start_index: int = 0,
+    return_trial_results: bool = False,
 ):
-    if seed is not None:
-        torch.manual_seed(seed)
-        np.random.seed(seed)
-
     _debug_log(
         debug,
         "Starting fixed_N run "
@@ -2123,7 +3332,11 @@ def run_fixed_N_sampling(
         data_std=data_std,
         reference_cdf_state=reference_cdf_state,
         reference_mode=reference_mode,
+        seed=seed,
         debug=debug,
+        n_parallel=n_parallel,
+        run_start_index=run_start_index,
+        return_trial_results=return_trial_results,
     )
     _debug_log(
         debug,

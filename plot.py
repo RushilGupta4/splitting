@@ -3,6 +3,7 @@ import csv
 import math
 import os
 from collections import defaultdict
+from statistics import NormalDist
 
 import matplotlib
 
@@ -36,6 +37,12 @@ def parse_args():
         "--std",
         action="store_true",
         help="Show mean_ks +/- std_ks intervals when std_ks is available",
+    )
+    parser.add_argument(
+        "--ci",
+        type=float,
+        default=None,
+        help="Show confidence interval for mean_ks at this level, e.g. 0.95",
     )
     return parser.parse_args()
 
@@ -98,6 +105,7 @@ def _load_rows(csv_path: str):
                     "eta": eta,
                     "mean_ks": mean_ks,
                     "std_ks": _parse_float(raw_row.get("std_ks", "")),
+                    "n_valid_runs": _parse_int(raw_row.get("n_valid_runs", "")),
                     "mode": raw_row.get("mode", "").strip(),
                     "method_label": raw_row.get("method_label", "").strip(),
                     "solver": raw_row.get("solver", "").strip(),
@@ -195,12 +203,24 @@ def _solver_style_from_key(series_key, solver_styles):
     )
 
 
-def _fill_std_interval(ax, x_values, y_values, std_values, color, zorder):
-    if any(std_ks is None for std_ks in std_values):
+def _ci_multiplier(confidence_level: float, degrees_of_freedom: int):
+    if not 0.0 < confidence_level < 1.0:
+        raise ValueError("--ci must be between 0 and 1, e.g. 0.95")
+    quantile = 0.5 + confidence_level / 2.0
+    try:
+        from scipy.stats import t
+
+        return float(t.ppf(quantile, degrees_of_freedom))
+    except ImportError:
+        return NormalDist().inv_cdf(quantile)
+
+
+def _fill_interval(ax, x_values, y_values, half_widths, color, zorder):
+    if any(width is None for width in half_widths):
         return
 
-    lower = [max(y - std_ks, 1e-12) for y, std_ks in zip(y_values, std_values)]
-    upper = [y + std_ks for y, std_ks in zip(y_values, std_values)]
+    lower = [max(y - width, 1e-12) for y, width in zip(y_values, half_widths)]
+    upper = [y + width for y, width in zip(y_values, half_widths)]
     ax.fill_between(
         x_values,
         lower,
@@ -212,7 +232,19 @@ def _fill_std_interval(ax, x_values, y_values, std_values, color, zorder):
     )
 
 
-def _plot_schedule(ax, schedule_rows, b1_colors, solver_styles, show_std):
+def _ci_half_width(std_ks, n_valid_runs, ci_level):
+    if std_ks is None or n_valid_runs is None or n_valid_runs <= 1:
+        return None
+    # compare.py stores population std (ddof=0); convert to the usual SE from
+    # the unbiased sample variance: sqrt(n/(n-1))*std/sqrt(n) = std/sqrt(n-1).
+    return (
+        _ci_multiplier(ci_level, n_valid_runs - 1)
+        * std_ks
+        / math.sqrt(n_valid_runs - 1)
+    )
+
+
+def _plot_schedule(ax, schedule_rows, b1_colors, solver_styles, show_std, ci_level):
     grouped = defaultdict(list)
     for row in schedule_rows:
         grouped[_series_key(row)].append(row)
@@ -222,10 +254,20 @@ def _plot_schedule(ax, schedule_rows, b1_colors, solver_styles, show_std):
         x_values = [row["B"] for row in points]
         y_values = [row["mean_ks"] for row in points]
         std_values = [row["std_ks"] for row in points]
+        ci_values = (
+            [
+                _ci_half_width(row["std_ks"], row["n_valid_runs"], ci_level)
+                for row in points
+            ]
+            if ci_level is not None
+            else None
+        )
 
         if series_key[0] == "baseline":
             if show_std:
-                _fill_std_interval(ax, x_values, y_values, std_values, "black", 2)
+                _fill_interval(ax, x_values, y_values, std_values, "black", 2)
+            if ci_values is not None:
+                _fill_interval(ax, x_values, y_values, ci_values, "black", 2)
             ax.plot(
                 x_values,
                 y_values,
@@ -243,7 +285,9 @@ def _plot_schedule(ax, schedule_rows, b1_colors, solver_styles, show_std):
                 series_key, solver_styles
             )
             if show_std:
-                _fill_std_interval(ax, x_values, y_values, std_values, color, 3)
+                _fill_interval(ax, x_values, y_values, std_values, color, 3)
+            if ci_values is not None:
+                _fill_interval(ax, x_values, y_values, ci_values, color, 3)
             ax.plot(
                 x_values,
                 y_values,
@@ -261,7 +305,9 @@ def _plot_schedule(ax, schedule_rows, b1_colors, solver_styles, show_std):
         linestyle = ":" if sigma_estimation_mode == "pilot_tree" else "-"
         marker = "s" if reuse_phase1_samples else "o"
         if show_std:
-            _fill_std_interval(ax, x_values, y_values, std_values, color, 1)
+            _fill_interval(ax, x_values, y_values, std_values, color, 1)
+        if ci_values is not None:
+            _fill_interval(ax, x_values, y_values, ci_values, color, 1)
         ax.plot(
             x_values,
             y_values,
@@ -388,6 +434,7 @@ def main():
             b1_colors,
             solver_styles,
             args.std,
+            args.ci,
         )
         sampling_steps, eta = schedule
         ax.set_title(f"steps={sampling_steps}, eta={_format_eta(eta)}")

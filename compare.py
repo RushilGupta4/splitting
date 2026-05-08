@@ -1,5 +1,6 @@
 import argparse
 import csv
+import hashlib
 import itertools
 import json
 import logging
@@ -14,11 +15,18 @@ from ensure_samples import (
     extract_reference_samples_tensor,
     load_reference_payload,
     reference_samples_path,
+    true_reference_samples_path,
 )
 from infer import (
+    DDIM,
+    _expected_cost_per_root,
     _load_model_and_stats,
+    _mean_scalar,
+    _mean_vector,
     _parse_split_percentages,
     _parse_x_grid,
+    _resolve_split_percentages,
+    _std_vector,
     prepare_reference_cdf_state,
     run_estimate_and_sample,
     run_fixed_N_sampling,
@@ -28,11 +36,8 @@ from infer import (
 
 log = logging.getLogger("compare")
 
-# SIGMA_MODES = ("pilot_tree", "independent")
-SIGMA_MODES = ("pilot_tree",)
-# SIGMA_MODES = ("independent",)
-REUSE_FLAGS = (False, True)
 SUPPORTED_SOLVERS = ("ddim", "dpmpp_2m")
+SUPPORTED_SIGMA_ESTIMATION_MODES = ("pilot_tree", "independent")
 
 CSV_FIELDS = [
     "record_id",
@@ -60,6 +65,7 @@ CSV_FIELDS = [
     "mean_ks",
     "std_ks",
     "var_ks",
+    "n_valid_runs",
     "extinction_rate",
     "is_best_for_pair",
     "error",
@@ -108,23 +114,47 @@ def parse_args():
         help="Comma-separated 'steps:eta' pairs, e.g. '1000:1.0,500:1.0'",
     )
     parser.add_argument(
-        "--solver_baselines",
+        "--baselines",
         type=str,
-        # default="ddim_40_eta0,dpmpp_2m_40,dpmpp_2m_100,dpmpp_2m_200",
-        default="dpmpp_2m_40",
+        default="fixed_N,dpmpp_2m_100",
         help=(
-            "Comma-separated solver baselines in '<solver>_<steps>' or "
-            "'<solver>_<steps>_eta<eta>' format. Supported solvers: "
-            f"{', '.join(SUPPORTED_SOLVERS)}. Use '' to disable."
+            "Comma-separated baselines. Use 'fixed_N' for the all-ones fixed_N "
+            "baseline, or '<solver>_<steps>' / '<solver>_<steps>_eta<eta>' for a "
+            f"solver baseline. Supported solvers: {', '.join(SUPPORTED_SOLVERS)}. "
+            "Use '' to disable."
         ),
     )
     parser.add_argument(
+        "--sigma_modes",
+        type=str,
+        default="pilot_tree,independent",
+        help=(
+            "Comma-separated sigma estimation modes for adaptive methods. "
+            f"Supported modes: {', '.join(SUPPORTED_SIGMA_ESTIMATION_MODES)}."
+        ),
+    )
+    parser.add_argument(
+        "--reuse_flags",
+        type=str,
+        default="false,true",
+        help="Comma-separated reuse_phase1_samples flags, e.g. 'false,true' or 'true'.",
+    )
+    parser.add_argument(
         "--reference_mode",
-        choices=("samples", "true_dist"),
-        default="samples",
-        help="samples uses cached DDPM/DDIM reference samples; true_dist uses the exact target CDF.",
+        choices=("true_dist", "true_samples", "ddpm_samples"),
+        default="ddpm_samples",
+        help=(
+            "ddpm_samples uses cached DDPM/DDIM reference samples; true_samples uses "
+            "cached target-distribution samples; true_dist uses the exact target CDF."
+        ),
     )
     parser.add_argument("--n_runs", type=int, default=100)
+    parser.add_argument(
+        "--n_parallel",
+        type=int,
+        default=1,
+        help="Number of trials to batch together within each setup.",
+    )
     parser.add_argument("--T", type=int, default=1000)
     parser.add_argument(
         "--split_percentages",
@@ -137,14 +167,17 @@ def parse_args():
     parser.add_argument(
         "--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu"
     )
-    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num_base_samples", type=int, default=1000000)
-    parser.add_argument("--output", type=str, default="outputs/compare_results.json")
     parser.add_argument(
-        "--csv_output",
+        "--output_dir",
         type=str,
-        default=None,
-        help="Path to summary CSV (default: --output with .csv)",
+        required=True,
+        help="Directory for compact run cache and derived CSV summary.",
+    )
+    parser.add_argument(
+        "--no_compile",
+        action="store_true",
+        help="Disable torch.compile for timing/debug runs.",
     )
     parser.add_argument("--debug", action="store_true")
     return parser.parse_args()
@@ -172,7 +205,12 @@ def _parse_step_eta_pairs(raw: str) -> List[Tuple[int, float]]:
     return pairs
 
 
-def _parse_solver_baseline_name(name: str) -> Dict[str, Any]:
+def _parse_baseline_name(name: str) -> Dict[str, Any]:
+    if name == "fixed_N":
+        return {
+            "mode": "fixed_N",
+            "method_label": "all_ones_baseline",
+        }
     for solver in sorted(SUPPORTED_SOLVERS, key=len, reverse=True):
         prefix = f"{solver}_"
         if not name.startswith(prefix):
@@ -214,14 +252,51 @@ def _parse_solver_baseline_name(name: str) -> Dict[str, Any]:
 
     supported = ", ".join(SUPPORTED_SOLVERS)
     raise ValueError(
-        f"Unknown solver baseline '{name}'. Expected '<solver>_<steps>' or "
+        f"Unknown baseline '{name}'. Expected 'fixed_N', '<solver>_<steps>', or "
         f"'<solver>_<steps>_eta<eta>' with supported solvers: {supported}"
     )
 
 
-def _parse_solver_baselines(raw: str) -> List[Dict[str, Any]]:
+def _parse_baselines(raw: str) -> List[Dict[str, Any]]:
     names = [x.strip() for x in raw.split(",") if x.strip()]
-    return [_parse_solver_baseline_name(name) for name in names]
+    return [_parse_baseline_name(name) for name in names]
+
+
+def _parse_sigma_modes(raw: str) -> List[str]:
+    modes = [x.strip() for x in raw.split(",") if x.strip()]
+    if not modes:
+        raise ValueError("sigma_modes must have at least one value")
+    unsupported = [
+        mode for mode in modes if mode not in SUPPORTED_SIGMA_ESTIMATION_MODES
+    ]
+    if unsupported:
+        supported = ", ".join(SUPPORTED_SIGMA_ESTIMATION_MODES)
+        raise ValueError(
+            f"Unsupported sigma_modes value(s): {', '.join(unsupported)}. "
+            f"Supported modes: {supported}"
+        )
+    return modes
+
+
+def _parse_bool_list(raw: str, name: str) -> List[bool]:
+    truthy = {"1", "true", "t", "yes", "y"}
+    falsy = {"0", "false", "f", "no", "n"}
+    values = []
+    for item in raw.split(","):
+        item = item.strip().lower()
+        if not item:
+            continue
+        if item in truthy:
+            values.append(True)
+        elif item in falsy:
+            values.append(False)
+        else:
+            raise ValueError(
+                f"{name} must contain boolean values like true,false or 1,0; got '{item}'"
+            )
+    if not values:
+        raise ValueError(f"{name} must have at least one value")
+    return values
 
 
 def _unique_step_eta_pairs(pairs: List[Tuple[int, float]]) -> List[Tuple[int, float]]:
@@ -240,31 +315,15 @@ def _build_trial_specs(
     B_list: List[int],
     B1_list: List[int],
     step_eta_pairs: List[Tuple[int, float]],
-    solver_baselines: List[Dict[str, Any]],
+    baselines: List[Dict[str, Any]],
+    sigma_modes: List[str],
+    reuse_flags: List[bool],
 ) -> List[Dict[str, Any]]:
-    """Every experiment (baseline + adaptive variants) as a flat list of spec dicts."""
+    """Every experiment (baselines + adaptive variants) as a flat list of spec dicts."""
     specs: List[Dict[str, Any]] = []
     for B, (steps, eta) in itertools.product(B_list, step_eta_pairs):
-        specs.append(
-            {
-                "mode": "fixed_N",
-                "B": B,
-                "B1": None,
-                "sampling_steps": steps,
-                "eta": eta,
-                "reference_sampling_steps": steps,
-                "reference_eta": eta,
-                "solver": None,
-                "solver_sampling_steps": None,
-                "solver_eta": None,
-                "solver_nfe": None,
-                "sigma_estimation_mode": None,
-                "reuse_phase1_samples": None,
-                "method_label": "all_ones_baseline",
-            }
-        )
         for B1, sigma_mode, reuse in itertools.product(
-            B1_list, SIGMA_MODES, REUSE_FLAGS
+            B1_list, sigma_modes, reuse_flags
         ):
             if B1 >= B:
                 log.info("Skipping config with B1=%s >= B=%s", B1, B)
@@ -287,8 +346,8 @@ def _build_trial_specs(
                     "method_label": f"{sigma_mode}_{'reuse' if reuse else 'fresh'}",
                 }
             )
-        for solver_spec in solver_baselines:
-            spec = dict(solver_spec)
+        for baseline_spec in baselines:
+            spec = dict(baseline_spec)
             spec["B"] = B
             spec["B1"] = None
             spec["sampling_steps"] = steps
@@ -297,7 +356,13 @@ def _build_trial_specs(
             spec["reference_eta"] = eta
             spec["sigma_estimation_mode"] = None
             spec["reuse_phase1_samples"] = None
-            spec["solver_nfe"] = int(spec["solver_sampling_steps"])
+            if spec["mode"] == "solver_baseline":
+                spec["solver_nfe"] = int(spec["solver_sampling_steps"])
+            else:
+                spec["solver"] = None
+                spec["solver_sampling_steps"] = None
+                spec["solver_eta"] = None
+                spec["solver_nfe"] = None
             specs.append(spec)
     return specs
 
@@ -314,7 +379,11 @@ def _run_trial(
     split_percentages,
     x_grid,
     seed: int,
+    n_runs: int | None = None,
+    run_start_index: int = 0,
+    return_trial_results: bool = False,
 ) -> Dict[str, Any]:
+    n_runs = args.n_runs if n_runs is None else n_runs
     common = dict(
         model=model,
         target_spec=target_spec,
@@ -326,11 +395,14 @@ def _run_trial(
         sampling_steps=spec["sampling_steps"],
         eta=spec["eta"],
         split_percentages=split_percentages,
-        n_runs=args.n_runs,
+        n_runs=n_runs,
         seed=seed,
         device=args.device,
         reference_mode=args.reference_mode,
         debug=args.debug,
+        n_parallel=args.n_parallel,
+        run_start_index=run_start_index,
+        return_trial_results=return_trial_results,
     )
     if spec["mode"] == "solver_baseline":
         return run_solver_baseline_sampling(
@@ -344,11 +416,14 @@ def _run_trial(
             T=args.T,
             sampling_steps=spec["solver_sampling_steps"],
             eta=spec["solver_eta"],
-            n_runs=args.n_runs,
+            n_runs=n_runs,
             seed=seed,
             device=args.device,
             reference_mode=args.reference_mode,
             debug=args.debug,
+            n_parallel=args.n_parallel,
+            run_start_index=run_start_index,
+            return_trial_results=return_trial_results,
         )
     if spec["mode"] == "fixed_N":
         return run_fixed_N_sampling(
@@ -450,8 +525,8 @@ def _write_summary_csv(csv_path: str, rows: List[Dict[str, Any]]):
 
 
 def _json_safe(value):
-    # Drops any "samples" key to keep the payload compact — per-run sample arrays
-    # are large and not needed downstream of the CSV summary.
+    # Drops any "samples" key defensively; per-run sample arrays are large and
+    # not needed downstream of the CSV summary.
     if isinstance(value, dict):
         return {str(k): _json_safe(v) for k, v in value.items() if k != "samples"}
     if isinstance(value, (list, tuple)):
@@ -467,12 +542,350 @@ def _json_safe(value):
     return value
 
 
+RUN_CACHE_SCHEMA_VERSION = 1
+
+
+def _canonical_json(value) -> str:
+    return json.dumps(_json_safe(value), sort_keys=True, separators=(",", ":"))
+
+
+def _checkpoint_identity(path: str) -> Dict[str, Any]:
+    identity = {"path": os.path.abspath(path)}
+    if os.path.exists(path):
+        stat = os.stat(path)
+        identity["mtime_ns"] = int(stat.st_mtime_ns)
+        identity["size"] = int(stat.st_size)
+    return identity
+
+
+def _runs_dir_for_output_dir(output_dir: str) -> str:
+    return os.path.join(output_dir, "runs")
+
+
+def _csv_path_for_output_dir(
+    output_dir: str, independent_n2: int, split_percentages: str
+):
+    split_tag = split_percentages.replace(",", "_")
+    return os.path.join(
+        output_dir, f"compare_results_{independent_n2},_{split_tag}.csv"
+    )
+
+
+def _config_cache_key(
+    args,
+    spec: Dict[str, Any],
+    *,
+    split_percentages: List[float],
+    x_grid: List[float],
+) -> Dict[str, Any]:
+    cache_key = {
+        "schema_version": RUN_CACHE_SCHEMA_VERSION,
+        "checkpoint": _checkpoint_identity(args.checkpoint),
+        "reference_mode": args.reference_mode,
+        "num_base_samples": int(args.num_base_samples),
+        "T": int(args.T),
+        "spec": _json_safe(spec),
+    }
+    if spec["mode"] in {"estimate_and_sample", "fixed_N"}:
+        cache_key["split_percentages"] = [float(x) for x in split_percentages]
+    if spec["mode"] == "estimate_and_sample":
+        cache_key["x_grid"] = [float(x) for x in x_grid]
+        if spec.get("sigma_estimation_mode") == "independent":
+            cache_key["independent_n2"] = int(args.independent_n2)
+    if args.reference_mode == "ddpm_samples":
+        cache_key["reference_samples"] = _checkpoint_identity(
+            reference_samples_path(
+                args.checkpoint,
+                int(spec["reference_sampling_steps"]),
+                float(spec["reference_eta"]),
+            )
+        )
+    elif args.reference_mode == "true_samples":
+        cache_key["reference_samples"] = _checkpoint_identity(
+            true_reference_samples_path(args.checkpoint)
+        )
+    return cache_key
+
+
+def _config_id(cache_key: Dict[str, Any]) -> str:
+    digest = hashlib.sha256(_canonical_json(cache_key).encode("utf-8")).hexdigest()
+    return digest[:16]
+
+
+def _seed_for_cache_key(cache_key: Dict[str, Any]) -> int:
+    digest = hashlib.sha256(_canonical_json(cache_key).encode("utf-8")).hexdigest()
+    return int(digest[:16], 16) % (2**63 - 1)
+
+
+def _compact_runs_path(config_dir: str) -> str:
+    return os.path.join(config_dir, "runs.txt")
+
+
+def _write_json_atomic(path: str, payload: Dict[str, Any]):
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    tmp_path = f"{path}.tmp.{os.getpid()}"
+    with open(tmp_path, "w") as f:
+        json.dump(_json_safe(payload), f, indent=2)
+    os.replace(tmp_path, path)
+
+
+def _format_cache_float(value) -> str:
+    return f"{float(value):.17g}"
+
+
+def _compact_trial_for_cache(
+    spec: Dict[str, Any], trial: Dict[str, Any]
+) -> Dict[str, Any]:
+    compact = {
+        "ks_distance": float(trial["ks_distance"]),
+        "extinct": bool(int(trial["leaf_count"]) == 0),
+    }
+    if spec["mode"] == "estimate_and_sample":
+        compact.update(
+            {
+                "N_i": [float(x) for x in trial["N_i"]],
+                "n0": int(trial["n0"]),
+                "used_B1": int(trial["used_B1"]),
+            }
+        )
+    return compact
+
+
+def _compact_trial_to_line(spec: Dict[str, Any], trial: Dict[str, Any]) -> str:
+    fields = [
+        _format_cache_float(trial["ks_distance"]),
+        "1" if trial["extinct"] else "0",
+    ]
+    if spec["mode"] == "estimate_and_sample":
+        fields.extend([str(int(trial["n0"])), str(int(trial["used_B1"]))])
+        fields.extend(_format_cache_float(x) for x in trial["N_i"])
+    return "\t".join(fields)
+
+
+def _parse_compact_trial_line(line: str, spec: Dict[str, Any]) -> Dict[str, Any]:
+    parts = line.rstrip("\n").split("\t")
+    if spec["mode"] == "estimate_and_sample":
+        if len(parts) < 5:
+            raise ValueError("adaptive run lines need ks, extinct, n0, used_B1, and N_i")
+        return {
+            "ks_distance": float(parts[0]),
+            "extinct": bool(int(parts[1])),
+            "n0": int(parts[2]),
+            "used_B1": int(parts[3]),
+            "N_i": [float(x) for x in parts[4:]],
+        }
+    if len(parts) != 2:
+        raise ValueError("baseline run lines need ks and extinct")
+    return {
+        "ks_distance": float(parts[0]),
+        "extinct": bool(int(parts[1])),
+    }
+
+
+def _load_cached_run_payloads(
+    config_dir: str, spec: Dict[str, Any], n_runs: int
+) -> Dict[int, Dict[str, Any]]:
+    cached = {}
+    path = _compact_runs_path(config_dir)
+    if not os.path.exists(path):
+        return cached
+    try:
+        with open(path) as f:
+            for run_number, line in enumerate(f, start=1):
+                if run_number > n_runs:
+                    break
+                if not line.strip():
+                    continue
+                try:
+                    trial = _parse_compact_trial_line(line, spec)
+                except (TypeError, ValueError) as exc:
+                    log.warning(
+                        "Ignoring invalid compact run cache %s line %s: %s",
+                        path,
+                        run_number,
+                        exc,
+                    )
+                    continue
+                cached[run_number] = {"run_number": run_number, "trial": trial}
+    except OSError as exc:
+        log.warning("Ignoring unreadable compact run cache %s: %s", path, exc)
+    return cached
+
+
+def _write_compact_runs_atomic(
+    config_dir: str,
+    spec: Dict[str, Any],
+    cached: Dict[int, Dict[str, Any]],
+):
+    path = _compact_runs_path(config_dir)
+    os.makedirs(config_dir, exist_ok=True)
+    tmp_path = f"{path}.tmp.{os.getpid()}"
+    max_run = max(cached, default=0)
+    with open(tmp_path, "w") as f:
+        for run_number in range(1, max_run + 1):
+            payload = cached.get(run_number)
+            if payload is None:
+                f.write("\n")
+                continue
+            f.write(_compact_trial_to_line(spec, payload["trial"]) + "\n")
+    os.replace(tmp_path, path)
+
+
+def _iter_consecutive_ranges(values: List[int]):
+    if not values:
+        return
+    sorted_values = sorted(values)
+    start = prev = sorted_values[0]
+    for value in sorted_values[1:]:
+        if value == prev + 1:
+            prev = value
+            continue
+        yield start, prev
+        start = prev = value
+    yield start, prev
+
+
+def _summarize_cached_sampling_trials(trials: List[Dict[str, Any]]) -> Dict[str, Any]:
+    ks_distances = np.array(
+        [trial.get("ks_distance", np.nan) for trial in trials], dtype=float
+    )
+    extinct = np.array([bool(trial["extinct"]) for trial in trials], dtype=bool)
+
+    valid_ks = ks_distances[~np.isnan(ks_distances)]
+    if valid_ks.size:
+        mean_ks = float(np.mean(valid_ks))
+        std_ks = float(np.std(valid_ks))
+        var_ks = float(np.var(valid_ks))
+    else:
+        mean_ks = std_ks = var_ks = float("nan")
+
+    return {
+        "mean_ks": mean_ks,
+        "std_ks": std_ks,
+        "var_ks": var_ks,
+        "n_valid_runs": int(valid_ks.size),
+        "extinction_rate": float(np.mean(extinct)) if extinct.size else 0.0,
+    }
+
+
+def _aggregate_cached_runs(
+    spec: Dict[str, Any],
+    run_payloads: List[Dict[str, Any]],
+    *,
+    args,
+    split_percentages: List[float],
+    x_grid: List[float],
+) -> Dict[str, Any]:
+    trials = [
+        payload["trial"]
+        for payload in sorted(run_payloads, key=lambda p: p["run_number"])
+    ]
+    stats = _summarize_cached_sampling_trials(trials)
+
+    if not trials:
+        return {**spec, "error": "No completed cached runs", "N_i": []}
+
+    if spec["mode"] == "solver_baseline":
+        solver_sampling_steps = int(spec["solver_sampling_steps"])
+        n0 = int(spec["B"] // solver_sampling_steps)
+        return {
+            "mode": "solver_baseline",
+            "solver": spec["solver"],
+            "B": int(spec["B"]),
+            "B1": 0,
+            "used_B1": 0,
+            "B2": int(spec["B"]),
+            "sampling_steps": int(spec["sampling_steps"]),
+            "eta": float(spec["eta"]),
+            "reference_mode": args.reference_mode,
+            "solver_nfe": int(solver_sampling_steps),
+            "N_i": [],
+            "N_i_std": [],
+            "N_i_count": int(len(trials)),
+            "n0": int(n0),
+            "final_root_count": int(n0),
+            "expected_cost_per_root": float(solver_sampling_steps),
+            "expected_total_samples": float(n0),
+            **stats,
+        }
+
+    if spec["mode"] == "fixed_N":
+        ddim = DDIM(
+            T=args.T,
+            device="cpu",
+            eta=spec["eta"],
+            sampling_steps=spec["sampling_steps"],
+        )
+        resolved_step_points, split_points = _resolve_split_percentages(
+            ddim, split_percentages
+        )
+        split_factors = [1.0] * len(split_percentages)
+        expected_cost_per_root = _expected_cost_per_root(
+            ddim, split_points, split_factors
+        )
+        n0 = int(spec["B"] // expected_cost_per_root)
+        expected_total_samples = float(n0)
+        for split_factor in split_factors:
+            expected_total_samples *= split_factor
+        return {
+            "mode": "fixed_N",
+            "B": int(spec["B"]),
+            "B1": 0,
+            "used_B1": 0,
+            "B2": int(spec["B"]),
+            "sampling_steps": int(spec["sampling_steps"]),
+            "eta": float(spec["eta"]),
+            "reference_mode": args.reference_mode,
+            "split_percentages": [float(x) for x in split_percentages],
+            "split_step_points": [int(x) for x in resolved_step_points],
+            "split_points": [int(x) for x in split_points],
+            "input_N_i": split_factors,
+            "N_i": split_factors,
+            "N_i_std": [0.0] * len(split_factors),
+            "N_i_count": int(len(trials)),
+            "n0": int(n0),
+            "final_root_count": int(n0),
+            "expected_cost_per_root": float(expected_cost_per_root),
+            "expected_total_samples": float(expected_total_samples),
+            **stats,
+        }
+
+    expected_total_samples = [
+        float(trial["n0"]) * float(np.prod(np.asarray(trial["N_i"], dtype=float)))
+        for trial in trials
+    ]
+    return {
+        "mode": "estimate_and_sample",
+        "B": int(spec["B"]),
+        "B1": int(spec["B1"]),
+        "sampling_steps": int(spec["sampling_steps"]),
+        "eta": float(spec["eta"]),
+        "reference_mode": args.reference_mode,
+        "split_percentages": [float(x) for x in split_percentages],
+        "x_grid": [float(x) for x in x_grid],
+        "sigma_estimation_mode": spec["sigma_estimation_mode"],
+        "independent_n2": int(args.independent_n2),
+        "reuse_phase1_samples": bool(spec["reuse_phase1_samples"]),
+        "N_i": _mean_vector([trial["N_i"] for trial in trials]),
+        "N_i_std": _std_vector([trial["N_i"] for trial in trials]),
+        "N_i_count": int(len(trials)),
+        "n0": _mean_scalar([trial["n0"] for trial in trials]),
+        "expected_total_samples": _mean_scalar(expected_total_samples),
+        "used_B1": _mean_scalar([trial["used_B1"] for trial in trials]),
+        **stats,
+    }
+
+
 def _build_config_payload(
     args,
     B_list,
     B1_list,
     step_eta_pairs,
-    solver_baselines,
+    baselines,
+    sigma_modes,
+    reuse_flags,
     split_percentages,
     x_grid,
     target_spec,
@@ -482,13 +895,14 @@ def _build_config_payload(
         for k, v in vars(args).items()
         if k
         not in {
-            "output",
-            "csv_output",
+            "output_dir",
             "debug",
             "B_list",
             "B1_list",
             "step_eta_pairs",
-            "solver_baselines",
+            "baselines",
+            "sigma_modes",
+            "reuse_flags",
             "split_percentages",
             "x_grid",
         }
@@ -498,7 +912,9 @@ def _build_config_payload(
     config["step_eta_pairs"] = [
         {"sampling_steps": s, "eta": e} for s, e in step_eta_pairs
     ]
-    config["solver_baselines"] = [dict(spec) for spec in solver_baselines]
+    config["baselines"] = [dict(spec) for spec in baselines]
+    config["sigma_modes"] = sigma_modes
+    config["reuse_flags"] = reuse_flags
     config["reference_mode"] = args.reference_mode
     config["split_percentages"] = split_percentages
     config["x_grid"] = x_grid
@@ -510,8 +926,33 @@ def _load_reference_cdf_states(
     checkpoint_path: str,
     step_eta_pairs: List[Tuple[int, float]],
     num_base_samples: int,
+    device: str,
+    reference_mode: str,
 ):
     reference_cdf_states = {}
+    if reference_mode == "true_samples":
+        path = true_reference_samples_path(checkpoint_path)
+        if not os.path.exists(path):
+            raise FileNotFoundError(
+                f"Missing true reference samples: {path}. Run ensure_samples.py first."
+            )
+        payload = load_reference_payload(path, map_location="cpu")
+        samples = extract_reference_samples_tensor(payload)
+        if int(samples.shape[0]) < num_base_samples:
+            raise ValueError(
+                f"True reference samples only contain {samples.shape[0]} points, "
+                f"but --num_base_samples={num_base_samples}. Run ensure_samples.py first."
+            )
+        selected_samples = samples[:num_base_samples]
+        state = prepare_reference_cdf_state(selected_samples)
+        reference_cdf_states["true_samples"] = state
+        log.debug("Loaded true reference samples from %s", path)
+        warm_reference_ks_kernel(state)
+        return reference_cdf_states
+
+    if reference_mode != "ddpm_samples":
+        return reference_cdf_states
+
     for sampling_steps, eta in step_eta_pairs:
         path = reference_samples_path(checkpoint_path, sampling_steps, eta)
         if not os.path.exists(path):
@@ -542,9 +983,8 @@ def _load_reference_cdf_states(
                 )
 
         selected_samples = samples[:num_base_samples]
-        reference_cdf_states[(int(sampling_steps), float(eta))] = (
-            prepare_reference_cdf_state(selected_samples)
-        )
+        state = prepare_reference_cdf_state(selected_samples)
+        reference_cdf_states[(int(sampling_steps), float(eta))] = state
         log.debug(
             "Loaded reference samples for steps=%s eta=%s from %s",
             sampling_steps,
@@ -554,6 +994,22 @@ def _load_reference_cdf_states(
     if reference_cdf_states:
         warm_reference_ks_kernel(next(iter(reference_cdf_states.values())))
     return reference_cdf_states
+
+
+def _reference_state_for_spec(
+    reference_cdf_states: Dict[Any, Any],
+    spec: Dict[str, Any],
+    reference_mode: str,
+):
+    if reference_mode == "true_samples":
+        return reference_cdf_states["true_samples"]
+    if reference_mode == "ddpm_samples":
+        reference_key = (
+            int(spec["reference_sampling_steps"]),
+            float(spec["reference_eta"]),
+        )
+        return reference_cdf_states[reference_key]
+    return None
 
 
 def main():
@@ -568,53 +1024,181 @@ def main():
     B_list = _parse_int_list(args.B_list, "B_list")
     B1_list = _parse_int_list(args.B1_list, "B1_list")
     step_eta_pairs = _parse_step_eta_pairs(args.step_eta_pairs)
-    solver_baselines = _parse_solver_baselines(args.solver_baselines)
-    if args.reference_mode == "samples":
-        reference_cdf_states = _load_reference_cdf_states(
-            args.checkpoint,
-            _unique_step_eta_pairs(step_eta_pairs),
-            args.num_base_samples,
-        )
-    else:
-        reference_cdf_states = {}
+    baselines = _parse_baselines(args.baselines)
+    sigma_modes = _parse_sigma_modes(args.sigma_modes)
+    reuse_flags = _parse_bool_list(args.reuse_flags, "reuse_flags")
     split_percentages = _parse_split_percentages(args.split_percentages)
     x_grid = _parse_x_grid(args.x_grid)
     if args.independent_n2 < 2:
         raise ValueError("independent_n2 must be at least 2")
+    if args.n_runs < 1:
+        raise ValueError("n_runs must be at least 1")
+    if args.n_parallel < 1:
+        raise ValueError("n_parallel must be at least 1")
 
-    model, target_spec, data_mean, data_std = _load_model_and_stats(args)
-    log.debug("Loaded checkpoint %s onto %s", args.checkpoint, args.device)
+    trial_specs = _build_trial_specs(
+        B_list, B1_list, step_eta_pairs, baselines, sigma_modes, reuse_flags
+    )
+    os.makedirs(args.output_dir, exist_ok=True)
+    runs_dir = _runs_dir_for_output_dir(args.output_dir)
 
-    trial_specs = _build_trial_specs(B_list, B1_list, step_eta_pairs, solver_baselines)
+    cache_entries = []
+    total_missing = 0
+    for record_id, spec in enumerate(trial_specs, start=1):
+        cache_key = _config_cache_key(
+            args,
+            spec,
+            split_percentages=split_percentages,
+            x_grid=x_grid,
+        )
+        seed = _seed_for_cache_key(cache_key)
+        config_id = _config_id(cache_key)
+        config_dir = os.path.join(runs_dir, config_id)
+        cached = _load_cached_run_payloads(config_dir, spec, args.n_runs)
+        missing = [run for run in range(1, args.n_runs + 1) if run not in cached]
+        total_missing += len(missing)
+        cache_entries.append(
+            {
+                "record_id": record_id,
+                "spec": spec,
+                "seed": seed,
+                "cache_key": cache_key,
+                "config_id": config_id,
+                "config_dir": config_dir,
+                "cached": cached,
+                "missing": missing,
+            }
+        )
+
+    if total_missing:
+        if args.reference_mode in {"true_samples", "ddpm_samples"}:
+            reference_cdf_states = _load_reference_cdf_states(
+                args.checkpoint,
+                _unique_step_eta_pairs(step_eta_pairs),
+                args.num_base_samples,
+                args.device,
+                args.reference_mode,
+            )
+        else:
+            reference_cdf_states = {}
+
+        model, target_spec, data_mean, data_std = _load_model_and_stats(args)
+        log.debug("Loaded checkpoint %s onto %s", args.checkpoint, args.device)
+
+        global_config = _build_config_payload(
+            args,
+            B_list,
+            B1_list,
+            step_eta_pairs,
+            baselines,
+            sigma_modes,
+            reuse_flags,
+            split_percentages,
+            x_grid,
+            target_spec,
+        )
+
+        for entry in tqdm(cache_entries, desc="Compare sweep"):
+            missing = entry["missing"]
+            if not missing:
+                continue
+
+            spec = entry["spec"]
+            config_dir = entry["config_dir"]
+            config_id = entry["config_id"]
+            _write_json_atomic(
+                os.path.join(config_dir, "config.json"),
+                {
+                    "schema_version": RUN_CACHE_SCHEMA_VERSION,
+                    "config_id": config_id,
+                    "cache_key": entry["cache_key"],
+                    "global_config": global_config,
+                    "spec": spec,
+                },
+            )
+
+            reference_cdf_state = None
+            if args.reference_mode in {"true_samples", "ddpm_samples"}:
+                reference_cdf_state = _reference_state_for_spec(
+                    reference_cdf_states, spec, args.reference_mode
+                )
+
+            for start_run, end_run in _iter_consecutive_ranges(missing):
+                n_segment_runs = end_run - start_run + 1
+                try:
+                    result = _run_trial(
+                        spec,
+                        model=model,
+                        target_spec=target_spec,
+                        data_mean=data_mean,
+                        data_std=data_std,
+                        reference_cdf_state=reference_cdf_state,
+                        args=args,
+                        split_percentages=split_percentages,
+                        x_grid=x_grid,
+                        seed=entry["seed"],
+                        n_runs=n_segment_runs,
+                        run_start_index=start_run - 1,
+                        return_trial_results=True,
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "Failed config %s runs %s-%s: %s",
+                        config_id,
+                        start_run,
+                        end_run,
+                        exc,
+                    )
+                    continue
+
+                if result.get("error"):
+                    log.warning(
+                        "Failed config %s runs %s-%s: %s",
+                        config_id,
+                        start_run,
+                        end_run,
+                        result["error"],
+                    )
+                    continue
+
+                trial_results = result.get("trial_results") or []
+                if len(trial_results) != n_segment_runs:
+                    log.warning(
+                        "Config %s runs %s-%s returned %d/%d trials; not caching",
+                        config_id,
+                        start_run,
+                        end_run,
+                        len(trial_results),
+                        n_segment_runs,
+                    )
+                    continue
+
+                for local_idx, trial in enumerate(trial_results):
+                    run_number = start_run + local_idx
+                    entry["cached"][run_number] = {
+                        "run_number": int(run_number),
+                        "trial": _compact_trial_for_cache(spec, trial),
+                    }
+                _write_compact_runs_atomic(config_dir, spec, entry["cached"])
+    else:
+        log.info("All requested runs are already cached; skipping sweep execution")
 
     records: List[Dict[str, Any]] = []
-    for record_id, spec in enumerate(tqdm(trial_specs, desc="Compare sweep"), start=1):
-        # Offset the seed by record_id so different methods on the same (B, steps, eta)
-        # do not share initial noise — avoids method-correlated bias.
-        seed = args.seed + record_id
-        log.debug("Trial %d: %s", record_id, spec)
-        try:
-            reference_cdf_state = None
-            if args.reference_mode == "samples":
-                reference_key = (
-                    int(spec["reference_sampling_steps"]),
-                    float(spec["reference_eta"]),
-                )
-                reference_cdf_state = reference_cdf_states[reference_key]
-            result = _run_trial(
-                spec,
-                model=model,
-                target_spec=target_spec,
-                data_mean=data_mean,
-                data_std=data_std,
-                reference_cdf_state=reference_cdf_state,
-                args=args,
-                split_percentages=split_percentages,
-                x_grid=x_grid,
-                seed=seed,
-            )
-        except Exception as exc:
-            result = {**spec, "error": str(exc), "N_i": []}
+    completed_runs = 0
+    for entry in cache_entries:
+        record_id = entry["record_id"]
+        spec = entry["spec"]
+        cached = _load_cached_run_payloads(entry["config_dir"], spec, args.n_runs)
+        completed_runs += len(cached)
+        result = _aggregate_cached_runs(
+            spec,
+            [cached[run] for run in sorted(cached)],
+            args=args,
+            split_percentages=split_percentages,
+            x_grid=x_grid,
+        )
+        if len(cached) < args.n_runs:
+            result["error"] = f"Only {len(cached)}/{args.n_runs} runs completed"
         result.update(
             {
                 "record_id": record_id,
@@ -637,33 +1221,15 @@ def main():
     summary_rows = _build_summary_rows(records, best_ids)
     log.debug("Completed compare sweep with %d records", len(records))
 
-    payload = {
-        "config": _build_config_payload(
-            args,
-            B_list,
-            B1_list,
-            step_eta_pairs,
-            solver_baselines,
-            split_percentages,
-            x_grid,
-            target_spec,
-        ),
-        "records": _json_safe(records),
-        "best_by_pair": _json_safe(best_by_pair),
-    }
-
-    json_parent = os.path.dirname(args.output)
-    if json_parent:
-        os.makedirs(json_parent, exist_ok=True)
-    with open(args.output, "w") as f:
-        json.dump(payload, f, indent=2)
-
-    csv_output = args.csv_output or os.path.splitext(args.output)[0] + ".csv"
+    csv_output = _csv_path_for_output_dir(
+        args.output_dir, args.independent_n2, args.split_percentages
+    )
     _write_summary_csv(csv_output, summary_rows)
 
-    print(f"Saved comparison results to {args.output}")
+    print(f"Saved compact run cache to {runs_dir}")
     print(f"Saved CSV summary to {csv_output}")
-    print(f"Ran {len(trial_specs)} experiments")
+    print(f"Completed {completed_runs}/{len(trial_specs) * args.n_runs} cached runs")
+    print(f"Attempted {total_missing} missing runs")
     for best in best_by_pair:
         print(
             f"  B={best['B']}, steps={best['sampling_steps']}, eta={best['eta']}: "
