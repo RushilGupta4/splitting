@@ -50,12 +50,13 @@ def compute_target_stats(device=None, dtype=torch.float32):
     return mean, std, covariance
 
 
-def sample_target_distribution(num_samples, device):
-    """Sample from the hard-coded 2D Gaussian-mixture target."""
-    spec = get_target_distribution_tensors(device=device)
-    weights = spec["weights"]
-    means = spec["means"]
-    covariances = spec["covariances"]
+def sample_target_spec(target_spec, num_samples, device, dtype=torch.float32):
+    """Sample from a 2D Gaussian-mixture target specification."""
+    weights = torch.as_tensor(target_spec["weights"], device=device, dtype=dtype)
+    means = torch.as_tensor(target_spec["means"], device=device, dtype=dtype)
+    covariances = torch.as_tensor(
+        target_spec["covariances"], device=device, dtype=dtype
+    )
 
     component_ids = torch.multinomial(weights, num_samples, replacement=True)
     samples = torch.empty(num_samples, means.shape[1], device=device, dtype=means.dtype)
@@ -71,6 +72,11 @@ def sample_target_distribution(num_samples, device):
         samples[mask] = distribution.sample((count,))
 
     return samples
+
+
+def sample_target_distribution(num_samples, device):
+    """Sample from the hard-coded 2D Gaussian-mixture target."""
+    return sample_target_spec(get_target_distribution_spec(), num_samples, device)
 
 
 def _coerce_stats_tensor(values, reference):
@@ -172,89 +178,6 @@ def mixture_pdf(points, target_spec=None):
     return pdf
 
 
-def validate_split_params(split_points, split_sizes, T):
-    """Validate split parameters.
-
-    Args:
-        split_points: List of timesteps where splitting occurs (must be decreasing)
-        split_sizes: List of split factors at each split point
-        T: Total diffusion timesteps
-
-    Raises:
-        ValueError: If parameters are invalid
-    """
-    if len(split_points) != len(split_sizes):
-        raise ValueError(
-            f"split_points and split_sizes must have same length, "
-            f"got {len(split_points)} and {len(split_sizes)}"
-        )
-
-    if len(split_points) == 0:
-        raise ValueError("split_points must have at least one element")
-
-    for i, sp in enumerate(split_points):
-        if sp <= 0 or sp >= T:
-            raise ValueError(f"split_points[{i}]={sp} must be in range (0, {T})")
-
-    for i in range(len(split_points) - 1):
-        if split_points[i] <= split_points[i + 1]:
-            raise ValueError(
-                f"split_points must be strictly decreasing, "
-                f"got split_points[{i}]={split_points[i]} <= split_points[{i+1}]={split_points[i+1]}"
-            )
-
-    for i, ss in enumerate(split_sizes):
-        if ss < 1:
-            raise ValueError(f"split_sizes[{i}]={ss} must be >= 1")
-
-
-def compute_n1(B, T, split_points, split_sizes):
-    r"""Compute N_1 (number of initial paths) given budget and parameters.
-
-    With K split points, the total computational cost is:
-        cost = N_1 * (T - split_points[0])
-             + N_1 * split_sizes[0] * (split_points[0] - split_points[1])
-             + N_1 * split_sizes[0] * split_sizes[1] * (split_points[1] - split_points[2])
-             + ...
-             + N_1 * prod(split_sizes) * split_points[-1]
-
-    This simplifies to:
-        cost = N_1 * cost_per_n1
-
-    Args:
-        B: Total computational budget (in denoising steps)
-        T: Total diffusion timesteps
-        split_points: List of timesteps where splitting occurs (must be decreasing)
-        split_sizes: List of split factors at each split point
-
-    Returns:
-        Tuple of (n1, cost_per_n1, used_budget)
-    """
-    validate_split_params(split_points, split_sizes, T)
-
-    cost_per_n1 = T - split_points[0]
-    cumulative_split = 1
-    for i in range(len(split_points)):
-        cumulative_split *= split_sizes[i]
-        if i + 1 < len(split_points):
-            segment_length = split_points[i] - split_points[i + 1]
-        else:
-            segment_length = split_points[i]
-        cost_per_n1 += cumulative_split * segment_length
-
-    n1 = B // cost_per_n1
-    used_budget = n1 * cost_per_n1
-    return n1, cost_per_n1, used_budget
-
-
-def compute_total_samples(n1, split_sizes):
-    """Compute total number of final samples."""
-    total = n1
-    for ss in split_sizes:
-        total *= ss
-    return total
-
-
 def validate_split_percentages(split_percentages):
     """Validate split percentages expressed as fractions of sampling steps."""
     if len(split_percentages) == 0:
@@ -274,79 +197,32 @@ def validate_split_percentages(split_percentages):
             )
 
 
-def add_common_args(parser):
-    """Add common arguments shared between inference scripts."""
-    parser.add_argument(
-        "--checkpoint",
-        type=str,
-        default="checkpoints/model_final.pt",
-        help="Path to model checkpoint",
-    )
-    parser.add_argument(
-        "--B",
-        type=int,
-        default=2_500_000,
-        help="Computational budget (in denoising steps)",
-    )
-    parser.add_argument(
-        "--n_runs", type=int, default=100, help="Number of runs for statistics"
-    )
-    parser.add_argument(
-        "--runs_batch_size",
-        type=int,
-        default=100,
-        help="Number of runs to process in parallel per batch",
-    )
-    parser.add_argument(
-        "--T",
-        type=int,
-        default=1000,
-        help="Total diffusion steps (for noise schedule)",
-    )
-    parser.add_argument(
-        "--sampling_steps",
-        type=int,
-        default=None,
-        help="Number of DDIM sampling steps (default: T)",
-    )
-    parser.add_argument(
-        "--eta",
-        type=float,
-        default=1.0,
-        help=r"DDIM \eta parameter (0=deterministic, 1=DDPM)",
-    )
-    parser.add_argument(
-        "--split_percentages",
-        type=str,
-        default="0.5",
-        help=(
-            "Comma-separated split percentages (strictly decreasing), "
-            "e.g. '0.666,0.333'. Each split point is resolved as round(steps * percentage)."
-        ),
-    )
-    parser.add_argument(
-        "--split_sizes",
-        type=str,
-        default="1",
-        help=(
-            "Comma-separated list of split sizes (same length as split_percentages), "
-            "e.g. '2,2,4'"
-        ),
-    )
-    parser.add_argument(
-        "--device",
-        type=str,
-        default="cuda:0" if torch.cuda.is_available() else "cpu",
-    )
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    return parser
+def parse_step_eta_pairs(raw: str):
+    pairs = []
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if ":" not in item:
+            raise ValueError(f"Each step_eta pair must be 'steps:eta', got '{item}'")
+        steps_str, eta_str = item.split(":", 1)
+        pairs.append((int(steps_str), float(eta_str)))
+    if not pairs:
+        raise ValueError("step_eta_pairs must contain at least one pair")
+    return pairs
 
 
-def parse_split_args(args):
-    """Parse split_percentages and split_sizes from comma-separated strings."""
+def parse_split_percentages(split_percentages_str: str):
     split_percentages = [
-        float(x.strip()) for x in args.split_percentages.split(",") if x.strip()
+        float(x.strip()) for x in split_percentages_str.split(",") if x.strip()
     ]
     validate_split_percentages(split_percentages)
-    split_sizes = [int(x.strip()) for x in args.split_sizes.split(",")]
-    return split_percentages, split_sizes
+    return split_percentages
+
+
+def parse_x_grid(x_grid_str: str):
+    x_grid = [float(x.strip()) for x in x_grid_str.split(",") if x.strip()]
+    if not x_grid:
+        raise ValueError("x_grid must have at least one threshold")
+    return x_grid
+

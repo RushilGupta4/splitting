@@ -1,13 +1,24 @@
 import argparse
 import logging
-import os
-from typing import Dict, List, Tuple
+from typing import Dict
 
 import torch
 from tqdm import tqdm
 
-from infer import DDIM, _load_model_and_stats
-from utils import denormalize, get_checkpoint_target_spec
+from diffusion import DDIM
+from model_io import load_model_and_stats
+from reference_cache import (
+    reference_is_sufficient,
+    reference_samples_path,
+    save_reference_samples,
+    true_reference_samples_path,
+)
+from utils import (
+    denormalize,
+    get_checkpoint_target_spec,
+    parse_step_eta_pairs,
+    sample_target_spec,
+)
 
 log = logging.getLogger("ensure_samples")
 
@@ -49,67 +60,6 @@ def parse_args():
     return parser.parse_args()
 
 
-def _parse_step_eta_pairs(raw: str) -> List[Tuple[int, float]]:
-    pairs = []
-    for item in raw.split(","):
-        item = item.strip()
-        if not item:
-            continue
-        if ":" not in item:
-            raise ValueError(f"Each step_eta pair must be 'steps:eta', got '{item}'")
-        steps_str, eta_str = item.split(":", 1)
-        pairs.append((int(steps_str), float(eta_str)))
-    if not pairs:
-        raise ValueError("step_eta_pairs must contain at least one pair")
-    return pairs
-
-
-def _format_eta_for_filename(eta: float) -> str:
-    return format(float(eta), ".12g").replace("-", "m").replace(".", "p")
-
-
-def reference_samples_filename(sampling_steps: int, eta: float) -> str:
-    return f"samples_steps{int(sampling_steps)}_eta{_format_eta_for_filename(eta)}.pt"
-
-
-def true_reference_samples_filename() -> str:
-    return "true_samples.pt"
-
-
-def reference_samples_path(
-    checkpoint_path: str, sampling_steps: int, eta: float
-) -> str:
-    checkpoint_dir = os.path.dirname(checkpoint_path) or "."
-    return os.path.join(checkpoint_dir, reference_samples_filename(sampling_steps, eta))
-
-
-def true_reference_samples_path(checkpoint_path: str) -> str:
-    checkpoint_dir = os.path.dirname(checkpoint_path) or "."
-    return os.path.join(checkpoint_dir, true_reference_samples_filename())
-
-
-def load_reference_payload(path: str, map_location="cpu"):
-    return torch.load(path, map_location=map_location)
-
-
-def extract_reference_samples_tensor(payload) -> torch.Tensor:
-    samples = payload.get("samples") if isinstance(payload, dict) else payload
-    samples = torch.as_tensor(samples)
-    if samples.ndim != 2 or samples.shape[1] != 2:
-        raise ValueError(
-            f"Expected samples of shape [N, 2], got {tuple(samples.shape)}"
-        )
-    return samples
-
-
-def _reference_is_sufficient(path: str, required_count: int) -> bool:
-    if not os.path.exists(path):
-        return False
-    payload = load_reference_payload(path, map_location="cpu")
-    samples = extract_reference_samples_tensor(payload)
-    return int(samples.shape[0]) >= required_count
-
-
 def _generate_reference_samples(
     model,
     data_mean: torch.Tensor,
@@ -144,37 +94,6 @@ def _generate_reference_samples(
     return torch.cat(batches, dim=0)
 
 
-def _target_spec_tensors(target_spec: Dict[str, object], device: str):
-    return {
-        "weights": torch.as_tensor(
-            target_spec["weights"], device=device, dtype=torch.float32
-        ),
-        "means": torch.as_tensor(target_spec["means"], device=device, dtype=torch.float32),
-        "covariances": torch.as_tensor(
-            target_spec["covariances"], device=device, dtype=torch.float32
-        ),
-    }
-
-
-def _sample_target_spec(target_spec: Dict[str, object], num_samples: int, device: str):
-    spec = _target_spec_tensors(target_spec, device)
-    weights = spec["weights"]
-    means = spec["means"]
-    covariances = spec["covariances"]
-    component_ids = torch.multinomial(weights, num_samples, replacement=True)
-    samples = torch.empty(num_samples, means.shape[1], device=device, dtype=means.dtype)
-    for component_idx in range(weights.numel()):
-        mask = component_ids == component_idx
-        count = int(mask.sum().item())
-        if count == 0:
-            continue
-        distribution = torch.distributions.MultivariateNormal(
-            loc=means[component_idx], covariance_matrix=covariances[component_idx]
-        )
-        samples[mask] = distribution.sample((count,))
-    return samples
-
-
 def _generate_true_reference_samples(
     target_spec: Dict[str, object],
     *,
@@ -189,37 +108,9 @@ def _generate_true_reference_samples(
     with torch.inference_mode():
         for _ in tqdm(range(0, num_samples, batch_size), desc="True reference"):
             current_batch = min(batch_size, remaining)
-            batches.append(_sample_target_spec(target_spec, current_batch, device).cpu())
+            batches.append(sample_target_spec(target_spec, current_batch, device).cpu())
             remaining -= current_batch
     return torch.cat(batches, dim=0)
-
-
-def _save_reference_samples(
-    path: str,
-    samples: torch.Tensor,
-    *,
-    checkpoint: str,
-    T: int,
-    sampling_steps: int,
-    eta: float,
-    reference_mode: str = "ddpm_samples",
-    target_spec=None,
-):
-    parent = os.path.dirname(path)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-    payload: Dict[str, object] = {
-        "checkpoint": checkpoint,
-        "reference_mode": reference_mode,
-        "T": int(T),
-        "sampling_steps": int(sampling_steps),
-        "eta": float(eta),
-        "num_samples": int(samples.shape[0]),
-        "samples": samples.cpu(),
-    }
-    if target_spec is not None:
-        payload["target_spec"] = target_spec
-    torch.save(payload, path)
 
 
 def main():
@@ -234,13 +125,13 @@ def main():
     if args.reference_mode == "ddpm_samples":
         if not args.step_eta_pairs.strip():
             raise ValueError("--step_eta_pairs is required for reference_mode=ddpm_samples")
-        step_eta_pairs = _parse_step_eta_pairs(args.step_eta_pairs)
+        step_eta_pairs = parse_step_eta_pairs(args.step_eta_pairs)
     else:
         step_eta_pairs = []
 
     if args.reference_mode == "true_samples":
         path = true_reference_samples_path(args.checkpoint)
-        if _reference_is_sufficient(path, args.num_base_samples):
+        if reference_is_sufficient(path, args.num_base_samples):
             log.info(
                 "Using existing true reference samples at %s", path
             )
@@ -255,7 +146,7 @@ def main():
             batch_size=args.batch_size,
             device=args.device,
         )
-        _save_reference_samples(
+        save_reference_samples(
             path,
             samples,
             checkpoint=args.checkpoint,
@@ -271,7 +162,7 @@ def main():
     pairs_to_build = []
     for sampling_steps, eta in step_eta_pairs:
         path = reference_samples_path(args.checkpoint, sampling_steps, eta)
-        if _reference_is_sufficient(path, args.num_base_samples):
+        if reference_is_sufficient(path, args.num_base_samples):
             log.info(
                 "Using existing reference samples for steps=%s eta=%s at %s",
                 sampling_steps,
@@ -288,7 +179,10 @@ def main():
         )
         return
 
-    model, _, data_mean, data_std = _load_model_and_stats(args)
+    model, _, data_mean, data_std = load_model_and_stats(
+        args.checkpoint,
+        args.device,
+    )
     log.debug("Loaded checkpoint %s onto %s", args.checkpoint, args.device)
 
     for sampling_steps, eta, path in pairs_to_build:
@@ -309,7 +203,7 @@ def main():
             batch_size=args.batch_size,
             device=args.device,
         )
-        _save_reference_samples(
+        save_reference_samples(
             path,
             samples,
             checkpoint=args.checkpoint,
