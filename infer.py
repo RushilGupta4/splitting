@@ -842,6 +842,13 @@ def _make_torch_generator(seed: int | None, device: str):
 
 
 PHASE2_SEED_OFFSET = 1_000_000
+SUPPORTED_BIAS_TYPES = {"biased", "unbiased"}
+
+
+def _validate_bias_type(bias_type: str):
+    if bias_type not in SUPPORTED_BIAS_TYPES:
+        supported = ", ".join(sorted(SUPPORTED_BIAS_TYPES))
+        raise ValueError(f"bias_type must be one of: {supported}; got '{bias_type}'")
 
 
 def _iter_run_chunks(n_runs: int, n_parallel: int):
@@ -984,8 +991,13 @@ def _independent_sigma_cost(
 
 
 def _derive_independent_counts(
-    ddim: DDIM, sigma_times: Sequence[int], B1: int, independent_n2: int
+    ddim: DDIM,
+    sigma_times: Sequence[int],
+    B1: int,
+    independent_n2: int,
+    bias_type: str = "unbiased",
 ) -> Tuple[float, List[Dict[str, int]], int]:
+    _validate_bias_type(bias_type)
     if not sigma_times:
         raise ValueError("sigma_times must be non-empty")
     if independent_n2 < 2:
@@ -1003,7 +1015,12 @@ def _derive_independent_counts(
         segment1 = ddim.segment_cost(ddim.T, t_curr)
         segment2 = ddim.segment_cost(t_curr, t_next)
         segment3 = ddim.segment_cost(t_next, 0)
-        min_cost = segment1 + independent_n2 * segment2 + independent_n2 * segment3
+        min_inner_count = 2 if bias_type == "unbiased" and segment3 > 0 else 1
+        min_cost = (
+            segment1
+            + independent_n2 * segment2
+            + independent_n2 * min_inner_count * segment3
+        )
         if budget_per_sigma < min_cost:
             raise ValueError(
                 "B1 is too small for equal per-sigma independent estimation with "
@@ -1032,7 +1049,12 @@ def _derive_independent_counts(
         # For the final sigma block, t_next == 0, so inner repeats are exact
         # zero-step duplicates. They do not change the sigma estimate but would
         # overweight those x0 samples when reuse_phase1_samples=True.
-        inner_count = 1 if segment3 == 0 else max(1, int(lower))
+        if segment3 == 0:
+            inner_count = 1
+        elif bias_type == "unbiased":
+            inner_count = max(2, int(lower))
+        else:
+            inner_count = max(1, int(lower))
         used_budget = _independent_sigma_cost(
             ddim, t_curr, t_next, outer_count, independent_n2, inner_count
         )
@@ -1295,12 +1317,14 @@ def _estimate_sigmas_from_tree(
     sigma_times: Sequence[int],
     child_counts_by_level: Sequence[torch.Tensor],
     x_grid: Sequence[float],
+    bias_type: str = "unbiased",
 ):
+    _validate_bias_type(bias_type)
     num_levels = len(sigma_times)
     current = _rectangle_indicator_grid(leaf_x0, x_grid)
     grid_size = len(x_grid)
-    sigma2_by_level = [None] * num_levels
-    sigma_by_level = [None] * num_levels
+    raw_var_by_level = [None] * num_levels
+    valid_mask_by_level = [None] * num_levels
     mean_by_level = [None] * num_levels
 
     for rev_idx in range(num_levels - 1, -1, -1):
@@ -1310,18 +1334,43 @@ def _estimate_sigmas_from_tree(
         if int(counts.sum().item()) != current.shape[0]:
             raise ValueError("Pilot tree child counts do not match leaf layout")
 
-        child_means, child_vars = _segment_mean_and_unbiased_var(current, counts)
-        if child_vars is None:
+        child_means, child_vars, valid_mask = _segment_mean_and_unbiased_var_all(
+            current, counts
+        )
+        if not valid_mask.any():
             raise ValueError(
                 "Pilot tree produced no parents with at least two children; increase B1"
             )
 
-        sigma2_flat = child_vars.mean(dim=0)
         mean_flat = child_means.mean(dim=0)
-        sigma2_by_level[rev_idx] = sigma2_flat
-        sigma_by_level[rev_idx] = torch.sqrt(torch.clamp(sigma2_flat, min=0.0))
+        raw_var_by_level[rev_idx] = child_vars
+        valid_mask_by_level[rev_idx] = valid_mask
         mean_by_level[rev_idx] = mean_flat
         current = child_means
+
+    sigma2_by_level = [None] * num_levels
+    sigma_by_level = [None] * num_levels
+    for level_idx in range(num_levels - 1, -1, -1):
+        corrected_vars = raw_var_by_level[level_idx]
+        if bias_type == "unbiased" and level_idx + 1 < num_levels:
+            lower_counts = child_counts_by_level[level_idx + 1].to(
+                device=corrected_vars.device, dtype=corrected_vars.dtype
+            )
+            lower_noise_by_child = raw_var_by_level[
+                level_idx + 1
+            ] / lower_counts.unsqueeze(1)
+            parent_counts = child_counts_by_level[level_idx].to(
+                device=corrected_vars.device, dtype=torch.long
+            )
+            lower_noise_by_parent = torch.segment_reduce(
+                lower_noise_by_child, reduce="mean", lengths=parent_counts
+            )
+            corrected_vars = corrected_vars - lower_noise_by_parent
+
+        valid_mask = valid_mask_by_level[level_idx]
+        sigma2_flat = torch.clamp(corrected_vars[valid_mask].mean(dim=0), min=0.0)
+        sigma2_by_level[level_idx] = sigma2_flat
+        sigma_by_level[level_idx] = torch.sqrt(sigma2_flat)
 
     if current.shape[0] >= 2:
         tau2_flat = torch.clamp(current.var(dim=0, unbiased=True), min=0.0)
@@ -1394,7 +1443,9 @@ def _estimate_sigmas_from_tree_batch(
     parent_run_ids_by_level: Sequence[torch.Tensor],
     x_grid: Sequence[float],
     chunk_size: int,
+    bias_type: str = "unbiased",
 ):
+    _validate_bias_type(bias_type)
     num_levels = len(sigma_times)
     if len(child_counts_by_level) != num_levels:
         raise ValueError("child_counts_by_level must match sigma_times length")
@@ -1404,9 +1455,8 @@ def _estimate_sigmas_from_tree_batch(
     current = _rectangle_indicator_grid(leaf_x0, x_grid)
     current_run_ids = leaf_run_ids.to(device=current.device, dtype=torch.long)
     grid_size = len(x_grid)
-    num_grid_points = grid_size * grid_size
-    sigma2_by_level = [None] * num_levels
-    sigma_by_level = [None] * num_levels
+    raw_var_by_level = [None] * num_levels
+    valid_mask_by_level = [None] * num_levels
     mean_by_level = [None] * num_levels
 
     for rev_idx in range(num_levels - 1, -1, -1):
@@ -1423,15 +1473,42 @@ def _estimate_sigmas_from_tree_batch(
             current, counts
         )
 
-        sigma2_flat, _ = _grouped_mean(
-            child_vars[valid_mask], parent_run_ids[valid_mask], chunk_size
-        )
         mean_flat, _ = _grouped_mean(child_means, parent_run_ids, chunk_size)
-        sigma2_by_level[rev_idx] = sigma2_flat
-        sigma_by_level[rev_idx] = torch.sqrt(torch.clamp(sigma2_flat, min=0.0))
+        raw_var_by_level[rev_idx] = child_vars
+        valid_mask_by_level[rev_idx] = valid_mask
         mean_by_level[rev_idx] = mean_flat
         current = child_means
         current_run_ids = parent_run_ids
+
+    sigma2_by_level = [None] * num_levels
+    sigma_by_level = [None] * num_levels
+    for level_idx in range(num_levels - 1, -1, -1):
+        corrected_vars = raw_var_by_level[level_idx]
+        if bias_type == "unbiased" and level_idx + 1 < num_levels:
+            lower_counts = child_counts_by_level[level_idx + 1].to(
+                device=corrected_vars.device, dtype=corrected_vars.dtype
+            )
+            lower_noise_by_child = raw_var_by_level[
+                level_idx + 1
+            ] / lower_counts.unsqueeze(1)
+            parent_counts = child_counts_by_level[level_idx].to(
+                device=corrected_vars.device, dtype=torch.long
+            )
+            lower_noise_by_parent = torch.segment_reduce(
+                lower_noise_by_child, reduce="mean", lengths=parent_counts
+            )
+            corrected_vars = corrected_vars - lower_noise_by_parent
+
+        valid_mask = valid_mask_by_level[level_idx]
+        parent_run_ids = parent_run_ids_by_level[level_idx].to(
+            device=corrected_vars.device, dtype=torch.long
+        )
+        sigma2_flat, _ = _grouped_mean(
+            corrected_vars[valid_mask], parent_run_ids[valid_mask], chunk_size
+        )
+        sigma2_flat = torch.clamp(sigma2_flat, min=0.0)
+        sigma2_by_level[level_idx] = sigma2_flat
+        sigma_by_level[level_idx] = torch.sqrt(sigma2_flat)
 
     tau2_by_run, tau_mean_by_run, _ = _grouped_unbiased_var(
         current, current_run_ids, chunk_size
@@ -1566,6 +1643,307 @@ def _grid_index_to_point(
     _, n_cols = grid_shape
     x1_idx, x2_idx = divmod(flat_index, n_cols)
     return [float(x_grid[x1_idx]), float(x_grid[x2_idx])]
+
+
+def _normalize_simplex_with_floor(weights: np.ndarray, floor: float):
+    weights = np.asarray(weights, dtype=float)
+    if weights.ndim != 1:
+        raise ValueError("simplex weights must be one-dimensional")
+    num_weights = weights.shape[0]
+    if num_weights == 0:
+        raise ValueError("simplex weights must be non-empty")
+
+    floor = min(max(float(floor), 0.0), 0.5 / float(num_weights))
+    weights = np.where(np.isfinite(weights), weights, 0.0)
+    weights = np.maximum(weights, 0.0)
+    weight_sum = float(weights.sum())
+    if weight_sum <= 0.0:
+        return np.full(num_weights, 1.0 / num_weights, dtype=float)
+
+    weights = weights / weight_sum
+    if floor <= 0.0 or np.all(weights >= floor):
+        return weights
+
+    above_floor = np.maximum(weights - floor, 0.0)
+    above_sum = float(above_floor.sum())
+    if above_sum <= 0.0:
+        return np.full(num_weights, 1.0 / num_weights, dtype=float)
+
+    free_mass = max(1.0 - floor * num_weights, 0.0)
+    return floor + free_mass * above_floor / above_sum
+
+
+def _allocation_objective_values(
+    weighted_sigma2_matrix: np.ndarray, simplex_weights: np.ndarray
+):
+    return weighted_sigma2_matrix @ (1.0 / simplex_weights)
+
+
+def _allocation_dual_objective(
+    weighted_sigma2_matrix: np.ndarray, dual_weights: np.ndarray
+):
+    c_values = weighted_sigma2_matrix.T @ dual_weights
+    return float(np.square(np.sqrt(np.maximum(c_values, 0.0)).sum()))
+
+
+def _top_indices(values: np.ndarray, count: int):
+    count = min(max(int(count), 0), int(values.shape[0]))
+    if count <= 0:
+        return np.empty(0, dtype=np.int64)
+    if count == values.shape[0]:
+        return np.arange(values.shape[0], dtype=np.int64)
+    return np.argpartition(values, -count)[-count:].astype(np.int64, copy=False)
+
+
+def _softmax_from_values(values: np.ndarray, temperature: float):
+    values = np.asarray(values, dtype=float)
+    if values.size == 0:
+        return values
+    temperature = max(float(temperature), 1e-300)
+    shifted = (values - float(np.max(values))) / temperature
+    weights = np.exp(np.clip(shifted, -745.0, 0.0))
+    weight_sum = float(weights.sum())
+    if weight_sum <= 0.0 or not np.isfinite(weight_sum):
+        return np.full(values.shape[0], 1.0 / values.shape[0], dtype=float)
+    return weights / weight_sum
+
+
+def _active_primal_initial_points(
+    active_matrix: np.ndarray,
+    y_initial: np.ndarray,
+    y_floor: float,
+):
+    num_active, num_levels = active_matrix.shape
+    starts = [
+        _normalize_simplex_with_floor(y_initial, y_floor),
+        np.full(num_levels, 1.0 / num_levels, dtype=float),
+    ]
+
+    column_means = np.mean(active_matrix, axis=0) if num_active else np.ones(num_levels)
+    starts.append(_normalize_simplex_with_floor(np.sqrt(column_means), y_floor))
+
+    if num_active:
+        row_scores = np.sqrt(np.maximum(active_matrix, 0.0)).sum(axis=1)
+        for row_idx in _top_indices(row_scores, min(num_levels + 1, num_active)):
+            starts.append(
+                _normalize_simplex_with_floor(
+                    np.sqrt(np.maximum(active_matrix[int(row_idx)], 0.0)), y_floor
+                )
+            )
+
+    return starts
+
+
+def _maximize_active_dual_weights(
+    active_matrix: np.ndarray,
+    initial_dual_weights: np.ndarray,
+    *,
+    max_iters: int = 200,
+):
+    num_active = active_matrix.shape[0]
+    dual_weights = _normalize_simplex_with_floor(initial_dual_weights, 0.0)
+    best_weights = dual_weights.copy()
+    best_objective = _allocation_dual_objective(active_matrix, best_weights)
+    c_floor = 1e-15
+
+    for _ in range(max_iters):
+        c_values = active_matrix.T @ dual_weights
+        sqrt_c = np.sqrt(np.maximum(c_values, c_floor))
+        sum_sqrt_c = float(sqrt_c.sum())
+        gradient = sum_sqrt_c * np.sum(active_matrix / sqrt_c[None, :], axis=1)
+        gradient_scale = float(np.max(np.abs(gradient)))
+        if gradient_scale <= 0.0 or not np.isfinite(gradient_scale):
+            break
+
+        step = 0.5 / gradient_scale
+        accepted = False
+        for _ in range(16):
+            exponent = step * gradient
+            exponent = np.clip(exponent - float(np.max(exponent)), -50.0, 50.0)
+            candidate_weights = _normalize_simplex_with_floor(
+                dual_weights * np.exp(exponent), 0.0
+            )
+            candidate_objective = _allocation_dual_objective(
+                active_matrix, candidate_weights
+            )
+            if candidate_objective >= best_objective * (1.0 - 1e-12):
+                dual_weights = candidate_weights
+                accepted = True
+                if candidate_objective > best_objective:
+                    best_weights = candidate_weights.copy()
+                    best_objective = candidate_objective
+                break
+            step *= 0.5
+
+        if not accepted:
+            break
+
+    if best_weights.shape[0] != num_active:
+        raise RuntimeError("active dual optimizer returned invalid shape")
+    return best_weights
+
+
+def _solve_active_primal_inner(
+    active_matrix: np.ndarray,
+    y_initial: np.ndarray,
+    *,
+    y_floor: float,
+    max_iters: int,
+):
+    best_y = _normalize_simplex_with_floor(y_initial, y_floor)
+    best_values = _allocation_objective_values(active_matrix, best_y)
+    best_objective = float(np.max(best_values))
+
+    for start in _active_primal_initial_points(active_matrix, y_initial, y_floor):
+        y = _normalize_simplex_with_floor(start, y_floor)
+        values = _allocation_objective_values(active_matrix, y)
+        objective = float(np.max(values))
+        no_improvement = 0
+
+        for iter_idx in range(max_iters):
+            temperature_factor = max(
+                1e-4, 5e-2 * (0.2 ** (iter_idx / max(max_iters - 1, 1)))
+            )
+            temperature = max(objective * temperature_factor, 1e-300)
+            active_weights = _softmax_from_values(values, temperature)
+            gradient = -(active_matrix.T @ active_weights) / np.square(y)
+            gradient_scale = float(np.max(np.abs(gradient)))
+            if gradient_scale <= 0.0 or not np.isfinite(gradient_scale):
+                break
+
+            step = 0.5 / gradient_scale
+            accepted = False
+            for _ in range(16):
+                exponent = -step * gradient
+                exponent = np.clip(exponent - float(np.max(exponent)), -50.0, 50.0)
+                y_candidate = _normalize_simplex_with_floor(
+                    y * np.exp(exponent), y_floor
+                )
+                candidate_values = _allocation_objective_values(
+                    active_matrix, y_candidate
+                )
+                candidate_objective = float(np.max(candidate_values))
+                if candidate_objective <= objective * (1.0 + 1e-12):
+                    improvement = objective - candidate_objective
+                    y = y_candidate
+                    values = candidate_values
+                    objective = candidate_objective
+                    accepted = True
+                    if improvement <= max(1e-12, 1e-10 * max(objective, 1.0)):
+                        no_improvement += 1
+                    else:
+                        no_improvement = 0
+                    break
+                step *= 0.5
+
+            if not accepted:
+                no_improvement += 1
+            if no_improvement >= 25:
+                break
+
+        if objective < best_objective:
+            best_y = y
+            best_values = values
+            best_objective = objective
+
+    final_temperature = max(best_objective * 1e-4, 1e-300)
+    active_dual_weights = _softmax_from_values(best_values, final_temperature)
+    active_dual_weights = _maximize_active_dual_weights(
+        active_matrix, active_dual_weights
+    )
+    return best_y, best_objective, active_dual_weights
+
+
+def _solve_active_set_primal_allocation(
+    weighted_sigma2_matrix: np.ndarray,
+    y_initial: np.ndarray,
+    *,
+    y_floor: float,
+    relative_tol: float = 2e-3,
+    max_outer_iters: int = 30,
+    max_inner_iters: int = 300,
+):
+    num_points, num_levels = weighted_sigma2_matrix.shape
+    if num_points == 0 or num_levels == 0:
+        raise ValueError("weighted_sigma2_matrix must be non-empty")
+
+    initial_active_count = min(num_points, max(32, 4 * num_levels))
+    add_count = min(num_points, max(8, num_levels))
+    max_active = min(num_points, max(256, 16 * num_levels))
+
+    row_scores = np.sqrt(np.maximum(weighted_sigma2_matrix, 0.0)).sum(axis=1)
+    active_indices = set(
+        int(idx) for idx in _top_indices(row_scores, initial_active_count)
+    )
+
+    uniform_y = np.full(num_levels, 1.0 / num_levels, dtype=float)
+    for probe_y in (y_initial, uniform_y):
+        probe_y = _normalize_simplex_with_floor(probe_y, y_floor)
+        probe_values = _allocation_objective_values(weighted_sigma2_matrix, probe_y)
+        active_indices.update(
+            int(idx) for idx in _top_indices(probe_values, add_count)
+        )
+
+    y_best = _normalize_simplex_with_floor(y_initial, y_floor)
+    best_result = None
+
+    for outer_iter in range(max_outer_iters):
+        active_array = np.array(sorted(active_indices), dtype=np.int64)
+        active_matrix = weighted_sigma2_matrix[active_array]
+        y_candidate, active_upper, active_dual = _solve_active_primal_inner(
+            active_matrix,
+            y_best,
+            y_floor=y_floor,
+            max_iters=max_inner_iters,
+        )
+
+        full_values = _allocation_objective_values(weighted_sigma2_matrix, y_candidate)
+        full_upper = float(np.max(full_values))
+
+        full_dual_weights = np.zeros(num_points, dtype=float)
+        full_dual_weights[active_array] = active_dual
+        dual_lower = _allocation_dual_objective(
+            weighted_sigma2_matrix, full_dual_weights
+        )
+        relative_gap = max(full_upper - dual_lower, 0.0) / max(
+            abs(full_upper), 1.0
+        )
+
+        best_result = {
+            "simplex_weights": y_candidate,
+            "dual_weights": full_dual_weights,
+            "dual_objective": dual_lower,
+            "worst_case_objective": full_upper,
+            "relative_gap": relative_gap,
+            "outer_iterations": outer_iter + 1,
+            "active_size": int(active_array.shape[0]),
+            "active_objective": float(active_upper),
+        }
+
+        y_best = y_candidate
+        if relative_gap <= relative_tol:
+            break
+
+        worst_indices = _top_indices(full_values, add_count)
+        previous_size = len(active_indices)
+        active_indices.update(int(idx) for idx in worst_indices)
+        if len(active_indices) > max_active:
+            keep_indices = _top_indices(full_values, max_active)
+            active_indices = set(int(idx) for idx in keep_indices)
+            active_indices.update(int(idx) for idx in active_array)
+            if len(active_indices) > max_active:
+                ranked = sorted(
+                    active_indices, key=lambda idx: full_values[idx], reverse=True
+                )
+                active_indices = set(ranked[:max_active])
+
+        if len(active_indices) == previous_size:
+            break
+
+    if best_result is None:
+        raise RuntimeError("active-set primal allocation did not run")
+
+    return best_result
 
 
 def _solve_optimal_split_factors(
@@ -1774,14 +2152,65 @@ def _solve_optimal_split_factors(
             "optimize_time": time.perf_counter() - t_opt_start,
         }
 
-    # KKT failed: the worst-case is a mixture. Fall back to SLSQP on the dual
-    # problem max_mu (sum_k sqrt(mu^T (cost_k * sigma2[:, k])))^2 over the simplex,
+    # KKT failed and there are at least three allocation levels. Optimize the
+    # low-dimensional primal simplex with an active set of grid points, then
+    # verify each candidate against the full grid. This keeps optimization cost
+    # tied mostly to the number of split levels instead of the number of grid
+    # points.
+    active_solver_error = None
+    try:
+        active_relative_tol = 2e-3
+        active_result = _solve_active_set_primal_allocation(
+            weighted_sigma2_matrix,
+            y_candidate,
+            y_floor=weight_floor,
+            relative_tol=active_relative_tol,
+        )
+        y_out = active_result["simplex_weights"]
+        M_out = allocation_from_simplex_weights(y_out)
+        split_factors = split_factors_from_allocation(M_out)
+        dual_weights = active_result["dual_weights"]
+        simplex_tol = 1e-8
+        active_grid_points = [
+            {
+                "point": _grid_index_to_point(idx, x_grid, grid_shape),
+                "weight": float(weight),
+            }
+            for idx, weight in enumerate(dual_weights)
+            if weight > simplex_tol
+        ]
+        relative_gap = float(active_result["relative_gap"])
+        return {
+            "split_factors": split_factors.tolist(),
+            "allocation_weights": M_out.tolist(),
+            "dual_weights": dual_weights.tolist(),
+            "dual_status": 0 if relative_gap <= active_relative_tol else 1,
+            "dual_success": bool(np.isfinite(active_result["worst_case_objective"])),
+            "dual_message": (
+                "Active-set primal solver "
+                f"(gap={relative_gap:.3e}, active={active_result['active_size']}, "
+                f"outer={active_result['outer_iterations']})"
+            ),
+            "dual_objective": float(active_result["dual_objective"]),
+            "worst_case_simplex_objective": float(
+                active_result["worst_case_objective"]
+            ),
+            "active_grid_points": active_grid_points,
+            "matrix_build_time": matrix_build_time,
+            "optimize_time": time.perf_counter() - t_opt_start,
+        }
+    except Exception as exc:
+        active_solver_error = exc
+
+    # Last-resort fallback: solve the high-dimensional dual problem
+    # max_mu (sum_k sqrt(mu^T (cost_k * sigma2[:, k])))^2 over the simplex,
     # warm-started from a single-atom point at j_star.
     try:
         from scipy.optimize import minimize
     except ImportError as exc:
         raise ImportError(
-            "scipy is required to solve the simplex allocation problem"
+            "scipy is required to solve the simplex allocation problem after "
+            f"active-set primal allocation failed: {active_solver_error}"
         ) from exc
 
     c_floor = 1e-15
@@ -2665,12 +3094,14 @@ def _run_pilot_tree_phase1_sampling_batch(
     eta: float,
     split_percentages: Sequence[float],
     x_grid: Sequence[float],
+    bias_type: str,
     reuse_phase1_samples: bool,
     device: str,
     chunk_size: int,
     debug: bool = False,
     generator: torch.Generator | None = None,
 ):
+    _validate_bias_type(bias_type)
     ddim = DDIM(T=T, device=device, eta=eta, sampling_steps=sampling_steps)
     resolved_step_points, split_points = _resolve_split_percentages(
         ddim, split_percentages
@@ -2717,6 +3148,7 @@ def _run_pilot_tree_phase1_sampling_batch(
         parent_run_ids_by_level=parent_run_ids_by_level,
         x_grid=x_grid,
         chunk_size=chunk_size,
+        bias_type=bias_type,
     )
     estimation_time = (time.perf_counter() - estimation_start) / chunk_size
 
@@ -2737,6 +3169,7 @@ def _run_pilot_tree_phase1_sampling_batch(
                 "resolved_step_points": [int(x) for x in resolved_step_points],
                 "split_points": [int(x) for x in split_points],
                 "sigma_times": [int(x) for x in sigma_times],
+                "bias_type": bias_type,
                 "sigma_estimates": sigma_estimates_by_run[run_idx],
                 "tau_estimate": tau_estimates[run_idx],
                 "used_B1": int(used_B1_by_run[run_idx]),
@@ -2762,12 +3195,14 @@ def _run_independent_phase1_sampling_batch(
     split_percentages: Sequence[float],
     x_grid: Sequence[float],
     independent_n2: int,
+    bias_type: str,
     reuse_phase1_samples: bool,
     device: str,
     chunk_size: int,
     debug: bool = False,
     generator: torch.Generator | None = None,
 ):
+    _validate_bias_type(bias_type)
     ddim = DDIM(T=T, device=device, eta=eta, sampling_steps=sampling_steps)
     resolved_step_points, split_points = _resolve_split_percentages(
         ddim, split_percentages
@@ -2778,6 +3213,7 @@ def _run_independent_phase1_sampling_batch(
         sigma_times=sigma_times,
         B1=B1,
         independent_n2=independent_n2,
+        bias_type=bias_type,
     )
     _debug_log(
         debug,
@@ -2848,7 +3284,17 @@ def _run_independent_phase1_sampling_batch(
 
         p_hat_mean = middle_means.mean(dim=(1, 2))
         outer_vars = torch.clamp(middle_means.var(dim=2, unbiased=True), min=0.0)
-        sigma2 = outer_vars.mean(dim=1)
+        raw_sigma2 = outer_vars.mean(dim=1)
+        if (
+            bias_type == "unbiased"
+            and inner_count >= 2
+            and ddim.segment_cost(t_next, 0) > 0
+        ):
+            inner_vars = torch.clamp(indicators.var(dim=3, unbiased=True), min=0.0)
+            sigma2 = raw_sigma2 - inner_vars.mean(dim=(1, 2)) / float(inner_count)
+        else:
+            sigma2 = raw_sigma2
+        sigma2 = torch.clamp(sigma2, min=0.0)
         sigma = torch.sqrt(torch.clamp(sigma2, min=0.0))
         outer_means = middle_means.mean(dim=2)
         if outer_count >= 2:
@@ -2890,6 +3336,7 @@ def _run_independent_phase1_sampling_batch(
                 "resolved_step_points": [int(x) for x in resolved_step_points],
                 "split_points": [int(x) for x in split_points],
                 "sigma_times": [int(x) for x in sigma_times],
+                "bias_type": bias_type,
                 "sigma_estimates": sigma_estimates_by_run[run_idx],
                 "tau_estimate": tau_estimates[run_idx],
                 "used_B1": int(used_B1),
@@ -3008,6 +3455,7 @@ def run_estimate_and_sample(
     x_grid: Sequence[float],
     independent_n2: int,
     sigma_estimation_mode: str,
+    bias_type: str,
     reuse_phase1_samples: bool,
     n_runs: int,
     seed: int | None,
@@ -3022,13 +3470,15 @@ def run_estimate_and_sample(
         raise ValueError("B1 must be nonnegative")
     if B1 >= B:
         raise ValueError("B1 must be strictly smaller than B")
+    _validate_bias_type(bias_type)
     if sigma_estimation_mode == "independent" and independent_n2 < 2:
         raise ValueError("independent_n2 must be at least 2")
 
     _debug_log(
         debug,
         "Starting estimate_and_sample run "
-        f"with B={B}, B1={B1}, sampling_steps={sampling_steps}, eta={eta}",
+        f"with B={B}, B1={B1}, sampling_steps={sampling_steps}, eta={eta}, "
+        f"bias_type={bias_type}",
     )
 
     chunks = list(_iter_run_chunks(n_runs, n_parallel))
@@ -3051,6 +3501,7 @@ def run_estimate_and_sample(
                     eta=eta,
                     split_percentages=split_percentages,
                     x_grid=x_grid,
+                    bias_type=bias_type,
                     reuse_phase1_samples=reuse_phase1_samples,
                     device=device,
                     chunk_size=chunk_size,
@@ -3085,6 +3536,7 @@ def run_estimate_and_sample(
                     split_percentages=split_percentages,
                     x_grid=x_grid,
                     independent_n2=independent_n2,
+                    bias_type=bias_type,
                     reuse_phase1_samples=reuse_phase1_samples,
                     device=device,
                     chunk_size=chunk_size,
@@ -3197,6 +3649,7 @@ def run_estimate_and_sample(
         "split_points": trial_results[0]["split_points"],
         "x_grid": [float(x) for x in x_grid],
         "sigma_estimation_mode": sigma_estimation_mode,
+        "bias_type": bias_type,
         "independent_n2": int(independent_n2),
         "reuse_phase1_samples": bool(reuse_phase1_samples),
         "sigma_times": trial_results[0]["sigma_times"],

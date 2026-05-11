@@ -38,6 +38,7 @@ log = logging.getLogger("compare")
 
 SUPPORTED_SOLVERS = ("ddim", "dpmpp_2m")
 SUPPORTED_SIGMA_ESTIMATION_MODES = ("pilot_tree", "independent")
+SUPPORTED_BIAS_TYPES = ("biased", "unbiased")
 
 CSV_FIELDS = [
     "record_id",
@@ -55,6 +56,7 @@ CSV_FIELDS = [
     "method_label",
     "mode",
     "sigma_estimation_mode",
+    "bias_type",
     "reuse_phase1_samples",
     "N_i",
     "N_i_std",
@@ -81,6 +83,7 @@ BEST_RECORD_FIELDS = (
     "solver_sampling_steps",
     "solver_eta",
     "method_label",
+    "bias_type",
     "B1",
     "mean_ks",
     "std_ks",
@@ -131,6 +134,15 @@ def parse_args():
         help=(
             "Comma-separated sigma estimation modes for adaptive methods. "
             f"Supported modes: {', '.join(SUPPORTED_SIGMA_ESTIMATION_MODES)}."
+        ),
+    )
+    parser.add_argument(
+        "--bias_types",
+        type=str,
+        default="unbiased",
+        help=(
+            "Comma-separated sigma estimator bias types for adaptive methods. "
+            f"Supported types: {', '.join(SUPPORTED_BIAS_TYPES)}."
         ),
     )
     parser.add_argument(
@@ -278,6 +290,22 @@ def _parse_sigma_modes(raw: str) -> List[str]:
     return modes
 
 
+def _parse_bias_types(raw: str) -> List[str]:
+    bias_types = [x.strip() for x in raw.split(",") if x.strip()]
+    if not bias_types:
+        raise ValueError("bias_types must have at least one value")
+    unsupported = [
+        bias_type for bias_type in bias_types if bias_type not in SUPPORTED_BIAS_TYPES
+    ]
+    if unsupported:
+        supported = ", ".join(SUPPORTED_BIAS_TYPES)
+        raise ValueError(
+            f"Unsupported bias_types value(s): {', '.join(unsupported)}. "
+            f"Supported types: {supported}"
+        )
+    return bias_types
+
+
 def _parse_bool_list(raw: str, name: str) -> List[bool]:
     truthy = {"1", "true", "t", "yes", "y"}
     falsy = {"0", "false", "f", "no", "n"}
@@ -317,13 +345,14 @@ def _build_trial_specs(
     step_eta_pairs: List[Tuple[int, float]],
     baselines: List[Dict[str, Any]],
     sigma_modes: List[str],
+    bias_types: List[str],
     reuse_flags: List[bool],
 ) -> List[Dict[str, Any]]:
     """Every experiment (baselines + adaptive variants) as a flat list of spec dicts."""
     specs: List[Dict[str, Any]] = []
     for B, (steps, eta) in itertools.product(B_list, step_eta_pairs):
-        for B1, sigma_mode, reuse in itertools.product(
-            B1_list, sigma_modes, reuse_flags
+        for B1, sigma_mode, bias_type, reuse in itertools.product(
+            B1_list, sigma_modes, bias_types, reuse_flags
         ):
             if B1 >= B:
                 log.info("Skipping config with B1=%s >= B=%s", B1, B)
@@ -342,8 +371,11 @@ def _build_trial_specs(
                     "solver_eta": None,
                     "solver_nfe": None,
                     "sigma_estimation_mode": sigma_mode,
+                    "bias_type": bias_type,
                     "reuse_phase1_samples": reuse,
-                    "method_label": f"{sigma_mode}_{'reuse' if reuse else 'fresh'}",
+                    "method_label": (
+                        f"{sigma_mode}_{bias_type}_{'reuse' if reuse else 'fresh'}"
+                    ),
                 }
             )
         for baseline_spec in baselines:
@@ -355,6 +387,7 @@ def _build_trial_specs(
             spec["reference_sampling_steps"] = steps
             spec["reference_eta"] = eta
             spec["sigma_estimation_mode"] = None
+            spec["bias_type"] = None
             spec["reuse_phase1_samples"] = None
             if spec["mode"] == "solver_baseline":
                 spec["solver_nfe"] = int(spec["solver_sampling_steps"])
@@ -436,6 +469,7 @@ def _run_trial(
         x_grid=x_grid,
         independent_n2=args.independent_n2,
         sigma_estimation_mode=spec["sigma_estimation_mode"],
+        bias_type=spec["bias_type"],
         reuse_phase1_samples=spec["reuse_phase1_samples"],
     )
 
@@ -866,6 +900,7 @@ def _aggregate_cached_runs(
         "split_percentages": [float(x) for x in split_percentages],
         "x_grid": [float(x) for x in x_grid],
         "sigma_estimation_mode": spec["sigma_estimation_mode"],
+        "bias_type": spec["bias_type"],
         "independent_n2": int(args.independent_n2),
         "reuse_phase1_samples": bool(spec["reuse_phase1_samples"]),
         "N_i": _mean_vector([trial["N_i"] for trial in trials]),
@@ -885,6 +920,7 @@ def _build_config_payload(
     step_eta_pairs,
     baselines,
     sigma_modes,
+    bias_types,
     reuse_flags,
     split_percentages,
     x_grid,
@@ -902,6 +938,7 @@ def _build_config_payload(
             "step_eta_pairs",
             "baselines",
             "sigma_modes",
+            "bias_types",
             "reuse_flags",
             "split_percentages",
             "x_grid",
@@ -914,6 +951,7 @@ def _build_config_payload(
     ]
     config["baselines"] = [dict(spec) for spec in baselines]
     config["sigma_modes"] = sigma_modes
+    config["bias_types"] = bias_types
     config["reuse_flags"] = reuse_flags
     config["reference_mode"] = args.reference_mode
     config["split_percentages"] = split_percentages
@@ -1026,6 +1064,7 @@ def main():
     step_eta_pairs = _parse_step_eta_pairs(args.step_eta_pairs)
     baselines = _parse_baselines(args.baselines)
     sigma_modes = _parse_sigma_modes(args.sigma_modes)
+    bias_types = _parse_bias_types(args.bias_types)
     reuse_flags = _parse_bool_list(args.reuse_flags, "reuse_flags")
     split_percentages = _parse_split_percentages(args.split_percentages)
     x_grid = _parse_x_grid(args.x_grid)
@@ -1037,7 +1076,13 @@ def main():
         raise ValueError("n_parallel must be at least 1")
 
     trial_specs = _build_trial_specs(
-        B_list, B1_list, step_eta_pairs, baselines, sigma_modes, reuse_flags
+        B_list,
+        B1_list,
+        step_eta_pairs,
+        baselines,
+        sigma_modes,
+        bias_types,
+        reuse_flags,
     )
     os.makedirs(args.output_dir, exist_ok=True)
     runs_dir = _runs_dir_for_output_dir(args.output_dir)
@@ -1092,6 +1137,7 @@ def main():
             step_eta_pairs,
             baselines,
             sigma_modes,
+            bias_types,
             reuse_flags,
             split_percentages,
             x_grid,
@@ -1212,6 +1258,7 @@ def main():
                 "solver_sampling_steps": spec.get("solver_sampling_steps"),
                 "solver_eta": spec.get("solver_eta"),
                 "solver_nfe": spec.get("solver_nfe"),
+                "bias_type": spec.get("bias_type"),
             }
         )
         records.append(result)

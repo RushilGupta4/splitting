@@ -147,6 +147,7 @@ def _load_rows(csv_path: str):
                         "solver_eta": None,
                         "solver_nfe": None,
                         "sigma_estimation_mode": "",
+                        "bias_type": "",
                         "reuse_phase1_samples": None,
                         "N_i": [],
                         "N_i_std": [],
@@ -174,6 +175,7 @@ def _load_rows(csv_path: str):
                         "solver_eta": _parse_float(raw_row.get("solver_eta", "")),
                         "solver_nfe": _parse_int(raw_row.get("solver_nfe", "")),
                         "sigma_estimation_mode": "",
+                        "bias_type": "",
                         "reuse_phase1_samples": None,
                         "N_i": [],
                         "N_i_std": [],
@@ -188,6 +190,7 @@ def _load_rows(csv_path: str):
 
             B1 = _parse_int(raw_row.get("B1", ""))
             sigma_estimation_mode = raw_row.get("sigma_estimation_mode", "").strip()
+            bias_type = raw_row.get("bias_type", "").strip()
             reuse_raw = raw_row.get("reuse_phase1_samples")
             if reuse_raw is None:
                 reuse_raw = raw_row.get("reuse_pilot_samples", "")
@@ -209,6 +212,7 @@ def _load_rows(csv_path: str):
                 "solver_eta": None,
                 "solver_nfe": None,
                 "sigma_estimation_mode": sigma_estimation_mode,
+                "bias_type": bias_type,
                 "reuse_phase1_samples": reuse_phase1_samples,
                 "N_i": _parse_float_list(raw_row.get("N_i", "")),
                 "N_i_std": _parse_float_list(raw_row.get("N_i_std", "")),
@@ -233,7 +237,11 @@ def _schedule_key(row):
 
 
 def _mode_key(row):
-    return (row["sigma_estimation_mode"], row["reuse_phase1_samples"])
+    return (
+        row["sigma_estimation_mode"],
+        row.get("bias_type", ""),
+        row["reuse_phase1_samples"],
+    )
 
 
 def _adaptive_rows(rows):
@@ -249,9 +257,17 @@ def _solver_rows(rows):
 
 
 def _mode_title(mode_key):
-    sigma_estimation_mode, reuse_phase1_samples = mode_key
+    if len(mode_key) == 2:
+        sigma_estimation_mode, reuse_phase1_samples = mode_key
+        bias_type = ""
+    else:
+        sigma_estimation_mode, bias_type, reuse_phase1_samples = mode_key
     reuse_label = "reuse" if reuse_phase1_samples else "fresh"
-    return f"{sigma_estimation_mode} {reuse_label}"
+    parts = [sigma_estimation_mode]
+    if bias_type:
+        parts.append(bias_type)
+    parts.append(reuse_label)
+    return " ".join(parts)
 
 
 def _mode_keys(rows):
