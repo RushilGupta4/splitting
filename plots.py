@@ -2,6 +2,7 @@ import argparse
 import csv
 import math
 import os
+import re
 from collections import defaultdict
 from statistics import NormalDist
 
@@ -127,6 +128,26 @@ def _parse_bool(value: str):
     raise ValueError(f"Unexpected boolean value: {value}")
 
 
+def _parse_method_label(label: str):
+    label = (label or "").strip()
+    if label == "all_ones_baseline":
+        return ("baseline", "", None, "", None, None)
+    match = re.match(r"^(pilot_tree|independent)_(reuse|fresh)$", label)
+    if match:
+        return ("adaptive", match.group(1), match.group(2) == "reuse", "", None, None)
+    match = re.match(r"^(.+)_([0-9]+)(?:_eta([-+0-9.eE]+))?$", label)
+    if match:
+        return (
+            "solver",
+            "",
+            None,
+            match.group(1),
+            int(match.group(2)),
+            float(match.group(3)) if match.group(3) is not None else None,
+        )
+    return ("solver", "", None, label, None, None)
+
+
 def _load_rows(csv_path: str):
     rows = []
     with open(csv_path, newline="") as f:
@@ -137,27 +158,29 @@ def _load_rows(csv_path: str):
 
             mean_ks = _parse_float(raw_row.get("mean_ks", ""))
             B = _parse_int(raw_row.get("B", ""))
-            sampling_steps = _parse_int(raw_row.get("sampling_steps", ""))
-            eta = _parse_float(raw_row.get("eta", ""))
-            mode = raw_row.get("mode", "").strip()
-            if mean_ks is None or B is None or sampling_steps is None or eta is None:
+            sampling_label = raw_row.get("sampling_label", "").strip()
+            method_label = raw_row.get("method_label", "").strip()
+            kind, sigma_estimation_mode, reuse_phase1_samples, solver, solver_steps, solver_eta = _parse_method_label(method_label)
+            if mean_ks is None or B is None or not sampling_label or not method_label:
                 continue
+            mode = {
+                "baseline": "fixed_N",
+                "solver": "solver_baseline",
+                "adaptive": "estimate_and_sample",
+            }[kind]
 
             common = {
                 "B": B,
-                "sampling_steps": sampling_steps,
-                "eta": eta,
+                "sampling_label": sampling_label,
+                "nfe_per_sample": _parse_int(raw_row.get("nfe_per_sample", "")),
                 "mean_ks": mean_ks,
                 "std_ks": _parse_float(raw_row.get("std_ks", "")),
                 "n_valid_runs": _parse_int(raw_row.get("n_valid_runs", "")),
                 "mode": mode,
-                "method_label": raw_row.get("method_label", "").strip(),
-                "solver": raw_row.get("solver", "").strip(),
-                "solver_sampling_steps": _parse_int(
-                    raw_row.get("solver_sampling_steps", "")
-                ),
-                "solver_eta": _parse_float(raw_row.get("solver_eta", "")),
-                "solver_nfe": _parse_int(raw_row.get("solver_nfe", "")),
+                "method_label": method_label,
+                "solver": solver,
+                "solver_sampling_steps": solver_steps,
+                "solver_eta": solver_eta,
             }
             empty_adaptive = {
                 "B1": None,
@@ -176,12 +199,6 @@ def _load_rows(csv_path: str):
                 continue
 
             B1 = _parse_int(raw_row.get("B1", ""))
-            sigma_estimation_mode = raw_row.get("sigma_estimation_mode", "").strip()
-            reuse_raw = raw_row.get("reuse_phase1_samples")
-            if reuse_raw is None:
-                reuse_raw = raw_row.get("reuse_pilot_samples", "")
-            reuse_phase1_samples = _parse_bool(reuse_raw or "")
-
             if B1 is None or not sigma_estimation_mode or reuse_phase1_samples is None:
                 continue
 
@@ -193,7 +210,7 @@ def _load_rows(csv_path: str):
                     "reuse_phase1_samples": reuse_phase1_samples,
                     "N_i": _parse_float_list(raw_row.get("N_i", "")),
                     "N_i_std": _parse_float_list(raw_row.get("N_i_std", "")),
-                    "N_i_count": _parse_int(raw_row.get("N_i_count", "")),
+                    "N_i_count": len(_parse_float_list(raw_row.get("N_i", ""))),
                     "mode_key": (
                         sigma_estimation_mode,
                         reuse_phase1_samples,
@@ -206,39 +223,33 @@ def _load_rows(csv_path: str):
 # --- Keys / formatters -------------------------------------------------------
 
 
-def _format_eta(eta: float) -> str:
-    return f"{eta:g}"
-
-
 def _schedule_key(row):
-    return (row["sampling_steps"], row["eta"])
+    return row["sampling_label"]
 
 
 def _format_schedule(schedule) -> str:
-    sampling_steps, eta = schedule
-    return f"steps={sampling_steps}, eta={_format_eta(eta)}"
+    return str(schedule)
 
 
 def _series_key(row):
-    if row["mode"] == "fixed_N":
+    kind, sigma_mode, reuse, _solver, _steps, _eta = _parse_method_label(row["method_label"])
+    if kind == "baseline":
         return ("baseline",)
-    if row["mode"] == "solver_baseline":
-        return (
-            "solver",
-            row["method_label"],
-            row["solver"],
-            row["solver_sampling_steps"],
-            row["solver_eta"],
-        )
+    if kind == "solver":
+        return ("solver", row["method_label"])
     return (
         "adaptive",
-        row["sigma_estimation_mode"],
-        row["reuse_phase1_samples"],
+        sigma_mode,
+        reuse,
         row["B1"],
     )
 
 
-def _format_solver_label(method_label, solver, solver_sampling_steps, solver_eta):
+def _format_eta(eta: float) -> str:
+    return f"{eta:g}"
+
+
+def _format_solver_label(method_label, solver=None, solver_sampling_steps=None, solver_eta=None):
     if solver and solver_sampling_steps is not None:
         solver_label = solver.upper() if solver == "ddim" else solver.replace("_", " ")
         label = f"{solver_label} {solver_sampling_steps}"
@@ -300,12 +311,7 @@ def _build_solver_style_map(rows):
             cmap(i % cmap.N),
             SOLVER_LINESTYLES[i % len(SOLVER_LINESTYLES)],
             SOLVER_MARKERS[i % len(SOLVER_MARKERS)],
-            _format_solver_label(
-                method_label,
-                solver_rows_by_label[method_label].get("solver"),
-                solver_rows_by_label[method_label].get("solver_sampling_steps"),
-                solver_rows_by_label[method_label].get("solver_eta"),
-            ),
+            _format_solver_label(method_label),
         )
         for i, method_label in enumerate(labels)
     }
@@ -322,12 +328,10 @@ def _build_schedule_style_map(rows):
     schedules = sorted({_schedule_key(row) for row in rows})
     if not schedules:
         return {}
-    step_values = sorted({s[0] for s in schedules})
-    cmap = plt.get_cmap("tab10") if len(step_values) <= 10 else plt.get_cmap("tab20")
-    step_colors = {step: cmap(i % cmap.N) for i, step in enumerate(step_values)}
+    cmap = plt.get_cmap("tab10") if len(schedules) <= 10 else plt.get_cmap("tab20")
     return {
         schedule: (
-            step_colors[schedule[0]],
+            cmap(i % cmap.N),
             SCHEDULE_MARKERS[i % len(SCHEDULE_MARKERS)],
         )
         for i, schedule in enumerate(schedules)
@@ -487,7 +491,7 @@ def _plot_schedule(ax, schedule_rows, b1_colors, solver_styles, show_std, ci_lev
     ax.xaxis.set_major_formatter(formatter)
 
 
-def _make_main_legends(fig, b1_colors, rows, solver_styles):
+def _make_main_legends(fig, b1_colors, rows, solver_styles, schedule_styles):
     semantic_handles = [
         Line2D([0], [0], color="black", linestyle="-", marker="o", linewidth=2.2),
         Line2D([0], [0], color="0.35", linestyle="-", linewidth=1.8),
@@ -535,6 +539,30 @@ def _make_main_legends(fig, b1_colors, rows, solver_styles):
         frameon=False,
     )
 
+    if schedule_styles:
+        schedule_handles = []
+        schedule_labels = []
+        for schedule, (color, marker) in sorted(schedule_styles.items()):
+            schedule_handles.append(
+                Line2D(
+                    [0],
+                    [0],
+                    color=color,
+                    linestyle="None",
+                    marker=marker,
+                    markersize=6,
+                )
+            )
+            schedule_labels.append(_format_schedule(schedule))
+        fig.legend(
+            schedule_handles,
+            schedule_labels,
+            loc="center right",
+            bbox_to_anchor=(1.0, 0.5),
+            frameon=False,
+            title="Sampling config",
+        )
+
     if not b1_colors:
         return
 
@@ -555,10 +583,14 @@ def _make_main_legends(fig, b1_colors, rows, solver_styles):
 
 
 def _plot_main(rows, b1_colors, solver_styles, args, output_path):
-    schedules = sorted({_schedule_key(row) for row in rows})
+    solver_rows = _solver_rows(rows)
+    non_solver_rows = [r for r in rows if r["mode"] != "solver_baseline"]
+    rows_for_panels = non_solver_rows or rows
+    schedules = sorted({_schedule_key(row) for row in rows_for_panels})
     schedule_groups = defaultdict(list)
-    for row in rows:
+    for row in rows_for_panels:
         schedule_groups[_schedule_key(row)].append(row)
+    schedule_styles = _build_schedule_style_map(non_solver_rows)
 
     n_schedules = len(schedules)
     ncols = min(2, n_schedules)
@@ -575,7 +607,7 @@ def _plot_main(rows, b1_colors, solver_styles, args, output_path):
     for ax, schedule in zip(axes_flat, schedules):
         _plot_schedule(
             ax,
-            schedule_groups[schedule],
+            schedule_groups[schedule] + solver_rows,
             b1_colors,
             solver_styles,
             args.std,
@@ -593,7 +625,7 @@ def _plot_main(rows, b1_colors, solver_styles, args, output_path):
     if args.title:
         fig.suptitle(args.title)
 
-    _make_main_legends(fig, b1_colors, rows, solver_styles)
+    _make_main_legends(fig, b1_colors, rows, solver_styles, schedule_styles)
 
     output_dir = os.path.dirname(output_path)
     if output_dir:
@@ -611,7 +643,7 @@ def _plot_main(rows, b1_colors, solver_styles, args, output_path):
 def _best_adaptive_rows(rows):
     grouped = defaultdict(list)
     for row in _adaptive_rows(rows):
-        grouped[(row["B"], row["sampling_steps"], row["eta"])].append(row)
+        grouped[(row["B"], _schedule_key(row))].append(row)
     selected = []
     for candidates in grouped.values():
         selected.append(
@@ -641,7 +673,7 @@ def _best_solver_rows(rows):
     selected = _best_by_group(
         _solver_rows(rows),
         key_fn=lambda r: (r["B"], r["method_label"]),
-        score_fn=lambda r: (r["mean_ks"], r["sampling_steps"], r["eta"]),
+        score_fn=lambda r: (r["mean_ks"], r.get("nfe_per_sample") or 0),
     )
     return sorted(selected.values(), key=lambda r: (r["method_label"], r["B"]))
 
@@ -675,13 +707,7 @@ def _best_config_series_key(row):
     if row["mode"] == "fixed_N":
         return ("fixed_N", schedule)
     if row["mode"] == "solver_baseline":
-        return (
-            "solver",
-            row["method_label"],
-            row["solver"],
-            row["solver_sampling_steps"],
-            row["solver_eta"],
-        )
+        return ("solver", row["method_label"])
     return ("best_adaptive", schedule)
 
 
@@ -691,8 +717,8 @@ def _format_best_config_label(series_key):
         schedule_label = _format_schedule(series_key[1])
         return f"fixed N, {schedule_label}"
     if kind == "solver":
-        _, method_label, solver, sampling_steps, eta = series_key
-        return _format_solver_label(method_label, solver, sampling_steps, eta)
+        _, method_label = series_key
+        return _format_solver_label(method_label)
     schedule_label = _format_schedule(series_key[1])
     return f"best adaptive, {schedule_label}"
 
@@ -1047,15 +1073,14 @@ def _plot_percent_change_panel(
     solver_labels = sorted(
         {
             method_label
-            for group_schedule, _, method_label in solver_by_group
-            if group_schedule == schedule
+            for _, method_label in solver_by_group
         }
     )
     for method_label in solver_labels:
         solver_candidates = {
             B: row
-            for (group_schedule, B, group_method_label), row in solver_by_group.items()
-            if group_schedule == schedule and group_method_label == method_label
+            for (B, group_method_label), row in solver_by_group.items()
+            if group_method_label == method_label
         }
         x_values, y_values = _percent_change_points(
             schedule, baseline_by_group, solver_candidates
@@ -1085,7 +1110,10 @@ def _plot_percent_change_panel(
 
 
 def _plot_percent_change(rows, title_prefix, solver_styles):
-    schedules = sorted({_schedule_key(row) for row in rows})
+    non_solver_rows = [r for r in rows if r["mode"] != "solver_baseline"]
+    schedules = sorted({_schedule_key(row) for row in non_solver_rows})
+    if not schedules:
+        return plt.figure(figsize=(7.2, 4.8))
     schedule_budget = lambda r: (_schedule_key(r), r["B"])
     by_mean_ks = lambda r: r["mean_ks"]
     baseline_by_group = _best_by_group(
@@ -1098,7 +1126,7 @@ def _plot_percent_change(rows, title_prefix, solver_styles):
     )
     solver_by_group = _best_by_group(
         _solver_rows(rows),
-        key_fn=lambda r: (_schedule_key(r), r["B"], r["method_label"]),
+        key_fn=lambda r: (r["B"], r["method_label"]),
         score_fn=by_mean_ks,
     )
 
@@ -1194,8 +1222,12 @@ def main():
             continue
 
         if plot_name == "optimal_b1":
+            if not _adaptive_rows(rows):
+                continue
             fig = _plot_optimal_b1(rows, args.title, mode_styles)
         elif plot_name == "optimal_ni":
+            if not _adaptive_rows(rows):
+                continue
             fig = _plot_optimal_ni(rows, args.title, mode_styles)
         elif plot_name == "percent_change":
             fig = _plot_percent_change(rows, args.title, solver_styles)

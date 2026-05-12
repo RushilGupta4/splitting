@@ -6,27 +6,15 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from diffusion import (
-    DDIM,
-    expected_cost_per_root as diffusion_expected_cost_per_root,
-    repeat_by_counts,
-    resolve_split_percentages,
-    run_probabilistic_inference_batch,
-    sample_branch_counts,
-    sample_segment,
-    segment_costs as diffusion_segment_costs,
-)
+from diffusion import repeat_by_counts, sample_branch_counts
 from ks import coerce_samples_np
-from model_io import model_input_dim
 from trials import (
     PHASE2_SEED_OFFSET,
     iter_run_chunks,
     make_torch_generator,
     submit_sampling_trial_result_futures,
     summarize_sampling_trials,
-    warm_sampling_ks,
 )
-from utils import denormalize
 
 log = logging.getLogger(__name__)
 
@@ -39,12 +27,12 @@ def _debug(enabled: bool, message: str):
 # --- Pilot-tree shape derivation --------------------------------------------
 
 
-def _pilot_cost_per_root(ddim: DDIM, split_points: Sequence[int], m_pilot: float):
-    start_points = [ddim.T] + list(split_points)
-    end_points = list(split_points) + [0]
+def _pilot_cost_per_root(runner, split_points: Sequence[Any], m_pilot: float):
+    start_points = [runner.start_time] + list(split_points)
+    end_points = list(split_points) + [runner.end_time]
     cost = 0.0
     for idx, (start_t, end_t) in enumerate(zip(start_points, end_points)):
-        cost += (m_pilot ** (idx + 1)) * ddim.segment_cost(start_t, end_t)
+        cost += (m_pilot ** (idx + 1)) * runner.segment_cost(start_t, end_t)
     return cost
 
 
@@ -54,25 +42,24 @@ def _pilot_tree_shape_from_scale(pilot_scale: float):
     return max(1, int(pilot_scale * pilot_scale)), float(pilot_scale)
 
 
-def _pilot_tree_expected_cost(ddim, split_points, pilot_scale):
+def _pilot_tree_expected_cost(runner, split_points, pilot_scale):
     pilot_roots, m_pilot = _pilot_tree_shape_from_scale(pilot_scale)
-    return pilot_roots * _pilot_cost_per_root(ddim, split_points, m_pilot)
+    return pilot_roots * _pilot_cost_per_root(runner, split_points, m_pilot)
 
 
-def _derive_pilot_tree_shape(ddim: DDIM, split_points: Sequence[int], B1: int):
-    # pilot_scale = y so pilot_roots ~ y^2 and per-level branching ~ y.
+def _derive_pilot_tree_shape(runner, split_points: Sequence[Any], B1: int):
     min_pilot_scale = 1.0 + 1e-6
-    min_cost = _pilot_tree_expected_cost(ddim, split_points, min_pilot_scale)
+    min_cost = _pilot_tree_expected_cost(runner, split_points, min_pilot_scale)
     if B1 < min_cost:
         raise ValueError(
             f"B1={B1} is too small for pilot_tree; need at least {min_cost:.6f}"
         )
     lower, upper = min_pilot_scale, 2.0
-    while _pilot_tree_expected_cost(ddim, split_points, upper) <= B1:
+    while _pilot_tree_expected_cost(runner, split_points, upper) <= B1:
         upper *= 2.0
     for _ in range(80):
         mid = 0.5 * (lower + upper)
-        if _pilot_tree_expected_cost(ddim, split_points, mid) <= B1:
+        if _pilot_tree_expected_cost(runner, split_points, mid) <= B1:
             lower = mid
         else:
             upper = mid
@@ -83,43 +70,53 @@ def _derive_pilot_tree_shape(ddim: DDIM, split_points: Sequence[int], B1: int):
 # --- Independent-mode shape derivation --------------------------------------
 
 
-def _independent_sigma_cost(ddim, t_curr, t_next, outer_count, middle_count, inner_count):
+def _independent_variance_cost(
+    runner, t_curr, t_next, outer_count, middle_count, inner_count
+):
     return (
-        outer_count * ddim.segment_cost(ddim.T, t_curr)
-        + outer_count * middle_count * ddim.segment_cost(t_curr, t_next)
-        + outer_count * middle_count * inner_count * ddim.segment_cost(t_next, 0)
+        outer_count * runner.segment_cost(runner.start_time, t_curr)
+        + outer_count * middle_count * runner.segment_cost(t_curr, t_next)
+        + outer_count
+        * middle_count
+        * inner_count
+        * runner.segment_cost(t_next, runner.end_time)
     )
 
 
 def _derive_independent_counts(
-    ddim: DDIM,
-    sigma_times: Sequence[int],
+    runner,
+    variance_times: Sequence[Any],
     B1: int,
     independent_n2: int,
 ) -> Tuple[float, List[Dict[str, int]], int]:
-    if not sigma_times:
-        raise ValueError("sigma_times must be non-empty")
+    if not variance_times:
+        raise ValueError("variance_times must be non-empty")
     if independent_n2 < 2:
         raise ValueError("independent_n2 must be at least 2")
 
-    budget_per_sigma = B1 / len(sigma_times)
-    if budget_per_sigma <= 0:
-        raise ValueError("B1 must be positive for independent sigma estimation")
+    budget_per_variance = B1 / len(variance_times)
+    if budget_per_variance <= 0:
+        raise ValueError("B1 must be positive for independent variance estimation")
 
-    counts_by_sigma = []
+    counts_by_variance = []
     total_used_B1 = 0
-    next_times = list(sigma_times[1:]) + [0]
+    next_times = list(variance_times[1:]) + [runner.end_time]
 
-    for t_curr, t_next in zip(sigma_times, next_times):
-        segment1 = ddim.segment_cost(ddim.T, t_curr)
-        segment2 = ddim.segment_cost(t_curr, t_next)
-        segment3 = ddim.segment_cost(t_next, 0)
+    for t_curr, t_next in zip(variance_times, next_times):
+        segment1 = runner.segment_cost(runner.start_time, t_curr)
+        segment2 = runner.segment_cost(t_curr, t_next)
+        segment3 = runner.segment_cost(t_next, runner.end_time)
         min_inner = 2 if segment3 > 0 else 1
-        min_cost = segment1 + independent_n2 * segment2 + independent_n2 * min_inner * segment3
-        if budget_per_sigma < min_cost:
+        min_cost = (
+            segment1
+            + independent_n2 * segment2
+            + independent_n2 * min_inner * segment3
+        )
+        if budget_per_variance < min_cost:
             raise ValueError(
-                f"B1 too small for equal per-sigma independent estimation; "
-                f"budget_per_sigma={budget_per_sigma:.6f}, min required={min_cost:.6f} at t={t_curr}"
+                f"B1 too small for equal per-variance independent estimation; "
+                f"budget_per_variance={budget_per_variance:.6f}, min required={min_cost:.6f} "
+                f"at t={t_curr}"
             )
 
         def cost_for_y(y):
@@ -128,26 +125,24 @@ def _derive_independent_counts(
             )
 
         lower, upper = 1.0, 2.0
-        while cost_for_y(upper) <= budget_per_sigma:
+        while cost_for_y(upper) <= budget_per_variance:
             upper *= 2.0
         for _ in range(80):
             mid = 0.5 * (lower + upper)
-            if cost_for_y(mid) <= budget_per_sigma:
+            if cost_for_y(mid) <= budget_per_variance:
                 lower = mid
             else:
                 upper = mid
 
         outer_count = max(1, int(lower * lower))
-        # On the last sigma block (t_next == 0), inner repeats are exact x0 duplicates;
-        # use inner_count=1 to avoid overweighting them under reuse_phase1_samples.
         if segment3 == 0:
             inner_count = 1
         else:
             inner_count = max(2, int(lower))
-        used_budget = _independent_sigma_cost(
-            ddim, t_curr, t_next, outer_count, independent_n2, inner_count
+        used_budget = _independent_variance_cost(
+            runner, t_curr, t_next, outer_count, independent_n2, inner_count
         )
-        counts_by_sigma.append(
+        counts_by_variance.append(
             {
                 "outer_count": int(outer_count),
                 "middle_count": int(independent_n2),
@@ -156,57 +151,50 @@ def _derive_independent_counts(
         )
         total_used_B1 += used_budget
 
-    return budget_per_sigma, counts_by_sigma, int(total_used_B1)
+    return budget_per_variance, counts_by_variance, int(total_used_B1)
 
 
-# --- Pilot tree construction + sigma estimation -----------------------------
+# --- Pilot tree construction + variance estimation --------------------------
 
 
 def _build_pilot_tree_batch(
-    model, ddim: DDIM, chunk_size: int, pilot_roots: int,
-    split_points: Sequence[int], m_pilot: float, generator=None,
+    runner,
+    chunk_size: int,
+    pilot_roots: int,
+    split_points: Sequence[Any],
+    m_pilot: float,
+    generator=None,
 ):
-    input_dim = model_input_dim(model)
-    x = torch.randn(
-        chunk_size * pilot_roots, input_dim, device=ddim.device, generator=generator
-    )
+    x = runner.sample_prior(chunk_size * pilot_roots, generator=generator)
     run_ids = torch.repeat_interleave(
-        torch.arange(chunk_size, device=ddim.device, dtype=torch.long), pilot_roots
+        torch.arange(chunk_size, device=runner.device, dtype=torch.long), pilot_roots
     )
 
     child_counts_by_level: List[torch.Tensor] = []
     parent_run_ids_by_level: List[torch.Tensor] = []
-    used_B1_by_run = torch.zeros(chunk_size, device=ddim.device, dtype=torch.long)
+    used_B1_by_run = torch.zeros(chunk_size, device=runner.device, dtype=torch.long)
 
-    start_points = [ddim.T] + list(split_points)
-    end_points = list(split_points) + [0]
+    start_points = [runner.start_time] + list(split_points)
+    end_points = list(split_points) + [runner.end_time]
     for start_t, end_t in zip(start_points, end_points):
         child_counts = sample_branch_counts(
-            x.shape[0], m_pilot, ddim.device, generator=generator
+            x.shape[0], m_pilot, runner.device, generator=generator
         )
         child_counts_by_level.append(child_counts)
         parent_run_ids_by_level.append(run_ids)
         x = repeat_by_counts(x, child_counts)
         run_ids = run_ids.repeat_interleave(child_counts, dim=0)
-        x = sample_segment(ddim, model, x, start_t, end_t, generator=generator)
+        x = runner.sample_segment(x, start_t, end_t, generator=generator)
         used_B1_by_run = used_B1_by_run + torch.bincount(
             run_ids, minlength=chunk_size
-        ) * int(ddim.segment_cost(start_t, end_t))
+        ) * int(runner.segment_cost(start_t, end_t))
 
     return (
-        x, run_ids, child_counts_by_level, parent_run_ids_by_level,
-        used_B1_by_run.detach().cpu().tolist(),
-    )
-
-
-def _rectangle_indicator_grid(values: torch.Tensor, x_grid: Sequence[float]):
-    thresholds = torch.as_tensor(x_grid, device=values.device, dtype=values.dtype)
-    x1_below = values[:, 0:1] <= thresholds.unsqueeze(0)
-    x2_below = values[:, 1:2] <= thresholds.unsqueeze(0)
-    return (
-        (x1_below.unsqueeze(2) & x2_below.unsqueeze(1))
-        .to(values.dtype)
-        .reshape(values.shape[0], -1)
+        x,
+        run_ids,
+        child_counts_by_level,
+        parent_run_ids_by_level,
+        used_B1_by_run.cpu().tolist(),
     )
 
 
@@ -254,33 +242,41 @@ def _grouped_unbiased_var(values, group_ids, num_groups):
     )
 
 
-def _estimate_sigmas_from_tree_batch(
-    leaf_x0: torch.Tensor,
+def _estimate_variances_from_tree_batch(
+    leaf_observables: torch.Tensor,
     num_levels: int,
     child_counts_by_level: Sequence[torch.Tensor],
     parent_run_ids_by_level: Sequence[torch.Tensor],
-    x_grid: Sequence[float],
     chunk_size: int,
 ):
-    """Return (sigma2[chunk, num_levels, grid_pts], tau2[chunk, grid_pts])."""
-    if len(child_counts_by_level) != num_levels or len(parent_run_ids_by_level) != num_levels:
+    """Return (variance2[chunk, num_levels, obs_dim], tau2[chunk, obs_dim])."""
+    if (
+        len(child_counts_by_level) != num_levels
+        or len(parent_run_ids_by_level) != num_levels
+    ):
         raise ValueError("level arrays must have length num_levels")
 
-    current = _rectangle_indicator_grid(leaf_x0, x_grid)
-    grid_pts = current.shape[1]
+    current = leaf_observables
+    obs_dim = current.shape[1]
     raw_var_by_level: List[torch.Tensor] = [None] * num_levels  # type: ignore
     valid_mask_by_level: List[torch.Tensor] = [None] * num_levels  # type: ignore
 
     for rev_idx in range(num_levels - 1, -1, -1):
-        counts = child_counts_by_level[rev_idx].to(device=current.device, dtype=torch.long)
-        child_means, child_vars, valid_mask = _segment_mean_and_unbiased_var(current, counts)
+        counts = child_counts_by_level[rev_idx].to(
+            device=current.device, dtype=torch.long
+        )
+        child_means, child_vars, valid_mask = _segment_mean_and_unbiased_var(
+            current, counts
+        )
         raw_var_by_level[rev_idx] = child_vars
         valid_mask_by_level[rev_idx] = valid_mask
         current = child_means
-    root_run_ids = parent_run_ids_by_level[0].to(device=current.device, dtype=torch.long)
+    root_run_ids = parent_run_ids_by_level[0].to(
+        device=current.device, dtype=torch.long
+    )
 
-    sigma2 = torch.zeros(
-        chunk_size, num_levels, grid_pts, device=current.device, dtype=current.dtype
+    variance2 = torch.zeros(
+        chunk_size, num_levels, obs_dim, device=current.device, dtype=current.dtype
     )
     for level_idx in range(num_levels):
         corrected = raw_var_by_level[level_idx]
@@ -301,11 +297,11 @@ def _estimate_sigmas_from_tree_batch(
         parents = parent_run_ids_by_level[level_idx].to(
             device=corrected.device, dtype=torch.long
         )
-        sigma2_flat, _ = _grouped_mean(corrected[valid], parents[valid], chunk_size)
-        sigma2[:, level_idx, :] = torch.clamp(sigma2_flat, min=0.0)
+        variance2_flat, _ = _grouped_mean(corrected[valid], parents[valid], chunk_size)
+        variance2[:, level_idx, :] = torch.clamp(variance2_flat, min=0.0)
 
     tau2 = _grouped_unbiased_var(current, root_run_ids, chunk_size)
-    return sigma2.detach().cpu().numpy(), tau2.detach().cpu().numpy()
+    return variance2.cpu().numpy(), tau2.cpu().numpy()
 
 
 # --- Cost-optimal split-factor optimizer ------------------------------------
@@ -469,8 +465,13 @@ def _solve_active_primal_inner(active_M, y_initial, *, y_floor, max_iters):
 
 
 def _solve_active_set_primal_allocation(
-    M: np.ndarray, y_initial: np.ndarray, *, y_floor: float,
-    relative_tol: float = 2e-3, max_outer_iters: int = 30, max_inner_iters: int = 300,
+    M: np.ndarray,
+    y_initial: np.ndarray,
+    *,
+    y_floor: float,
+    relative_tol: float = 2e-3,
+    max_outer_iters: int = 30,
+    max_inner_iters: int = 300,
 ):
     num_points, num_levels = M.shape
     if num_points == 0 or num_levels == 0:
@@ -513,9 +514,13 @@ def _solve_active_set_primal_allocation(
         active_indices.update(int(idx) for idx in worst)
         if len(active_indices) > max_active:
             keep = _top_indices(full_values, max_active)
-            active_indices = set(int(idx) for idx in keep) | set(int(idx) for idx in active_array)
+            active_indices = set(int(idx) for idx in keep) | set(
+                int(idx) for idx in active_array
+            )
             if len(active_indices) > max_active:
-                ranked = sorted(active_indices, key=lambda idx: full_values[idx], reverse=True)
+                ranked = sorted(
+                    active_indices, key=lambda idx: full_values[idx], reverse=True
+                )
                 active_indices = set(ranked[:max_active])
         if len(active_indices) == prev_size:
             break
@@ -524,22 +529,22 @@ def _solve_active_set_primal_allocation(
 
 
 def _solve_optimal_split_factors(
-    sigma2_per_level: np.ndarray, tau2: np.ndarray, cost_weights: Sequence[float]
+    variance2_per_level: np.ndarray, tau2: np.ndarray, cost_weights: Sequence[float]
 ) -> List[float]:
-    """Solve for optimal split factors given per-level sigma^2 grids and tau^2."""
-    sigma2_per_level = np.asarray(sigma2_per_level, dtype=float)
+    """Solve for optimal split factors given per-level variance grids and tau^2."""
+    variance2_per_level = np.asarray(variance2_per_level, dtype=float)
     tau2 = np.asarray(tau2, dtype=float)
-    if sigma2_per_level.ndim != 2:
-        raise ValueError("sigma2_per_level must be (num_levels, grid_pts)")
-    if not np.isfinite(sigma2_per_level).all() or not np.isfinite(tau2).all():
-        raise ValueError("sigma2/tau2 contain non-finite values")
+    if variance2_per_level.ndim != 2:
+        raise ValueError("variance2_per_level must be (num_levels, grid_pts)")
+    if not np.isfinite(variance2_per_level).all() or not np.isfinite(tau2).all():
+        raise ValueError("variance/tau2 contain non-finite values")
 
-    num_levels, grid_pts = sigma2_per_level.shape
+    num_levels, grid_pts = variance2_per_level.shape
     if tau2.shape != (grid_pts,):
         raise ValueError(f"tau2 shape {tau2.shape} != ({grid_pts},)")
 
     # (grid_pts, num_levels) — collapse leaf-level tau into level 0.
-    M = np.maximum(sigma2_per_level, 0.0).T.copy()
+    M = np.maximum(variance2_per_level, 0.0).T.copy()
     M[:, 0] += np.maximum(tau2, 0.0)
 
     weight_floor = 1e-12
@@ -551,13 +556,13 @@ def _solve_optimal_split_factors(
     cost_w = cost_w / float(cost_w.sum())
 
     weighted_M = M * cost_w[None, :]
-    sigma_matrix = np.sqrt(weighted_M)
-    row_sums = sigma_matrix.sum(axis=1)
+    root_matrix = np.sqrt(weighted_M)
+    row_sums = root_matrix.sum(axis=1)
     j_star = int(np.argmax(row_sums))
-    sigmas_at_j = sigma_matrix[j_star]
-    total = float(sigmas_at_j.sum())
+    roots_at_j = root_matrix[j_star]
+    total = float(roots_at_j.sum())
     y_initial = (
-        sigmas_at_j / total
+        roots_at_j / total
         if total > 0.0
         else np.full(num_levels, 1.0 / num_levels, dtype=float)
     )
@@ -576,36 +581,59 @@ def _solve_optimal_split_factors(
 
 
 def _run_pilot_tree_phase1_sampling_batch(
-    model, data_mean, data_std, *,
-    B1, T, sampling_steps, eta, split_percentages, x_grid,
-    reuse_phase1_samples, device, chunk_size, debug=False, generator=None,
+    runner,
+    *,
+    B1,
+    comparison_mode,
+    observable_config,
+    split_percentages,
+    reuse_phase1_samples,
+    chunk_size,
+    debug=False,
+    generator=None,
 ):
-    ddim = DDIM(T=T, device=device, eta=eta, sampling_steps=sampling_steps)
-    _, split_points = resolve_split_percentages(ddim, split_percentages)
+    _, split_points = runner.resolve_split_percentages(split_percentages)
     num_levels = len(split_points) + 1
-    pilot_scale, pilot_roots, m_pilot = _derive_pilot_tree_shape(ddim, split_points, B1)
+    pilot_scale, pilot_roots, m_pilot = _derive_pilot_tree_shape(
+        runner, split_points, B1
+    )
     _debug(
         debug,
         f"Phase 1 pilot_tree: chunk={chunk_size} pilot_scale={pilot_scale:.4f} "
         f"pilot_roots={pilot_roots} m_pilot={m_pilot:.4f}",
     )
 
-    leaf_x0, leaf_run_ids, child_counts_by_level, parent_run_ids_by_level, used_B1_by_run = (
-        _build_pilot_tree_batch(
-            model, ddim, chunk_size, pilot_roots, split_points, m_pilot, generator=generator,
-        )
+    (
+        leaf_x,
+        leaf_run_ids,
+        child_counts_by_level,
+        parent_run_ids_by_level,
+        used_B1_by_run,
+    ) = _build_pilot_tree_batch(
+        runner,
+        chunk_size,
+        pilot_roots,
+        split_points,
+        m_pilot,
+        generator=generator,
     )
-    leaf_x0 = denormalize(leaf_x0, data_mean, data_std)
+    leaf_x0 = runner.postprocess_samples(leaf_x)
+    leaf_observables = runner.observable_values(
+        leaf_x0, comparison_mode=comparison_mode, observable_config=observable_config
+    )
 
-    sigma2_arr, tau2_arr = _estimate_sigmas_from_tree_batch(
-        leaf_x0, num_levels, child_counts_by_level, parent_run_ids_by_level,
-        x_grid, chunk_size,
+    variance2_arr, tau2_arr = _estimate_variances_from_tree_batch(
+        leaf_observables,
+        num_levels,
+        child_counts_by_level,
+        parent_run_ids_by_level,
+        chunk_size,
     )
 
     phase1_x0_by_run: List[Any] = [None] * chunk_size
     if reuse_phase1_samples:
         counts = (
-            torch.bincount(leaf_run_ids, minlength=chunk_size).detach().cpu().tolist()
+            torch.bincount(leaf_run_ids, minlength=chunk_size).cpu().tolist()
         )
         phase1_x0_by_run = [
             coerce_samples_np(s) for s in torch.split(leaf_x0, counts)
@@ -613,8 +641,8 @@ def _run_pilot_tree_phase1_sampling_batch(
 
     return [
         {
-            "split_points": [int(x) for x in split_points],
-            "sigma2_per_level": sigma2_arr[run_idx],
+            "split_points": list(split_points),
+            "variance2_per_level": variance2_arr[run_idx],
             "tau2": tau2_arr[run_idx],
             "used_B1": int(used_B1_by_run[run_idx]),
             "phase1_x0_samples": phase1_x0_by_run[run_idx],
@@ -624,86 +652,115 @@ def _run_pilot_tree_phase1_sampling_batch(
 
 
 def _run_independent_phase1_sampling_batch(
-    model, data_mean, data_std, *,
-    B1, T, sampling_steps, eta, split_percentages, x_grid, independent_n2,
-    reuse_phase1_samples, device, chunk_size, debug=False, generator=None,
+    runner,
+    *,
+    B1,
+    comparison_mode,
+    observable_config,
+    split_percentages,
+    independent_n2,
+    reuse_phase1_samples,
+    chunk_size,
+    debug=False,
+    generator=None,
 ):
-    ddim = DDIM(T=T, device=device, eta=eta, sampling_steps=sampling_steps)
-    _, split_points = resolve_split_percentages(ddim, split_percentages)
-    sigma_times = [T] + list(split_points)
-    num_levels = len(sigma_times)
-    _, counts_by_sigma, _ = _derive_independent_counts(
-        ddim, sigma_times, B1, independent_n2,
+    _, split_points = runner.resolve_split_percentages(split_percentages)
+    variance_times = [runner.start_time] + list(split_points)
+    num_levels = len(variance_times)
+    _, counts_by_variance, _ = _derive_independent_counts(
+        runner, variance_times, B1, independent_n2
     )
-    _debug(debug, f"Phase 1 independent: chunk={chunk_size} counts={counts_by_sigma}")
+    _debug(debug, f"Phase 1 independent: chunk={chunk_size} counts={counts_by_variance}")
 
-    input_dim = model_input_dim(model)
-    next_times = list(sigma_times[1:]) + [0]
+    next_times = list(variance_times[1:]) + [runner.end_time]
 
-    grid_size = len(x_grid)
-    grid_pts = grid_size * grid_size
-    sigma2_per_level = np.zeros((chunk_size, num_levels, grid_pts), dtype=float)
-    tau2 = np.zeros((chunk_size, grid_pts), dtype=float)
+    variance2_per_level: np.ndarray | None = None
+    tau2: np.ndarray | None = None
+    obs_dim: int | None = None
     phase1_samples_by_run: List[list] = [[] for _ in range(chunk_size)]
     used_B1 = 0
 
     for idx, ((t_curr, t_next), spec) in enumerate(
-        zip(zip(sigma_times, next_times), counts_by_sigma)
+        zip(zip(variance_times, next_times), counts_by_variance)
     ):
         outer = int(spec["outer_count"])
         middle = int(spec["middle_count"])
         inner = int(spec["inner_count"])
         leaf_per_run = outer * middle * inner
 
-        root = torch.randn(
-            chunk_size * outer, input_dim, device=device, generator=generator
+        root = runner.sample_prior(chunk_size * outer, generator=generator)
+        x_curr = runner.sample_segment(
+            root, runner.start_time, t_curr, generator=generator
         )
-        x_curr = sample_segment(ddim, model, root, ddim.T, t_curr, generator=generator)
         x_curr_rep = repeat_by_counts(
-            x_curr, torch.full((x_curr.shape[0],), middle, device=device, dtype=torch.long)
+            x_curr,
+            torch.full(
+                (x_curr.shape[0],), middle, device=runner.device, dtype=torch.long
+            ),
         )
-        x_next = sample_segment(ddim, model, x_curr_rep, t_curr, t_next, generator=generator)
+        x_next = runner.sample_segment(
+            x_curr_rep, t_curr, t_next, generator=generator
+        )
         x_next_rep = repeat_by_counts(
-            x_next, torch.full((x_next.shape[0],), inner, device=device, dtype=torch.long)
+            x_next,
+            torch.full(
+                (x_next.shape[0],), inner, device=runner.device, dtype=torch.long
+            ),
         )
-        x_0 = sample_segment(ddim, model, x_next_rep, t_next, 0, generator=generator)
-        x_0 = denormalize(x_0, data_mean, data_std)
+        x_0 = runner.sample_segment(
+            x_next_rep, t_next, runner.end_time, generator=generator
+        )
+        x_0 = runner.postprocess_samples(x_0)
 
         if reuse_phase1_samples:
-            x0_by_run = x_0.reshape(chunk_size, leaf_per_run, input_dim)
+            x0_by_run = x_0.reshape(chunk_size, leaf_per_run, x_0.shape[-1])
             for run_idx in range(chunk_size):
                 phase1_samples_by_run[run_idx].append(x0_by_run[run_idx])
 
-        used_B1 += _independent_sigma_cost(ddim, t_curr, t_next, outer, middle, inner)
-
-        indicators = _rectangle_indicator_grid(x_0, x_grid).reshape(
-            chunk_size, outer, middle, inner, grid_pts
+        used_B1 += _independent_variance_cost(
+            runner, t_curr, t_next, outer, middle, inner
         )
+
+        observables = runner.observable_values(
+            x_0,
+            comparison_mode=comparison_mode,
+            observable_config=observable_config,
+        )
+        if obs_dim is None:
+            obs_dim = observables.shape[1]
+            variance2_per_level = np.zeros((chunk_size, num_levels, obs_dim), dtype=float)
+            tau2 = np.zeros((chunk_size, obs_dim), dtype=float)
+        indicators = observables.reshape(chunk_size, outer, middle, inner, obs_dim)
         middle_means = indicators.mean(dim=3)
         if middle < 2:
-            raise ValueError("Independent sigma estimation needs middle_count >= 2")
+            raise ValueError("Independent variance estimation needs middle_count >= 2")
         outer_vars = torch.clamp(middle_means.var(dim=2, unbiased=True), min=0.0)
-        raw_sigma2 = outer_vars.mean(dim=1)
-        if inner >= 2 and ddim.segment_cost(t_next, 0) > 0:
+        raw_variance2 = outer_vars.mean(dim=1)
+        if inner >= 2 and runner.segment_cost(t_next, runner.end_time) > 0:
             inner_vars = torch.clamp(indicators.var(dim=3, unbiased=True), min=0.0)
-            sigma2_level = raw_sigma2 - inner_vars.mean(dim=(1, 2)) / float(inner)
+            variance2_level = raw_variance2 - inner_vars.mean(dim=(1, 2)) / float(inner)
         else:
-            sigma2_level = raw_sigma2
-        sigma2_level = torch.clamp(sigma2_level, min=0.0)
-        sigma2_per_level[:, idx, :] = sigma2_level.detach().cpu().numpy()
+            variance2_level = raw_variance2
+        variance2_level = torch.clamp(variance2_level, min=0.0)
+        variance2_per_level[:, idx, :] = variance2_level.cpu().numpy()
 
         if idx == 0:
             outer_means = middle_means.mean(dim=2)
             if outer >= 2:
                 tau2_level = torch.clamp(outer_means.var(dim=1, unbiased=True), min=0.0)
             else:
-                tau2_level = torch.zeros(chunk_size, grid_pts, device=device, dtype=x_0.dtype)
-            tau2[:] = tau2_level.detach().cpu().numpy()
+                tau2_level = torch.zeros(
+                    chunk_size, obs_dim, device=runner.device, dtype=x_0.dtype
+                )
+            tau2[:] = tau2_level.cpu().numpy()
+
+    if variance2_per_level is None or tau2 is None:
+        raise RuntimeError("Independent phase-1 produced no variance estimates")
 
     return [
         {
-            "split_points": [int(x) for x in split_points],
-            "sigma2_per_level": sigma2_per_level[run_idx],
+            "split_points": list(split_points),
+            "variance2_per_level": variance2_per_level[run_idx],
             "tau2": tau2[run_idx],
             "used_B1": int(used_B1),
             "phase1_x0_samples": (
@@ -719,19 +776,18 @@ def _run_independent_phase1_sampling_batch(
 # --- Phase 1 → Phase 2 ------------------------------------------------------
 
 
-def _solve_phase1_allocation(payload, *, B, T, sampling_steps, eta):
-    ddim = DDIM(T=T, device="cpu", eta=eta, sampling_steps=sampling_steps)
+def _solve_phase1_allocation(payload, runner, *, B):
     split_points = payload["split_points"]
-    seg_costs = diffusion_segment_costs(ddim, split_points)
+    seg_costs = runner.segment_costs(split_points)
     total = float(np.sum(seg_costs))
     if total <= 0.0:
         raise ValueError("segment costs must sum to a positive value")
     cost_weights = [c / total for c in seg_costs]
 
     split_factors = _solve_optimal_split_factors(
-        payload["sigma2_per_level"], payload["tau2"], cost_weights
+        payload["variance2_per_level"], payload["tau2"], cost_weights
     )
-    cost_per_root = diffusion_expected_cost_per_root(ddim, split_points, split_factors)
+    cost_per_root = runner.expected_cost_per_root(split_points, split_factors)
     B2 = B - int(payload["used_B1"])
     n0 = int(B2 // cost_per_root)
     if n0 < 1:
@@ -748,38 +804,42 @@ def _solve_phase1_allocation(payload, *, B, T, sampling_steps, eta):
 
 
 def run_estimate_and_sample(
-    model,
-    target_spec: Dict[str, Any],
-    data_mean: torch.Tensor,
-    data_std: torch.Tensor,
-    reference_cdf_state: Dict[str, Any] | None,
+    runner,
+    comparison_state: Any,
     *,
-    B, B1, T, sampling_steps, eta, split_percentages, x_grid, independent_n2,
-    sigma_estimation_mode, reuse_phase1_samples, n_runs, seed, device,
-    reference_mode: str = "ddpm_samples",
+    comparison_mode: str,
+    B: int,
+    B1: int,
+    split_percentages,
+    observable_config,
+    independent_n2: int,
+    variance_estimation_mode: str,
+    reuse_phase1_samples: bool,
+    n_runs: int,
+    seed: int | None,
     debug: bool = False,
     n_parallel: int = 1,
-    run_start_index: int = 0,
+    run_offset: int = 0,
     return_trial_results: bool = False,
 ):
     if B1 < 0 or B1 >= B:
         raise ValueError("require 0 <= B1 < B")
-    if sigma_estimation_mode == "independent" and independent_n2 < 2:
+    if variance_estimation_mode == "independent" and independent_n2 < 2:
         raise ValueError("independent_n2 must be at least 2")
 
-    if sigma_estimation_mode == "pilot_tree":
+    if variance_estimation_mode == "pilot_tree":
         phase1_fn = _run_pilot_tree_phase1_sampling_batch
         phase1_extra: Dict[str, Any] = {}
-    elif sigma_estimation_mode == "independent":
+    elif variance_estimation_mode == "independent":
         phase1_fn = _run_independent_phase1_sampling_batch
         phase1_extra = {"independent_n2": int(independent_n2)}
     else:
-        raise ValueError(f"unknown sigma_estimation_mode '{sigma_estimation_mode}'")
+        raise ValueError(f"unknown variance_estimation_mode '{variance_estimation_mode}'")
 
     _debug(
         debug,
-        f"Starting estimate_and_sample B={B} B1={B1} steps={sampling_steps} "
-        f"eta={eta} mode={sigma_estimation_mode}",
+        f"Starting estimate_and_sample B={B} B1={B1} runner={runner.runner_name} "
+        f"mode={variance_estimation_mode}",
     )
 
     chunks = list(iter_run_chunks(n_runs, n_parallel))
@@ -790,30 +850,23 @@ def run_estimate_and_sample(
         allocation_futures = []
         for start, end in tqdm(chunks, desc="Phase 1", leave=False):
             chunk_size = end - start
-            run_seed = None if seed is None else seed + run_start_index + start
+            run_seed = None if seed is None else seed + run_offset + start
             payloads = phase1_fn(
-                model=model,
-                data_mean=data_mean,
-                data_std=data_std,
+                runner,
                 B1=B1,
-                T=T,
-                sampling_steps=sampling_steps,
-                eta=eta,
+                comparison_mode=comparison_mode,
+                observable_config=observable_config,
                 split_percentages=split_percentages,
-                x_grid=x_grid,
                 reuse_phase1_samples=reuse_phase1_samples,
-                device=device,
                 chunk_size=chunk_size,
                 debug=debug,
-                generator=make_torch_generator(run_seed, device),
+                generator=make_torch_generator(run_seed, runner.device),
                 **phase1_extra,
             )
-            # Overlap CPU allocation solves with subsequent GPU Phase 1 chunks.
             for local_idx, payload in enumerate(payloads):
                 run_idx = start + local_idx
                 future = alloc_executor.submit(
-                    _solve_phase1_allocation,
-                    payload, B=B, T=T, sampling_steps=sampling_steps, eta=eta,
+                    _solve_phase1_allocation, payload, runner, B=B
                 )
                 allocation_futures.append((run_idx, future))
 
@@ -823,8 +876,6 @@ def run_estimate_and_sample(
     if any(t is None for t in trial_results):
         raise RuntimeError("Phase 1 allocation did not produce all trial results")
 
-    ddim = DDIM(T=T, device=device, eta=eta, sampling_steps=sampling_steps)
-    warm_sampling_ks(reference_mode, target_spec)
     ks_workers = max(1, min(int(n_parallel), n_runs))
     ks_futures: List[Tuple[int, Any]] = []
     with ThreadPoolExecutor(max_workers=ks_workers) as ks_executor:
@@ -833,26 +884,22 @@ def run_estimate_and_sample(
             run_seed = (
                 None
                 if seed is None
-                else seed + PHASE2_SEED_OFFSET + run_start_index + start
+                else seed + PHASE2_SEED_OFFSET + run_offset + start
             )
-            samples_by_run, _, _ = run_probabilistic_inference_batch(
-                model=model,
-                ddim=ddim,
+            samples_by_run, _, _ = runner.run_split_batch(
                 n0_by_run=[int(t["n0"]) for t in chunk],
                 split_points=chunk[0]["split_points"],
                 split_factors_by_run=[t["N_i"] for t in chunk],
-                data_mean=data_mean,
-                data_std=data_std,
-                generator=make_torch_generator(run_seed, device),
+                generator=make_torch_generator(run_seed, runner.device),
             )
             submit_sampling_trial_result_futures(
                 executor=ks_executor,
                 futures=ks_futures,
                 run_indices=range(start, end),
                 samples_by_run=samples_by_run,
-                target_spec=target_spec,
-                reference_cdf_state=reference_cdf_state,
-                reference_mode=reference_mode,
+                runner=runner,
+                comparison_mode=comparison_mode,
+                comparison_state=comparison_state,
                 phase1_x0_samples_by_run=[t.get("phase1_x0_samples") for t in chunk],
             )
         for run_idx, future in tqdm(ks_futures, desc="KS", leave=False):

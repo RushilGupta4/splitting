@@ -1,17 +1,9 @@
 import logging
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable, Dict, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
-import torch
 from tqdm import tqdm
 
-from diffusion import (
-    DDIM,
-    expected_cost_per_root,
-    resolve_split_percentages,
-    run_probabilistic_inference_batch,
-    run_solver_baseline_batch,
-)
 from trials import (
     PHASE2_SEED_OFFSET,
     collect_sampling_trial_result_futures,
@@ -19,7 +11,6 @@ from trials import (
     make_torch_generator,
     submit_sampling_trial_result_futures,
     summarize_sampling_trials,
-    warm_sampling_ks,
 )
 
 log = logging.getLogger(__name__)
@@ -28,18 +19,16 @@ log = logging.getLogger(__name__)
 def _run_phase2_loop(
     sample_batch_fn: Callable,
     *,
-    target_spec: Dict[str, Any],
-    reference_cdf_state: Dict[str, Any] | None,
-    reference_mode: str,
+    runner,
+    comparison_mode: str,
+    comparison_state: Any,
     n_runs: int,
     n_parallel: int,
     seed: int | None,
-    run_start_index: int,
-    device: str,
+    run_offset: int,
 ):
     """Run n_runs Phase-2 trials. sample_batch_fn(chunk_size, generator) -> samples_by_run."""
     trial_results: list = [None] * n_runs
-    warm_sampling_ks(reference_mode, target_spec)
     workers = max(1, min(int(n_parallel), n_runs))
     futures: list = []
     with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -50,79 +39,68 @@ def _run_phase2_loop(
             run_seed = (
                 None
                 if seed is None
-                else seed + PHASE2_SEED_OFFSET + run_start_index + start
+                else seed + PHASE2_SEED_OFFSET + run_offset + start
             )
             samples_by_run = sample_batch_fn(
-                chunk_size, make_torch_generator(run_seed, device)
+                chunk_size, make_torch_generator(run_seed, runner.device)
             )
             submit_sampling_trial_result_futures(
                 executor=executor,
                 futures=futures,
                 run_indices=range(start, end),
                 samples_by_run=samples_by_run,
-                target_spec=target_spec,
-                reference_cdf_state=reference_cdf_state,
-                reference_mode=reference_mode,
+                runner=runner,
+                comparison_mode=comparison_mode,
+                comparison_state=comparison_state,
             )
         collect_sampling_trial_result_futures(trial_results, futures)
     return trial_results
 
 
 def run_solver_baseline_sampling(
-    model,
-    target_spec: Dict[str, Any],
-    data_mean: torch.Tensor,
-    data_std: torch.Tensor,
-    reference_cdf_state: Dict[str, Any] | None,
+    runner,
+    comparison_state: Any,
     *,
+    comparison_mode: str,
     solver: str,
     B: int,
-    T: int,
-    sampling_steps: int,
-    eta: float = 0.0,
+    solver_kwargs: Mapping[str, Any] | None = None,
     n_runs: int,
     seed: int | None,
-    device: str,
-    reference_mode: str = "ddpm_samples",
     debug: bool = False,
     n_parallel: int = 1,
-    run_start_index: int = 0,
+    run_offset: int = 0,
     return_trial_results: bool = False,
 ):
-    if sampling_steps < 1:
-        raise ValueError("sampling_steps must be at least 1")
-    n0 = int(B // sampling_steps)
+    solver_kwargs = dict(solver_kwargs or {})
+    cost = float(runner.solver_cost(solver, **solver_kwargs))
+    if cost <= 0.0:
+        raise ValueError(f"runner.solver_cost returned non-positive value {cost}")
+    n0 = int(B // cost)
     if n0 < 1:
         raise ValueError(
-            f"Budget B={B} is too small for solver baseline with {sampling_steps} steps"
+            f"Budget B={B} is too small for solver baseline with cost {cost}"
         )
 
     def sample_batch(chunk_size, generator):
-        samples, _ = run_solver_baseline_batch(
-            model=model,
-            data_mean=data_mean,
-            data_std=data_std,
+        samples, _ = runner.run_solver_baseline_batch(
             solver=solver,
             chunk_size=chunk_size,
             n0=n0,
-            T=T,
-            sampling_steps=sampling_steps,
-            eta=eta,
-            device=device,
             generator=generator,
+            **solver_kwargs,
         )
         return samples
 
     trial_results = _run_phase2_loop(
         sample_batch,
-        target_spec=target_spec,
-        reference_cdf_state=reference_cdf_state,
-        reference_mode=reference_mode,
+        runner=runner,
+        comparison_mode=comparison_mode,
+        comparison_state=comparison_state,
         n_runs=n_runs,
         n_parallel=n_parallel,
         seed=seed,
-        run_start_index=run_start_index,
-        device=device,
+        run_offset=run_offset,
     )
     result = {
         "mode": "solver_baseline",
@@ -135,31 +113,23 @@ def run_solver_baseline_sampling(
 
 
 def run_fixed_N_sampling(
-    model,
-    target_spec: Dict[str, Any],
-    data_mean: torch.Tensor,
-    data_std: torch.Tensor,
-    reference_cdf_state: Dict[str, Any] | None,
+    runner,
+    comparison_state: Any,
     *,
+    comparison_mode: str,
     B: int,
-    T: int,
-    sampling_steps: int,
-    eta: float,
     split_percentages: Sequence[float],
     N_i_list: Sequence[float],
     n_runs: int,
     seed: int | None,
-    device: str,
-    reference_mode: str = "ddpm_samples",
     debug: bool = False,
     n_parallel: int = 1,
-    run_start_index: int = 0,
+    run_offset: int = 0,
     return_trial_results: bool = False,
 ):
-    ddim = DDIM(T=T, device=device, eta=eta, sampling_steps=sampling_steps)
-    _, split_points = resolve_split_percentages(ddim, split_percentages)
+    _, split_points = runner.resolve_split_percentages(split_percentages)
     split_factors = [float(x) for x in N_i_list]
-    cost_per_root = expected_cost_per_root(ddim, split_points, split_factors)
+    cost_per_root = runner.expected_cost_per_root(split_points, split_factors)
     n0 = int(B // cost_per_root)
     if n0 < 1:
         raise ValueError(
@@ -167,28 +137,23 @@ def run_fixed_N_sampling(
         )
 
     def sample_batch(chunk_size, generator):
-        samples, _, _ = run_probabilistic_inference_batch(
-            model=model,
-            ddim=ddim,
+        samples, _, _ = runner.run_split_batch(
             n0_by_run=[n0] * chunk_size,
             split_points=split_points,
             split_factors_by_run=[split_factors] * chunk_size,
-            data_mean=data_mean,
-            data_std=data_std,
             generator=generator,
         )
         return samples
 
     trial_results = _run_phase2_loop(
         sample_batch,
-        target_spec=target_spec,
-        reference_cdf_state=reference_cdf_state,
-        reference_mode=reference_mode,
+        runner=runner,
+        comparison_mode=comparison_mode,
+        comparison_state=comparison_state,
         n_runs=n_runs,
         n_parallel=n_parallel,
         seed=seed,
-        run_start_index=run_start_index,
-        device=device,
+        run_offset=run_offset,
     )
     result = {
         "mode": "fixed_N",

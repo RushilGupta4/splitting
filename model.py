@@ -10,6 +10,8 @@ class SinusoidalTimeEmbedding(nn.Module):
 
     def __init__(self, dim):
         super().__init__()
+        if dim % 2 != 0:
+            raise ValueError("SinusoidalTimeEmbedding dim must be even")
         self.dim = dim
         half_dim = self.dim // 2
         frequency_exponents = math.log(10000) / (half_dim - 1)
@@ -19,6 +21,7 @@ class SinusoidalTimeEmbedding(nn.Module):
         self.register_buffer("frequencies", frequencies, persistent=False)
 
     def forward(self, t):
+        t = t.to(self.frequencies.dtype)
         embeddings = t[:, None] * self.frequencies[None, :]
         embeddings = torch.cat([torch.sin(embeddings), torch.cos(embeddings)], dim=-1)
         return embeddings
@@ -41,11 +44,17 @@ class ResNetBlock(nn.Module):
             nn.Linear(time_embed_dim, hidden_dim),
         )
         self.activation = nn.SiLU()
+        # nn.init.zeros_(self.net[3].weight)
+        # nn.init.zeros_(self.net[3].bias)
 
     def forward(self, x, t_emb):
-        h = self.net(x)
+        h = self.net[0](x)
+        h = self.net[1](h)
         h = h + self.time_mlp(t_emb)
-        return self.activation(x + h)
+        h = self.net[2](h)
+        h = self.net[3](h)
+        h = self.net[4](h)
+        return x + h
 
 
 class Denoiser(nn.Module):
@@ -72,10 +81,13 @@ class Denoiser(nn.Module):
         )
 
         self.output_proj = nn.Sequential(
-            nn.LayerNorm(hidden_dim),
             nn.SiLU(),
-            nn.Linear(hidden_dim, input_dim),
+            nn.Linear(hidden_dim, hidden_dim * 2),
+            nn.SiLU(),
+            nn.Linear(hidden_dim * 2, input_dim),
         )
+        # nn.init.zeros_(self.output_proj[-1].weight)
+        # nn.init.zeros_(self.output_proj[-1].bias)
 
     # @torch.compile()
     def forward(self, x, t):
