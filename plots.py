@@ -637,6 +637,15 @@ def _best_by_group(rows, *, key_fn, score_fn):
     return out
 
 
+def _best_solver_rows(rows):
+    selected = _best_by_group(
+        _solver_rows(rows),
+        key_fn=lambda r: (r["B"], r["method_label"]),
+        score_fn=lambda r: (r["mean_ks"], r["sampling_steps"], r["eta"]),
+    )
+    return sorted(selected.values(), key=lambda r: (r["method_label"], r["B"]))
+
+
 def _best_adaptive_improvement_points(rows):
     score = lambda r: (r["mean_ks"], r["method_label"])
     by_b = lambda r: r["B"]
@@ -668,7 +677,6 @@ def _best_config_series_key(row):
     if row["mode"] == "solver_baseline":
         return (
             "solver",
-            schedule,
             row["method_label"],
             row["solver"],
             row["solver_sampling_steps"],
@@ -679,20 +687,19 @@ def _best_config_series_key(row):
 
 def _format_best_config_label(series_key):
     kind = series_key[0]
-    schedule_label = _format_schedule(series_key[1])
     if kind == "fixed_N":
+        schedule_label = _format_schedule(series_key[1])
         return f"fixed N, {schedule_label}"
     if kind == "solver":
-        _, _, method_label, solver, sampling_steps, eta = series_key
-        return (
-            f"{_format_solver_label(method_label, solver, sampling_steps, eta)}, "
-            f"{schedule_label}"
-        )
+        _, method_label, solver, sampling_steps, eta = series_key
+        return _format_solver_label(method_label, solver, sampling_steps, eta)
+    schedule_label = _format_schedule(series_key[1])
     return f"best adaptive, {schedule_label}"
 
 
 def _plot_best_config(rows, output_path, show_std, ci_level, title=None):
-    selected_rows = [r for r in rows if r["mode"] in {"fixed_N", "solver_baseline"}]
+    selected_rows = _baseline_rows(rows)
+    selected_rows.extend(_best_solver_rows(rows))
     selected_rows.extend(_best_adaptive_rows(rows))
     if not selected_rows:
         return False
@@ -722,29 +729,30 @@ def _plot_best_config(rows, output_path, show_std, ci_level, title=None):
         )
 
         kind = series_key[0]
-        schedule = series_key[1]
-        color, schedule_marker = schedule_styles.get(schedule, ("#1f77b4", "o"))
         linestyle = "-"
-        marker = schedule_marker
+        marker = "o"
         linewidth = 2.0
         zorder = 3
         alpha = 0.95
 
         if kind == "solver":
-            method_label = series_key[2]
-            _, _, marker, _ = _solver_style(method_label, solver_styles)
-            linestyle = "--"
+            method_label = series_key[1]
+            color, linestyle, marker, _ = _solver_style(method_label, solver_styles)
             linewidth = 1.9
             zorder = 4
-        elif kind == "best_adaptive":
-            linestyle = ":"
-            marker = "*"
-            linewidth = 2.4
-            zorder = 5
-        elif kind == "fixed_N":
-            linestyle = "-"
-            linewidth = 2.2
-            zorder = 4
+        else:
+            schedule = series_key[1]
+            color, schedule_marker = schedule_styles.get(schedule, ("#1f77b4", "o"))
+            marker = schedule_marker
+            if kind == "best_adaptive":
+                linestyle = ":"
+                marker = "*"
+                linewidth = 2.4
+                zorder = 5
+            elif kind == "fixed_N":
+                linestyle = "-"
+                linewidth = 2.2
+                zorder = 4
 
         if show_std:
             _fill_interval(ax, x_values, y_values, std_values, color, zorder - 1)

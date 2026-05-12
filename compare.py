@@ -155,28 +155,38 @@ def _unique_step_eta_pairs(pairs):
 
 def _build_trial_specs(B_list, B1_list, step_eta_pairs, baselines, sigma_modes, reuse_flags):
     specs: List[Dict[str, Any]] = []
-    for B, (steps, eta) in itertools.product(B_list, step_eta_pairs):
-        for B1, sigma_mode, reuse in itertools.product(
-            B1_list, sigma_modes, reuse_flags
-        ):
-            if B1 >= B:
-                log.info("Skipping config with B1=%s >= B=%s", B1, B)
-                continue
-            specs.append({
-                "mode": "estimate_and_sample",
-                "B": B, "B1": B1,
-                "sampling_steps": steps, "eta": eta,
-                "sigma_estimation_mode": sigma_mode,
-                "reuse_phase1_samples": reuse,
-                "method_label": f"{sigma_mode}_{'reuse' if reuse else 'fresh'}",
-            })
-        for baseline_spec in baselines:
+    schedule_baselines = [b for b in baselines if b["mode"] != "solver_baseline"]
+    solver_baselines = [b for b in baselines if b["mode"] == "solver_baseline"]
+    first_steps, first_eta = step_eta_pairs[0]
+
+    for B in B_list:
+        for steps, eta in step_eta_pairs:
+            for B1, sigma_mode, reuse in itertools.product(
+                B1_list, sigma_modes, reuse_flags
+            ):
+                if B1 >= B:
+                    log.info("Skipping config with B1=%s >= B=%s", B1, B)
+                    continue
+                specs.append({
+                    "mode": "estimate_and_sample",
+                    "B": B, "B1": B1,
+                    "sampling_steps": steps, "eta": eta,
+                    "sigma_estimation_mode": sigma_mode,
+                    "reuse_phase1_samples": reuse,
+                    "method_label": f"{sigma_mode}_{'reuse' if reuse else 'fresh'}",
+                })
+            for baseline_spec in schedule_baselines:
+                spec = dict(baseline_spec)
+                spec["B"] = B
+                spec["sampling_steps"] = steps
+                spec["eta"] = eta
+                specs.append(spec)
+        for baseline_spec in solver_baselines:
             spec = dict(baseline_spec)
             spec["B"] = B
-            spec["sampling_steps"] = steps
-            spec["eta"] = eta
-            if spec["mode"] == "solver_baseline":
-                spec["solver_nfe"] = int(spec["solver_sampling_steps"])
+            spec["sampling_steps"] = first_steps
+            spec["eta"] = first_eta
+            spec["solver_nfe"] = int(spec["solver_sampling_steps"])
             specs.append(spec)
     return specs
 
@@ -225,10 +235,10 @@ def _runs_dir(output_dir):
     return os.path.join(output_dir, "runs")
 
 
-def _csv_path(output_dir, independent_n2, split_percentages):
+def _csv_path(output_dir, split_percentages):
     return os.path.join(
         output_dir,
-        f"compare_results_{independent_n2},_{split_percentages.replace(',', '_')}.csv",
+        f"compare_results_{split_percentages.replace(',', '_')}.csv",
     )
 
 
@@ -609,7 +619,7 @@ def main():
             record["error"] = f"Only {len(cached)}/{args.n_runs} runs completed"
         records.append(record)
 
-    csv_output = _csv_path(args.output_dir, args.independent_n2, args.split_percentages)
+    csv_output = _csv_path(args.output_dir, args.split_percentages)
     _write_summary_csv(csv_output, _build_summary_rows(records))
 
     print(f"Saved compact run cache to {runs_dir}")
