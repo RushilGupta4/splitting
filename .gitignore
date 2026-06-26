@@ -1,6 +1,4 @@
-*.sh
-
-outputs*
+output*
 checkpoints/
 
 # Byte-compiled / optimized / DLL files
