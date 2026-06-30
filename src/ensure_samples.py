@@ -1,15 +1,15 @@
 import argparse
-import json
 import logging
+import math
 
 import torch
+from tqdm import tqdm
 
 from reference_cache import (
     reference_is_sufficient,
     reference_samples_path_for_key,
     save_reference_samples_with_key,
 )
-from runners.base import iter_budget_resolved_sampling_configs
 from runners.registry import get_runner_class, names
 
 log = logging.getLogger("ensure_samples")
@@ -30,12 +30,21 @@ def parse_args():
     parser.add_argument(
         "--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu"
     )
+    parser.add_argument("--no_compile", action="store_true")
     parser.add_argument("--debug", action="store_true")
     return parser.parse_args()
 
 
-def _ensure_for_runner(runner, comparison_mode, num_base_samples, batch_size):
-    cache_key = runner.reference_cache_key(comparison_mode)
+def _ensure_for_runner(
+    runner,
+    comparison_mode,
+    reference_generation_config,
+    num_base_samples,
+    batch_size,
+):
+    if int(batch_size) < 1:
+        raise ValueError("batch_size must be at least 1")
+    cache_key = runner.reference_cache_key(comparison_mode, reference_generation_config)
     path = reference_samples_path_for_key(runner.checkpoint_path, cache_key)
     if reference_is_sufficient(path, num_base_samples):
         log.info("Using existing reference samples at %s", path)
@@ -46,11 +55,55 @@ def _ensure_for_runner(runner, comparison_mode, num_base_samples, batch_size):
         comparison_mode,
         path,
     )
-    samples = runner.generate_reference_samples(
-        comparison_mode=comparison_mode,
-        num_samples=num_base_samples,
-        batch_size=batch_size,
-    )
+    step_bar = None
+
+    def start_step_progress(total_steps):
+        nonlocal step_bar
+        if total_steps <= 0:
+            return
+        if step_bar is not None:
+            step_bar.close()
+        step_bar = tqdm(
+            total=total_steps,
+            desc="Diffusion steps",
+            unit="step",
+            leave=False,
+            position=1,
+        )
+
+    def update_step_progress(n=1):
+        if step_bar is not None:
+            step_bar.update(n)
+
+    def finish_step_progress():
+        nonlocal step_bar
+        if step_bar is not None:
+            step_bar.close()
+            step_bar = None
+
+    num_batches = math.ceil(int(num_base_samples) / int(batch_size))
+    with tqdm(
+        total=num_batches,
+        desc="Batches",
+        unit="batch",
+        position=0,
+    ) as batch_bar:
+        progress = {
+            "batch": batch_bar.update,
+            "start_steps": start_step_progress,
+            "step": update_step_progress,
+            "finish_steps": finish_step_progress,
+        }
+        try:
+            samples = runner.generate_reference_samples(
+                comparison_mode=comparison_mode,
+                reference_generation_config=reference_generation_config,
+                num_samples=num_base_samples,
+                batch_size=batch_size,
+                progress=progress,
+            )
+        finally:
+            finish_step_progress()
     save_reference_samples_with_key(path, samples, cache_key=cache_key)
     log.info("Saved %d reference samples to %s", samples.shape[0], path)
 
@@ -66,7 +119,11 @@ def main():
 
     runner_cls = get_runner_class(args.runner)
     cfg = runner_cls.get_config(args.config)
-    base_runner = runner_cls.load_from_checkpoint(device=args.device, no_compile=True)
+    base_runner = runner_cls.load_from_checkpoint(
+        device=args.device,
+        no_compile=args.no_compile,
+        **dict(cfg.get("runner_defaults") or {}),
+    )
     comparison_mode = cfg["comparison_mode"]
 
     mode_spec = next(
@@ -84,29 +141,22 @@ def main():
         )
         return
 
-    if mode_spec.reference_uses_sampling_config:
-        seen = set()
-        sampling_configs = list(iter_budget_resolved_sampling_configs(cfg))
-        if "solver_reference_sampling_config" in cfg:
-            sampling_configs.append(cfg["solver_reference_sampling_config"])
-        for sampling_config in sampling_configs:
-            key = json.dumps(sampling_config, sort_keys=True, separators=(",", ":"))
-            if key in seen:
-                continue
-            seen.add(key)
-            _ensure_for_runner(
-                base_runner.with_sampling_config(**sampling_config),
-                comparison_mode,
-                int(cfg["num_base_samples"]),
-                int(args.batch_size),
-            )
-    else:
-        _ensure_for_runner(
-            base_runner,
-            comparison_mode,
-            int(cfg["num_base_samples"]),
-            int(args.batch_size),
+    if "reference_generation_config" not in cfg:
+        raise ValueError(
+            "reference_generation_config is required when comparison_mode "
+            f"{comparison_mode!r} requires cached reference samples"
         )
+    reference_generation_config = base_runner.normalize_reference_generation_config(
+        comparison_mode,
+        cfg["reference_generation_config"],
+    )
+    _ensure_for_runner(
+        base_runner,
+        comparison_mode,
+        reference_generation_config,
+        int(cfg["num_base_samples"]),
+        int(args.batch_size),
+    )
 
 
 if __name__ == "__main__":

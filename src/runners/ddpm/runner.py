@@ -392,33 +392,79 @@ class DDPMRunner(BaseRunner):
         )
 
     # ------------------------------------------------------------------
-    # Observables
-    # ------------------------------------------------------------------
-
-    def observable_values(
-        self,
-        samples: torch.Tensor,
-        *,
-        comparison_mode: str,
-        x_grid: Any,
-    ) -> torch.Tensor:
-        raise NotImplementedError(
-            f"{type(self).__name__}.observable_values must be implemented"
-        )
-
-    # ------------------------------------------------------------------
     # Reference cache & comparison state
     # ------------------------------------------------------------------
 
-    def reference_cache_key(self, comparison_mode: str) -> Mapping[str, Any]:
+    def normalize_reference_generation_config(
+        self,
+        comparison_mode: str,
+        reference_generation_config: Mapping[str, Any] | None,
+    ) -> Mapping[str, Any]:
         self._validate_mode(comparison_mode)
         if comparison_mode == "true_dist":
-            return {
-                "runner": self.runner_name,
-                "comparison_mode": comparison_mode,
-                "target_spec": self._target_spec,
-            }
+            return {}
+        if reference_generation_config is None:
+            raise ValueError(
+                f"reference_generation_config is required for comparison_mode={comparison_mode!r}"
+            )
+        cfg = dict(reference_generation_config)
+        method = str(cfg.get("method", ""))
         if comparison_mode == "true_samples":
+            if method != "target_samples":
+                raise ValueError(
+                    "true_samples reference_generation_config must set method='target_samples'"
+                )
+            allowed = {"method"}
+            unknown = set(cfg) - allowed
+            if unknown:
+                raise ValueError(
+                    f"Unknown true_samples reference_generation_config keys: {sorted(unknown)}"
+                )
+            return {"method": "target_samples"}
+
+        if method != "ddpm_samples":
+            raise ValueError(
+                f"{comparison_mode} reference_generation_config must set method='ddpm_samples'"
+            )
+        required = {"method", "sampler", "T", "sampling_steps", "eta"}
+        missing = sorted(required - set(cfg))
+        if missing:
+            raise ValueError(
+                f"reference_generation_config missing required keys: {missing}"
+            )
+        unknown = set(cfg) - required
+        if unknown:
+            raise ValueError(
+                f"Unknown reference_generation_config keys: {sorted(unknown)}"
+            )
+        sampler = str(cfg["sampler"])
+        if sampler not in type(self).supported_samplers:
+            raise ValueError(
+                f"Unknown DDPM reference sampler {sampler!r}. "
+                f"Available: {tuple(type(self).supported_samplers)}"
+            )
+        T = int(cfg["T"])
+        sampling_steps = int(cfg["sampling_steps"])
+        if T < 1 or sampling_steps < 1:
+            raise ValueError("T and sampling_steps must be at least 1")
+        return {
+            "method": "ddpm_samples",
+            "sampler": sampler,
+            "T": T,
+            "sampling_steps": sampling_steps,
+            "eta": float(cfg["eta"]),
+        }
+
+    def reference_cache_key(
+        self,
+        comparison_mode: str,
+        reference_generation_config: Mapping[str, Any] | None = None,
+    ) -> Mapping[str, Any]:
+        self._validate_mode(comparison_mode)
+        ref_cfg = self.normalize_reference_generation_config(
+            comparison_mode, reference_generation_config
+        )
+        if comparison_mode == "true_dist":
             return {
                 "runner": self.runner_name,
                 "comparison_mode": comparison_mode,
@@ -428,20 +474,25 @@ class DDPMRunner(BaseRunner):
             "runner": self.runner_name,
             "comparison_mode": comparison_mode,
             "target_spec": self._target_spec,
-            "sampling_config": dict(self.sampling_config.values),
+            "reference_generation_config": dict(ref_cfg),
         }
 
     def generate_reference_samples(
         self,
         *,
         comparison_mode: str,
+        reference_generation_config: Mapping[str, Any],
         num_samples: int,
         batch_size: int,
         generator=None,
+        progress=None,
     ) -> torch.Tensor:
         self._validate_mode(comparison_mode)
         if comparison_mode == "true_dist":
             raise ValueError("true_dist comparison does not require reference samples")
+        ref_cfg = self.normalize_reference_generation_config(
+            comparison_mode, reference_generation_config
+        )
         if batch_size < 1:
             raise ValueError("batch_size must be at least 1")
 
@@ -458,19 +509,44 @@ class DDPMRunner(BaseRunner):
                         ).cpu()
                     )
                     remaining -= current
+                    if progress is not None:
+                        progress["batch"](1)
             return torch.cat(batches, dim=0)
 
         # ddpm_samples
+        ref_runner = self.with_sampling_config(
+            sampler=ref_cfg["sampler"],
+            T=ref_cfg["T"],
+            sampling_steps=ref_cfg["sampling_steps"],
+            eta=ref_cfg["eta"],
+        )
         with torch.inference_mode():
             while remaining > 0:
                 current = min(batch_size, remaining)
                 x_T = torch.randn(
-                    current, self.input_dim, device=self._device, generator=generator
+                    current, ref_runner.input_dim, device=self._device, generator=generator
                 )
-                generated = self._ddim.sample_loop(self._model, x_T, self._ddim.T, 0)
-                generated = self.postprocess_samples(generated)
+                if progress is not None:
+                    progress["start_steps"](
+                        len(ref_runner._ddim._segment_timesteps(ref_runner._ddim.T, 0))
+                    )
+                try:
+                    generated = ref_runner._ddim.sample_loop(
+                        ref_runner._model,
+                        x_T,
+                        ref_runner._ddim.T,
+                        0,
+                        generator=generator,
+                        progress_callback=None if progress is None else progress["step"],
+                    )
+                finally:
+                    if progress is not None:
+                        progress["finish_steps"]()
+                generated = ref_runner.postprocess_samples(generated)
                 batches.append(generated.cpu())
                 remaining -= current
+                if progress is not None:
+                    progress["batch"](1)
         return torch.cat(batches, dim=0)
 
     def prepare_comparison_state(

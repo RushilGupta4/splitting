@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import torch
 
-from runners.sde1d.spec import SDECase, normal_initial_spec
+from runners.sde.spec import (
+    SDECase,
+    diagonal_normal_initial_spec,
+    normal_initial_spec,
+)
 
 R_RATE = 0.1
 SIGMA = 0.2
@@ -31,12 +35,22 @@ def diffusion_derivative(t: float, x: torch.Tensor) -> torch.Tensor:
     return torch.where(positive, derivative, torch.zeros_like(x))
 
 
-def target_spec(terminal_time: float) -> dict:
+def target_spec(
+    terminal_time: float,
+    dimension: int,
+    coupling_strength: float,
+) -> dict:
     return {
         "name": "cev_security_price",
         "label": "Duffie-Glynn CEV security price",
-        "dimension": 1,
+        "dimension": int(dimension),
+        "coupling_strength": float(coupling_strength),
         "terminal_time": float(terminal_time),
+        "initial_distribution": diagonal_normal_initial_spec(
+            INITIAL_MEAN,
+            INITIAL_VARIANCE,
+            int(dimension),
+        ),
         "params": {
             "r": R_RATE,
             "sigma": SIGMA,

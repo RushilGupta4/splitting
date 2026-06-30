@@ -1,15 +1,15 @@
-from runners.sde1d.runner import (
+from runners.sde.runner import (
     CEVSecurityPriceRunner,
-    SDE1DRunner,
-    SDE1D_RUNNER_CLASSES,
+    SDERunner,
+    SDE_RUNNER_CLASSES,
     SimpleOURunner,
     SmoothThresholdAutoregressionRunner,
 )
 
 __all__ = [
     "CEVSecurityPriceRunner",
-    "SDE1DRunner",
-    "SDE1D_RUNNER_CLASSES",
+    "SDERunner",
+    "SDE_RUNNER_CLASSES",
     "SimpleOURunner",
     "SmoothThresholdAutoregressionRunner",
 ]

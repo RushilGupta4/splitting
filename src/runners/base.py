@@ -545,17 +545,19 @@ class BaseRunner(ABC):
         """Return (samples_by_run, sampling_time). Samples must be postprocessed."""
 
     @abstractmethod
-    def observable_values(
+    def normalize_reference_generation_config(
         self,
-        samples: torch.Tensor,
-        *,
         comparison_mode: str,
-        x_grid: Any,
-    ) -> torch.Tensor:
-        """Return [num_samples, num_observables] values for phase-1 variance estimation."""
+        reference_generation_config: Mapping[str, Any] | None,
+    ) -> Mapping[str, Any]:
+        """Validate and canonicalize config used to build cached references."""
 
     @abstractmethod
-    def reference_cache_key(self, comparison_mode: str) -> Mapping[str, Any]:
+    def reference_cache_key(
+        self,
+        comparison_mode: str,
+        reference_generation_config: Mapping[str, Any] | None = None,
+    ) -> Mapping[str, Any]:
         """Return JSON-safe identity for reference samples/state for this mode."""
 
     @abstractmethod
@@ -563,9 +565,11 @@ class BaseRunner(ABC):
         self,
         *,
         comparison_mode: str,
+        reference_generation_config: Mapping[str, Any],
         num_samples: int,
         batch_size: int,
         generator=None,
+        progress=None,
     ) -> torch.Tensor:
         """Generate or load raw reference samples for modes that need cached samples."""
 

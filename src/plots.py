@@ -5,7 +5,6 @@ import math
 import os
 from collections import defaultdict
 from dataclasses import dataclass
-from statistics import NormalDist
 from typing import Any
 
 import matplotlib
@@ -287,10 +286,12 @@ def _pretty_name(name: str) -> str:
 
 
 def _short_sigma_mode(name: str) -> str:
-    if name == "pilot_tree":
-        return "pilot"
+    if name == "joint":
+        return "joint"
     if name == "independent":
         return "ind"
+    if name == "crossfit_q":
+        return "cf-Q MLP"
     return str(name).replace("_", " ")
 
 
@@ -504,7 +505,7 @@ def _build_mode_style_map(rows):
     return {
         mode_key: (
             cmap(i % cmap.N),
-            "--" if mode_key[0] == "independent" else ":" if mode_key[0] == "pilot_tree" else "-",
+            "--" if mode_key[0] == "independent" else ":" if mode_key[0] == "joint" else "-",
             ADAPTIVE_MARKERS[i % len(ADAPTIVE_MARKERS)],
         )
         for i, mode_key in enumerate(mode_keys)
@@ -537,12 +538,9 @@ def _ci_multiplier(confidence_level: float, degrees_of_freedom: int):
     if not 0.0 < confidence_level < 1.0:
         raise ValueError("--ci must be between 0 and 1, e.g. 0.95")
     quantile = 0.5 + confidence_level / 2.0
-    try:
-        from scipy.stats import t
+    from scipy.stats import t
 
-        return float(t.ppf(quantile, degrees_of_freedom))
-    except ImportError:
-        return NormalDist().inv_cdf(quantile)
+    return float(t.ppf(quantile, degrees_of_freedom))
 
 
 def _ci_half_width(std_ks, n_valid_runs, ci_level):
@@ -673,7 +671,7 @@ def _plot_main_panel(ax, rows, facet_key, method_styles, b1_markers, show_std, c
         elif kind == "adaptive":
             b1 = series_key[2]
             marker = b1_markers.get(b1, "o")
-            linestyle = "--" if method_key[1] == "independent" else ":" if method_key[1] == "pilot_tree" else "-"
+            linestyle = "--" if method_key[1] == "independent" else ":" if method_key[1] == "joint" else "-"
             zorder = 2
         else:
             zorder = 4
@@ -721,7 +719,7 @@ def _make_main_legend(fig, rows, method_styles, b1_markers):
     adaptive_method_keys = sorted({_method_key(row) for row in _adaptive_rows(rows)}, key=str)
     for method_key in adaptive_method_keys:
         color = method_styles.get(method_key, "#1f77b4")
-        linestyle = "--" if method_key[1] == "independent" else ":" if method_key[1] == "pilot_tree" else "-"
+        linestyle = "--" if method_key[1] == "independent" else ":" if method_key[1] == "joint" else "-"
         handles.append(Line2D([0], [0], color=color, linestyle=linestyle, marker="o", linewidth=2.0))
         labels.append(_method_display_label(method_key))
 
@@ -995,6 +993,8 @@ def _plot_optimal_b1_panel(ax, selected_rows, mode_keys, mode_styles):
     if not plotted_any:
         ax.text(0.5, 0.5, "no data", ha="center", va="center", transform=ax.transAxes)
     ax.grid(alpha=0.25)
+    ax.set_xscale("log")
+    ax.set_yscale("log")
     _apply_scalar_formatters(ax, format_x=True, format_y=True)
 
 

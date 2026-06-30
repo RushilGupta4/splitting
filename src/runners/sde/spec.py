@@ -8,6 +8,7 @@ import torch
 
 
 TensorFn = Callable[[float, torch.Tensor], torch.Tensor]
+TargetSpecFactory = Callable[[float, int, float], dict[str, Any]]
 
 
 @dataclass(frozen=True)
@@ -20,7 +21,7 @@ class SDECase:
     drift: TensorFn
     diffusion: TensorFn
     diffusion_derivative: TensorFn
-    target_spec_factory: Callable[[float], dict[str, Any]]
+    target_spec_factory: TargetSpecFactory
 
 
 def normal_initial_spec(mean: float, variance: float) -> dict[str, Any]:
@@ -28,6 +29,20 @@ def normal_initial_spec(mean: float, variance: float) -> dict[str, Any]:
         "kind": "normal",
         "mean": float(mean),
         "variance": float(variance),
+    }
+
+
+def diagonal_normal_initial_spec(
+    mean: float,
+    variance: float,
+    dimension: int,
+) -> dict[str, Any]:
+    dimension = int(dimension)
+    return {
+        "kind": "diagonal_normal",
+        "dimension": dimension,
+        "mean": [float(mean)] * dimension,
+        "variance": [float(variance)] * dimension,
     }
 
 

@@ -1,6 +1,5 @@
 from runners.common_configs import crossfit_q_config
 
-
 _N40_SCALE = {
     25_000: 40,
     50_000: 50,
@@ -35,28 +34,29 @@ _SAMPLING_BASE = {
     "B_list": [
         25_000,
         50_000,
-        100_000,
-        250_000,
+        # 100_000,
+        # 250_000,
     ],
     "B1_list": [
         5_000,
         10_000,
         # 25_000,
     ],
-    "baselines": ["fixed_N", "dpmpp_2m"],
+    "baselines": [
+        "fixed_N",
+        # "dpmpp_2m",
+    ],
 }
 
 _METADATA_DEFAULTS = {
-    "comparison_mode": "ddpm_samples",
+    "comparison_mode": "true_samples",
     "reference_generation_config": {
-        "method": "ddpm_samples",
-        "sampler": "ddim",
+        "method": "hf_ddpm_scheduler",
         "T": 1000,
         "sampling_steps": 1000,
-        "eta": 1.0,
     },
     "split_percentages_list": _SPLITS,
-    "num_base_samples": 1_000_000,
+    "num_base_samples": 25_000,
     "n_runs": 200,
 }
 
@@ -65,6 +65,6 @@ CONFIGS = {
         **_SAMPLING_BASE,
         **_METADATA_DEFAULTS,
         **crossfit_q_config(),
-        "description": "All methods, explicit 1000-step DDPM reference",
+        "description": "All methods, true_samples reference",
     },
 }

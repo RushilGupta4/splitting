@@ -26,8 +26,4 @@ class EDMGMM2DRunner(EDMRunner):
     def model_input_dim(model) -> int:
         return spec.model_input_dim(model)
 
-    def observable_values(self, samples, *, comparison_mode: str, x_grid):
-        self._validate_mode(comparison_mode)
-        return spec.rectangle_indicator_grid(samples, comparison_mode, x_grid)
-
 __all__ = ["EDMGMM2DRunner"]

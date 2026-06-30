@@ -45,6 +45,7 @@ class DDIM:
         self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - self.alphas_cumprod)
 
         self._create_timestep_schedule()
+        self._segment_timestep_cache = {}
 
     def _create_timestep_schedule(self):
         if self.sampling_steps == self.T:
@@ -58,7 +59,15 @@ class DDIM:
                 self.timesteps[-1] = 0
 
     def segment_cost(self, start_t: int, end_t: int) -> int:
-        return sum(1 for t in self.timesteps if end_t <= t < start_t)
+        return len(self._segment_timesteps(start_t, end_t))
+
+    def _segment_timesteps(self, start_t: int, end_t: int):
+        key = (int(start_t), int(end_t))
+        cached = self._segment_timestep_cache.get(key)
+        if cached is None:
+            cached = [t for t in self.timesteps if key[1] <= t < key[0]]
+            self._segment_timestep_cache[key] = cached
+        return cached
 
     def p_sample(self, model, x_t, t, t_prev, generator: torch.Generator | None = None):
         batch_size = x_t.shape[0]
@@ -107,10 +116,16 @@ class DDIM:
         return x_prev
 
     def sample_loop(
-        self, model, x_T, start_t, end_t, generator: torch.Generator | None = None
+        self,
+        model,
+        x_T,
+        start_t,
+        end_t,
+        generator: torch.Generator | None = None,
+        progress_callback=None,
     ):
         x = x_T
-        relevant_timesteps = [t for t in self.timesteps if end_t <= t < start_t]
+        relevant_timesteps = self._segment_timesteps(start_t, end_t)
 
         with torch.inference_mode():
             for i, t in enumerate(relevant_timesteps):
@@ -119,6 +134,8 @@ class DDIM:
                 else:
                     t_prev = end_t - 1
                 x = self.p_sample(model, x, t, t_prev, generator=generator)
+                if progress_callback is not None:
+                    progress_callback(1)
 
         return x
 
@@ -130,10 +147,18 @@ def sample_segment(
     start_t: int,
     end_t: int,
     generator: torch.Generator | None = None,
+    progress_callback=None,
 ):
     if x.shape[0] == 0:
         return x
-    return ddim.sample_loop(model, x, start_t, end_t, generator=generator)
+    return ddim.sample_loop(
+        model,
+        x,
+        start_t,
+        end_t,
+        generator=generator,
+        progress_callback=progress_callback,
+    )
 
 
 def resolve_split_percentages(

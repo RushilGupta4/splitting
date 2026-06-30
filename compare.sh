@@ -7,24 +7,23 @@
 # cd $PBS_O_WORKDIR
 
 CONFIGS=(
-    # "outputs/ddpm_joint_only|ddpm_gmm2d|joint_only|cuda:0"
-    # "outputs/ddpm_independent_only|ddpm_gmm2d|independent_only|cuda:1"
-    # "outputs/edm_default|edm_gmm2d|default|cuda:0"
-    # "outputs/ddpm_default|ddpm_gmm2d|default|cuda:1"
-    "outputs2/simple_ou|simple_ou|default|cuda:0"
-    "outputs2/cev_security_price|cev_security_price|default|cuda:0"
-    "outputs2/smooth_threshold_autoregression|smooth_threshold_autoregression|default|cuda:0"
+    # "outputs/ddpm|ddpm_gmm2d|default|cuda:1|50000"
+    # "outputs/ddpm_mnist|ddpm_mnist|default|cuda:0|12500"
+    # "outputs/edm_default|edm_gmm2d|default|cuda:0|50000"
+    "outputs2/simple_ou|simple_ou|default|cuda:0|50000"
+    # "outputs/cev_security_price|cev_security_price|default|cuda:0|50000"
+    # "outputs/smooth_threshold_autoregression|smooth_threshold_autoregression|default|cuda:0|50000"
 )
 N_PARALLEL=50
 CI_LEVEL=0.5
-N_RUNS=100
+N_RUNS=50
 
 for config in "${CONFIGS[@]}"
 do
     (
-        IFS='|' read -r output_dir runner config_name device <<< "$config"
+        IFS='|' read -r output_dir runner config_name device reference_sample_batch_size <<< "$config"
         mkdir -p "$output_dir"
-        uv run python src/ensure_samples.py --runner "$runner" --config "$config_name" --device "$device" --debug || exit 1
+        uv run python src/ensure_samples.py --runner "$runner" --config "$config_name" --batch_size "$reference_sample_batch_size" --device "$device" --debug || exit 1
         uv run python src/compare.py --runner "$runner" --config "$config_name" --output_dir "$output_dir" --device "$device" --n_parallel $N_PARALLEL --n_runs $N_RUNS --debug || exit 1
         manifest="$output_dir/compare_outputs.json"
         while IFS= read -r csv; do

@@ -80,14 +80,14 @@ def plot_final_marginals(model, args, data_mean, data_std, output_path):
         span = max(high - low, 1e-6)
         low -= 0.1 * span
         high += 0.1 * span
-        x_grid = np.linspace(low, high, 800)
+        plot_points = np.linspace(low, high, 800)
         true_pdf = _mixture_marginal_pdf_1d(
-            x_grid,
+            plot_points,
             weights=weights,
             means=means[:, dim],
             stds=marginal_stds[:, dim],
         )
-        ax.plot(x_grid, true_pdf, color="black", linewidth=2.0, label="True marginal")
+        ax.plot(plot_points, true_pdf, color="black", linewidth=2.0, label="True marginal")
         ax.hist(
             generated_dim,
             bins=int(args.num_plot_bins),

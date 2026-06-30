@@ -326,7 +326,9 @@ class EDMRunner(BaseRunner):
             int(num_samples), self.input_dim, device=self._device, generator=generator
         ) * float(self._sigma_max)
 
-    def sample_segment(self, x, start_time, end_time, *, generator=None):
+    def sample_segment(
+        self, x, start_time, end_time, *, generator=None, progress_callback=None
+    ):
         if self._sampler == "edm_stochastic":
             params = self._sampler_params
             return edm_sample_segment(
@@ -340,6 +342,7 @@ class EDMRunner(BaseRunner):
                 S_max=params["S_max"],
                 S_noise=params["S_noise"],
                 generator=generator,
+                progress_callback=progress_callback,
             )
         if self._sampler == "dpmpp_2s":
             params = self._sampler_params
@@ -354,6 +357,7 @@ class EDMRunner(BaseRunner):
                 churn_max_noise_level=params["churn_max_noise_level"],
                 noise_level_inflation_factor=params["noise_level_inflation_factor"],
                 generator=generator,
+                progress_callback=progress_callback,
             )
         if self._sampler == "sde_euler_maruyama":
             return sde_euler_maruyama_sample_segment(
@@ -363,6 +367,7 @@ class EDMRunner(BaseRunner):
                 float(end_time),
                 self._schedule,
                 generator=generator,
+                progress_callback=progress_callback,
             )
         raise ValueError(f"Unknown EDM sampler {self._sampler!r}")
 
@@ -385,7 +390,7 @@ class EDMRunner(BaseRunner):
             )
         total = 0
         for idx in range(start_idx, end_idx):
-            sigma_next = float(self._schedule.sigmas[idx + 1].item())
+            sigma_next = self._schedule.sigmas_cpu[idx + 1]
             total += self._transition_cost(sigma_next)
         return float(total)
 
@@ -621,32 +626,126 @@ class EDMRunner(BaseRunner):
         x = x.to(dtype=torch.float32).reshape(int(chunk_size), int(n0), -1).contiguous()
         return [x[i] for i in range(int(chunk_size))], sampling_time
 
-    def observable_values(
-        self, samples, *, comparison_mode: str, x_grid: Any
-    ) -> torch.Tensor:
-        raise NotImplementedError(
-            f"{type(self).__name__}.observable_values must be implemented"
-        )
-
-    def reference_cache_key(self, comparison_mode: str) -> Mapping[str, Any]:
+    def normalize_reference_generation_config(
+        self,
+        comparison_mode: str,
+        reference_generation_config: Mapping[str, Any] | None,
+    ) -> Mapping[str, Any]:
         self._validate_mode(comparison_mode)
+        if comparison_mode == "true_dist":
+            return {}
+        if reference_generation_config is None:
+            raise ValueError(
+                f"reference_generation_config is required for comparison_mode={comparison_mode!r}"
+            )
+        cfg = dict(reference_generation_config)
+        method = str(cfg.get("method", ""))
+        if comparison_mode == "true_samples":
+            if method != "target_samples":
+                raise ValueError(
+                    "true_samples reference_generation_config must set method='target_samples'"
+                )
+            allowed = {"method"}
+            unknown = set(cfg) - allowed
+            if unknown:
+                raise ValueError(
+                    f"Unknown true_samples reference_generation_config keys: {sorted(unknown)}"
+                )
+            return {"method": "target_samples"}
+
+        if method != "edm_samples":
+            raise ValueError(
+                f"{comparison_mode} reference_generation_config must set method='edm_samples'"
+            )
+        required = {
+            "method",
+            "sampler",
+            "sampling_steps",
+            "sigma_min",
+            "sigma_max",
+            "rho",
+            "sampler_params",
+        }
+        missing = sorted(required - set(cfg))
+        if missing:
+            raise ValueError(
+                f"reference_generation_config missing required keys: {missing}"
+            )
+        unknown = set(cfg) - required
+        if unknown:
+            raise ValueError(
+                f"Unknown reference_generation_config keys: {sorted(unknown)}"
+            )
+        sampler = str(cfg["sampler"])
+        if sampler not in type(self).supported_samplers:
+            raise ValueError(
+                f"Unknown EDM reference sampler {sampler!r}. "
+                f"Available: {tuple(type(self).supported_samplers)}"
+            )
+        sampling_steps = int(cfg["sampling_steps"])
+        if sampling_steps < 1:
+            raise ValueError("sampling_steps must be at least 1")
+        sampler_params = self._normalize_sampler_params(
+            sampler,
+            sampler_params=dict(cfg["sampler_params"]),
+            flat_edm_params={key: None for key in FLAT_EDM_PARAM_KEYS},
+        )
+        return {
+            "method": "edm_samples",
+            "sampler": sampler,
+            "sampling_steps": sampling_steps,
+            "sigma_min": float(cfg["sigma_min"]),
+            "sigma_max": float(cfg["sigma_max"]),
+            "rho": float(cfg["rho"]),
+            "sampler_params": sampler_params,
+        }
+
+    def reference_cache_key(
+        self,
+        comparison_mode: str,
+        reference_generation_config: Mapping[str, Any] | None = None,
+    ) -> Mapping[str, Any]:
+        self._validate_mode(comparison_mode)
+        ref_cfg = self.normalize_reference_generation_config(
+            comparison_mode, reference_generation_config
+        )
         base = {
             "runner": self.runner_name,
             "comparison_mode": comparison_mode,
             "target_spec": self._target_spec,
         }
-        if comparison_mode == "edm_samples":
-            base["sampling_config"] = dict(self.sampling_config.values)
+        if comparison_mode != "true_dist":
+            base["reference_generation_config"] = dict(ref_cfg)
         return base
 
     def generate_reference_samples(
-        self, *, comparison_mode: str, num_samples: int, batch_size: int, generator=None
+        self,
+        *,
+        comparison_mode: str,
+        reference_generation_config: Mapping[str, Any],
+        num_samples: int,
+        batch_size: int,
+        generator=None,
+        progress=None,
     ):
         self._validate_mode(comparison_mode)
         if comparison_mode == "true_dist":
             raise ValueError("true_dist comparison does not require reference samples")
+        ref_cfg = self.normalize_reference_generation_config(
+            comparison_mode, reference_generation_config
+        )
         if batch_size < 1:
             raise ValueError("batch_size must be at least 1")
+        ref_runner = None
+        if comparison_mode == "edm_samples":
+            ref_runner = self.with_sampling_config(
+                sampler=ref_cfg["sampler"],
+                sampling_steps=ref_cfg["sampling_steps"],
+                sigma_min=ref_cfg["sigma_min"],
+                sigma_max=ref_cfg["sigma_max"],
+                rho=ref_cfg["rho"],
+                sampler_params=ref_cfg["sampler_params"],
+            )
         batches = []
         remaining = int(num_samples)
         with torch.inference_mode():
@@ -659,13 +758,27 @@ class EDMRunner(BaseRunner):
                         self._device,
                     )
                 else:
-                    x = self.sample_prior(current, generator=generator)
-                    generated = self.sample_segment(
-                        x, self.start_time, self.end_time, generator=generator
-                    )
-                    generated = self.postprocess_samples(generated)
+                    x = ref_runner.sample_prior(current, generator=generator)
+                    if progress is not None:
+                        start_idx = ref_runner._schedule.index_for_sigma(float(ref_runner.start_time))
+                        end_idx = ref_runner._schedule.index_for_sigma(float(ref_runner.end_time))
+                        progress["start_steps"](end_idx - start_idx)
+                    try:
+                        generated = ref_runner.sample_segment(
+                            x,
+                            ref_runner.start_time,
+                            ref_runner.end_time,
+                            generator=generator,
+                            progress_callback=None if progress is None else progress["step"],
+                        )
+                    finally:
+                        if progress is not None:
+                            progress["finish_steps"]()
+                    generated = ref_runner.postprocess_samples(generated)
                 batches.append(generated.cpu())
                 remaining -= current
+                if progress is not None:
+                    progress["batch"](1)
         return torch.cat(batches, dim=0)
 
     def prepare_comparison_state(self, *, comparison_mode: str, reference_samples=None):

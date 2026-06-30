@@ -14,16 +14,16 @@ from ks import (
     warm_reference_ks_kernel,
 )
 from runners.base import BaseRunner, ComparisonModeSpec, SamplingConfig
-from runners.sde1d.cases import SDE_CASES
-from runners.sde1d.sampling import SDE1D_SAMPLERS, sample_sde_segment
+from runners.sde.cases import SDE_CASES
+from runners.sde.sampling import SDE_SAMPLERS, sample_sde_segment
 from runners.splitting import balanced_split_with_run_ids
 from utils import validate_split_percentages
 
-SUPPORTED_SAMPLERS = SDE1D_SAMPLERS
+SUPPORTED_SAMPLERS = SDE_SAMPLERS
 
 
-class SDE1DRunner(BaseRunner):
-    runner_name = "sde_1d"
+class SDERunner(BaseRunner):
+    runner_name = "sde"
     case_name = ""
     DEFAULT_SAMPLER = "euler"
 
@@ -35,6 +35,8 @@ class SDE1DRunner(BaseRunner):
         terminal_time: float = 1.0,
         reference_sampler: str = "euler",
         reference_steps: int = 5000,
+        dimension: int = 1,
+        coupling_strength: float | None = None,
         device: str = "cpu",
         checkpoint_path: str | None = None,
     ):
@@ -56,6 +58,25 @@ class SDE1DRunner(BaseRunner):
             raise ValueError("terminal_time must be positive")
         if float(SDE_CASES[self.case_name].initial_variance) < 0.0:
             raise ValueError("initial_variance must be nonnegative")
+        dimension = int(dimension)
+        if dimension < 1:
+            raise ValueError("dimension must be at least 1")
+        if dimension > 1 and (sampler == "milstein" or reference_sampler == "milstein"):
+            raise ValueError("Milstein sampler is only supported for dimension=1 for now")
+        if coupling_strength is not None and not math.isfinite(
+            float(coupling_strength)
+        ):
+            raise ValueError("coupling_strength must be finite")
+        if dimension == 1:
+            effective_coupling = 0.0
+        else:
+            effective_coupling = (
+                0.25 if coupling_strength is None else float(coupling_strength)
+            )
+            if effective_coupling <= 0.0:
+                raise ValueError(
+                    "coupling_strength must be positive when dimension > 1"
+                )
 
         self._case = SDE_CASES[self.case_name]
         self._sampler = str(sampler)
@@ -63,10 +84,16 @@ class SDE1DRunner(BaseRunner):
         self._terminal_time = float(terminal_time)
         self._reference_sampler = str(reference_sampler)
         self._reference_steps = int(reference_steps)
+        self._dimension = int(dimension)
+        self._coupling_strength = float(effective_coupling)
         self._device = str(device)
         self._dtype = torch.float64
         self._checkpoint_path = checkpoint_path or self.default_checkpoint_path()
-        self._target_spec = self._case.target_spec_factory(self._terminal_time)
+        self._target_spec = self._case.target_spec_factory(
+            self._terminal_time,
+            self._dimension,
+            self._coupling_strength,
+        )
 
     @classmethod
     def add_train_args(cls, parser) -> None:
@@ -75,6 +102,8 @@ class SDE1DRunner(BaseRunner):
         parser.add_argument(
             "--sampler", choices=SUPPORTED_SAMPLERS, default=cls.DEFAULT_SAMPLER
         )
+        parser.add_argument("--dimension", type=int, default=1)
+        parser.add_argument("--coupling_strength", type=float, default=None)
         parser.add_argument("--device", type=str, default="cpu")
 
     @classmethod
@@ -92,11 +121,11 @@ class SDE1DRunner(BaseRunner):
         device: str,
         no_compile: bool = False,
         **kwargs,
-    ) -> "SDE1DRunner":
+    ) -> "SDERunner":
         del no_compile
         return cls(device=device, checkpoint_path=checkpoint_path, **kwargs)
 
-    def with_sampling_config(self, **kwargs) -> "SDE1DRunner":
+    def with_sampling_config(self, **kwargs) -> "SDERunner":
         allowed = {
             "sampler",
             "sampling_steps",
@@ -104,6 +133,12 @@ class SDE1DRunner(BaseRunner):
             "reference_sampler",
             "reference_steps",
         }
+        runner_defaults = {"dimension", "coupling_strength"} & set(kwargs)
+        if runner_defaults:
+            raise ValueError(
+                f"{type(self).__name__}.with_sampling_config cannot change runner "
+                f"defaults: {sorted(runner_defaults)}"
+            )
         unknown = set(kwargs) - allowed
         if unknown:
             raise ValueError(
@@ -117,6 +152,8 @@ class SDE1DRunner(BaseRunner):
                 kwargs.get("reference_sampler", self._reference_sampler)
             ),
             reference_steps=int(kwargs.get("reference_steps", self._reference_steps)),
+            dimension=self._dimension,
+            coupling_strength=self._coupling_strength,
             device=self._device,
             checkpoint_path=self._checkpoint_path,
         )
@@ -127,7 +164,11 @@ class SDE1DRunner(BaseRunner):
 
     @property
     def input_dim(self) -> int:
-        return 1
+        return int(self._dimension)
+
+    @property
+    def coupling_strength(self) -> float:
+        return float(self._coupling_strength)
 
     @property
     def target_spec(self) -> Mapping[str, Any]:
@@ -160,8 +201,8 @@ class SDE1DRunner(BaseRunner):
             ComparisonModeSpec(
                 name="true_samples",
                 requires_reference_cache=True,
-                reference_uses_sampling_config=True,
-                description="Two-sample 1D KS against fine-SDE terminal reference samples.",
+                reference_uses_sampling_config=False,
+                description="Two-sample KS against fine-SDE terminal reference samples.",
             ),
         )
 
@@ -174,7 +215,7 @@ class SDE1DRunner(BaseRunner):
 
     def sample_prior(self, num_samples: int, *, generator=None) -> torch.Tensor:
         noise = torch.randn(
-            (int(num_samples), 1),
+            (int(num_samples), self._dimension),
             device=self._device,
             dtype=self._dtype,
             generator=generator,
@@ -199,6 +240,7 @@ class SDE1DRunner(BaseRunner):
         end_time: Any,
         *,
         generator=None,
+        progress_callback=None,
     ) -> torch.Tensor:
         start_idx = self._coerce_index(start_time, name="start_time")
         end_idx = self._coerce_index(end_time, name="end_time")
@@ -214,13 +256,32 @@ class SDE1DRunner(BaseRunner):
             end_idx=end_idx,
             sampling_steps=self._sampling_steps,
             terminal_time=self._terminal_time,
+            dimension=self._dimension,
+            coupling_strength=self._coupling_strength,
             device=self._device,
             dtype=self._dtype,
             generator=generator,
+            progress_callback=progress_callback,
         )
 
+    def _coerce_sample_tensor(self, samples, *, name: str) -> torch.Tensor:
+        values = samples if isinstance(samples, torch.Tensor) else torch.as_tensor(samples)
+        if values.ndim == 1:
+            if self._dimension != 1:
+                raise ValueError(
+                    f"{name} must have shape [N, {self._dimension}], got {tuple(values.shape)}"
+                )
+            values = values.reshape(-1, 1)
+        elif values.ndim > 2:
+            values = values.reshape(-1, values.shape[-1])
+        if values.ndim != 2 or int(values.shape[1]) != self._dimension:
+            raise ValueError(
+                f"{name} must have shape [N, {self._dimension}], got {tuple(values.shape)}"
+            )
+        return values.to(device=self._device, dtype=self._dtype).contiguous()
+
     def postprocess_samples(self, native_samples: torch.Tensor) -> torch.Tensor:
-        return native_samples.reshape(-1, 1)
+        return self._coerce_sample_tensor(native_samples, name="native_samples")
 
     def resolve_split_percentages(self, split_percentages: Sequence[float]):
         validate_split_percentages(split_percentages)
@@ -391,38 +452,81 @@ class SDE1DRunner(BaseRunner):
         )
         x = runner.postprocess_samples(x)
         sampling_time = time.perf_counter() - sampling_start
-        x = x.to(dtype=torch.float32).reshape(int(chunk_size), int(n0), 1).contiguous()
+        x = (
+            x.to(dtype=torch.float32)
+            .reshape(int(chunk_size), int(n0), self._dimension)
+            .contiguous()
+        )
         return [x[idx] for idx in range(int(chunk_size))], sampling_time
 
-    def observable_values(
+    def normalize_reference_generation_config(
         self,
-        samples,
-        *,
         comparison_mode: str,
-        x_grid: Any,
-    ) -> torch.Tensor:
+        reference_generation_config: Mapping[str, Any] | None,
+    ) -> Mapping[str, Any]:
         self._validate_mode(comparison_mode)
-        values = (
-            samples if isinstance(samples, torch.Tensor) else torch.as_tensor(samples)
+        if reference_generation_config is None:
+            raise ValueError(
+                f"reference_generation_config is required for comparison_mode={comparison_mode!r}"
+            )
+        cfg = dict(reference_generation_config)
+        required = {"method", "sampler", "sampling_steps", "terminal_time"}
+        missing = sorted(required - set(cfg))
+        if missing:
+            raise ValueError(
+                f"reference_generation_config missing required keys: {missing}"
+            )
+        unknown = set(cfg) - required
+        if unknown:
+            raise ValueError(
+                f"Unknown reference_generation_config keys: {sorted(unknown)}"
+            )
+        if str(cfg["method"]) != "sde_terminal_samples":
+            raise ValueError(
+                "SDE reference_generation_config must set method='sde_terminal_samples'"
+            )
+        sampler = str(cfg["sampler"])
+        if sampler not in SUPPORTED_SAMPLERS:
+            raise ValueError(
+                f"Unknown SDE reference sampler {sampler!r}. Available: {SUPPORTED_SAMPLERS}"
+            )
+        sampling_steps = int(cfg["sampling_steps"])
+        if sampling_steps < 1:
+            raise ValueError("sampling_steps must be at least 1")
+        terminal_time = float(cfg["terminal_time"])
+        if terminal_time <= 0.0:
+            raise ValueError("terminal_time must be positive")
+        if terminal_time != float(self._terminal_time):
+            raise ValueError(
+                "reference_generation_config terminal_time must match runner terminal_time "
+                f"({self._terminal_time})"
+            )
+        self.with_sampling_config(
+            sampler=sampler,
+            sampling_steps=sampling_steps,
+            terminal_time=terminal_time,
         )
-        values = values.to(device=self._device, dtype=self._dtype).reshape(-1, 1)
-        thresholds = torch.as_tensor(
-            x_grid,
-            device=values.device,
-            dtype=values.dtype,
-        ).reshape(1, -1)
-        return (values[:, 0:1] <= thresholds).to(values.dtype)
+        return {
+            "method": "sde_terminal_samples",
+            "sampler": sampler,
+            "sampling_steps": sampling_steps,
+            "terminal_time": terminal_time,
+        }
 
-    def reference_cache_key(self, comparison_mode: str) -> Mapping[str, Any]:
+    def reference_cache_key(
+        self,
+        comparison_mode: str,
+        reference_generation_config: Mapping[str, Any] | None = None,
+    ) -> Mapping[str, Any]:
         self._validate_mode(comparison_mode)
+        ref_cfg = self.normalize_reference_generation_config(
+            comparison_mode, reference_generation_config
+        )
         key: dict[str, Any] = {
             "runner": self.runner_name,
             "comparison_mode": comparison_mode,
             "target_spec": self._target_spec,
-            "reference_sampler": self._reference_sampler,
-            "reference_steps": int(self._reference_steps),
-            "terminal_time": float(self._terminal_time),
-            "path_clipping": None,
+            "reference_generation_config": dict(ref_cfg),
         }
         return key
 
@@ -430,30 +534,51 @@ class SDE1DRunner(BaseRunner):
         self,
         *,
         comparison_mode: str,
+        reference_generation_config: Mapping[str, Any],
         num_samples: int,
         batch_size: int,
         generator=None,
+        progress=None,
     ) -> torch.Tensor:
         self._validate_mode(comparison_mode)
         if int(batch_size) < 1:
             raise ValueError("batch_size must be at least 1")
+        ref_cfg = self.normalize_reference_generation_config(
+            comparison_mode, reference_generation_config
+        )
 
         batches: list[torch.Tensor] = []
         remaining = int(num_samples)
         runner = self.with_sampling_config(
-            sampler=self._reference_sampler,
-            sampling_steps=self._reference_steps,
+            sampler=ref_cfg["sampler"],
+            sampling_steps=ref_cfg["sampling_steps"],
+            terminal_time=ref_cfg["terminal_time"],
         )
         with torch.inference_mode():
             while remaining > 0:
                 current = min(int(batch_size), remaining)
                 x = runner.sample_prior(current, generator=generator)
-                samples = runner.sample_segment(
-                    x, runner.start_time, runner.end_time, generator=generator
-                )
+                if progress is not None:
+                    progress["start_steps"](
+                        runner._coerce_index(runner.end_time, name="end_time")
+                        - runner._coerce_index(runner.start_time, name="start_time")
+                    )
+                try:
+                    samples = runner.sample_segment(
+                        x,
+                        runner.start_time,
+                        runner.end_time,
+                        generator=generator,
+                        progress_callback=None if progress is None else progress["step"],
+                    )
+                finally:
+                    if progress is not None:
+                        progress["finish_steps"]()
                 samples = runner.postprocess_samples(samples)
                 batches.append(samples.cpu().to(dtype=torch.float32))
                 remaining -= current
+                if progress is not None:
+                    progress["batch"](1)
         return torch.cat(batches, dim=0)
 
     def prepare_comparison_state(
@@ -495,31 +620,31 @@ class SDE1DRunner(BaseRunner):
         return float(value)
 
 
-class SimpleOURunner(SDE1DRunner):
-    """1D SDE runner for Simple OU."""
+class SimpleOURunner(SDERunner):
+    """SDE runner for Simple OU."""
 
     runner_name = "simple_ou"
     case_name = "simple_ou"
-    config_module = "runners.sde1d.simple_ou.configs"
+    config_module = "runners.sde.simple_ou.configs"
 
 
-class CEVSecurityPriceRunner(SDE1DRunner):
-    """1D SDE runner for the Duffie-Glynn CEV security-price model."""
+class CEVSecurityPriceRunner(SDERunner):
+    """SDE runner for the Duffie-Glynn CEV security-price model."""
 
     runner_name = "cev_security_price"
     case_name = "cev_security_price"
-    config_module = "runners.sde1d.cev_security_price.configs"
+    config_module = "runners.sde.cev_security_price.configs"
 
 
-class SmoothThresholdAutoregressionRunner(SDE1DRunner):
-    """1D SDE runner for a smooth threshold autoregression model."""
+class SmoothThresholdAutoregressionRunner(SDERunner):
+    """SDE runner for a smooth threshold autoregression model."""
 
     runner_name = "smooth_threshold_autoregression"
     case_name = "smooth_threshold_autoregression"
-    config_module = "runners.sde1d.smooth_threshold_autoregression.configs"
+    config_module = "runners.sde.smooth_threshold_autoregression.configs"
 
 
-SDE1D_RUNNER_CLASSES = {
+SDE_RUNNER_CLASSES = {
     SimpleOURunner.runner_name: SimpleOURunner,
     CEVSecurityPriceRunner.runner_name: CEVSecurityPriceRunner,
     SmoothThresholdAutoregressionRunner.runner_name: SmoothThresholdAutoregressionRunner,

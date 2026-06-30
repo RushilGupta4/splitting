@@ -11,8 +11,15 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from adaptive import run_estimate_and_sample
+from adaptive import (
+    CROSSFIT_Q_DEFAULT_FOLDS,
+    _crossfit_q_normalize_mlp_params,
+    _normalize_grid_free_params,
+    _normalize_phase1_query_params,
+    run_estimate_and_sample,
+)
 from baselines import run_fixed_N_sampling, run_solver_baseline_sampling
+from ks import reference_ks_metric_cache_key
 from reference_cache import (
     load_reference_samples_for_runner,
     reference_samples_path_for_key,
@@ -31,8 +38,12 @@ from utils import validate_split_percentages
 
 log = logging.getLogger("compare")
 
-SUPPORTED_SIGMA_ESTIMATION_MODES = {"pilot_tree", "independent"}
-SUPPORTED_OPTIMIZATION_MODES = {"monotone", "monotone_fw"}
+SUPPORTED_SIGMA_ESTIMATION_MODES = {
+    "joint",
+    "independent",
+    "crossfit_q",
+}
+SUPPORTED_OPTIMIZATION_MODES = {"monotone"}
 _FILE_IDENTITY_CACHE: Dict[str, Dict[str, Any]] = {}
 
 CSV_FIELDS = [
@@ -83,11 +94,8 @@ def _validate_config(cfg: dict, *, runner, config_name: str):
         "B_list",
         "B1_list",
         "sigma_modes",
-        "reuse_flags",
         "baselines",
         "split_percentages_list",
-        "x_grid",
-        "independent_n2",
         "num_base_samples",
         "n_runs",
     }
@@ -102,17 +110,40 @@ def _validate_config(cfg: dict, *, runner, config_name: str):
     mode_spec = next(
         s for s in runner.comparison_modes() if s.name == cfg["comparison_mode"]
     )
+    if mode_spec.requires_reference_cache:
+        if "reference_generation_config" not in cfg:
+            raise ValueError(
+                "reference_generation_config is required when comparison_mode "
+                f"{cfg['comparison_mode']!r} requires cached reference samples"
+            )
+        cfg["reference_generation_config"] = dict(
+            runner.normalize_reference_generation_config(
+                cfg["comparison_mode"], cfg["reference_generation_config"]
+            )
+        )
     sigma_modes = set(cfg["sigma_modes"])
     if not sigma_modes <= SUPPORTED_SIGMA_ESTIMATION_MODES:
         raise ValueError(
             f"Unknown sigma_modes: {sorted(sigma_modes - SUPPORTED_SIGMA_ESTIMATION_MODES)}"
         )
-    if "pilot_tree" in sigma_modes:
-        if "pilot_m" not in cfg:
-            raise ValueError("pilot_m is required when sigma_modes includes pilot_tree")
-        pilot_m = float(cfg["pilot_m"])
-        if not np.isfinite(pilot_m) or pilot_m <= 1.0:
-            raise ValueError("pilot_m must be finite and > 1")
+    if not sigma_modes:
+        raise ValueError("sigma_modes must be non-empty")
+    cfg["grid_free_params"] = _normalize_grid_free_params(cfg.get("grid_free_params"))
+    cfg["phase1_query_params"] = _normalize_phase1_query_params(
+        cfg.get("phase1_query_params")
+    )
+    if "joint" in sigma_modes:
+        if "joint_m" not in cfg:
+            raise ValueError("joint_m is required when sigma_modes includes joint")
+        joint_m = float(cfg["joint_m"])
+        if not np.isfinite(joint_m) or joint_m <= 1.0:
+            raise ValueError("joint_m must be finite and > 1")
+    if "crossfit_q" in sigma_modes:
+        if int(cfg.get("crossfit_q_folds", CROSSFIT_Q_DEFAULT_FOLDS)) < 1:
+            raise ValueError("crossfit_q_folds must be at least 1")
+        cfg["crossfit_q_mlp_params"] = _crossfit_q_normalize_mlp_params(
+            cfg.get("crossfit_q_mlp_params")
+        )
     optimization_modes = {
         str(mode) for mode in cfg.get("optimization_modes", ["monotone"])
     }
@@ -123,7 +154,7 @@ def _validate_config(cfg: dict, *, runner, config_name: str):
             "Unknown optimization_modes: "
             f"{sorted(optimization_modes - SUPPORTED_OPTIMIZATION_MODES)}"
         )
-    if int(cfg["independent_n2"]) < 2:
+    if "independent" in sigma_modes and int(cfg.get("independent_n2", 3)) < 2:
         raise ValueError("independent_n2 must be at least 2")
     if any(int(b1) <= 0 for b1 in cfg.get("free_B1_list", [])):
         raise ValueError("free_B1_list entries must be positive")
@@ -135,8 +166,6 @@ def _validate_config(cfg: dict, *, runner, config_name: str):
         raise ValueError("sampling_configs must be non-empty")
     for sampling_config in iter_budget_resolved_sampling_configs(cfg):
         runner.with_sampling_config(**dict(sampling_config))
-    if "solver_reference_sampling_config" in cfg:
-        runner.with_sampling_config(**dict(cfg["solver_reference_sampling_config"]))
     for split_percentages in cfg["split_percentages_list"]:
         validate_split_percentages([float(x) for x in split_percentages])
     parsed_baselines = [
@@ -153,16 +182,6 @@ def _validate_config(cfg: dict, *, runner, config_name: str):
                     int(B),
                     schedule_key=BASELINE_STEP_SCHEDULES,
                 )
-    if (
-        mode_spec.reference_uses_sampling_config
-        and any(b["mode"] == "solver_baseline" for b in parsed_baselines)
-        and "solver_reference_sampling_config" not in cfg
-    ):
-        raise ValueError(
-            "solver_reference_sampling_config is required when solver baselines are "
-            "used with a sampling-config-specific comparison mode"
-        )
-
 
 def _apply_overrides(cfg: dict, args):
     cfg = dict(cfg)
@@ -215,7 +234,7 @@ def _build_trial_specs(cfg, baselines):
     free_B1_list = cfg.get("free_B1_list", [])
     sigma_modes = cfg["sigma_modes"]
     optimization_modes = cfg.get("optimization_modes", ["monotone"])
-    reuse_flags = cfg["reuse_flags"]
+    reuse_flags = cfg.get("reuse_flags", [True])
     schedule_baselines = [b for b in baselines if b["mode"] != "solver_baseline"]
     solver_baselines = [b for b in baselines if b["mode"] == "solver_baseline"]
 
@@ -326,9 +345,14 @@ def _run_trial(
         **common,
         B1=int(spec["B1"]),
         split_percentages=split_percentages,
-        x_grid=cfg["x_grid"],
-        independent_n2=int(cfg["independent_n2"]),
-        pilot_m=float(cfg.get("pilot_m", 2.0)),
+        independent_n2=int(cfg.get("independent_n2", 3)),
+        joint_m=float(cfg.get("joint_m", 2.0)),
+        crossfit_q_folds=int(
+            cfg.get("crossfit_q_folds", CROSSFIT_Q_DEFAULT_FOLDS)
+        ),
+        crossfit_q_mlp_params=dict(cfg.get("crossfit_q_mlp_params") or {}),
+        grid_free_params=dict(cfg.get("grid_free_params") or {}),
+        phase1_query_params=dict(cfg.get("phase1_query_params") or {}),
         variance_estimation_mode=spec["sigma_estimation_mode"],
         optimization_mode=spec.get("optimization_mode", "monotone"),
         reuse_phase1_samples=bool(spec["reuse_phase1_samples"]),
@@ -389,12 +413,6 @@ def _json_safe(value):
     if isinstance(value, np.bool_):
         return bool(value)
     return value
-
-
-def _sampling_config_key(sampling_config: Mapping[str, Any]):
-    return json.dumps(
-        _json_safe(dict(sampling_config)), sort_keys=True, separators=(",", ":")
-    )
 
 
 def _compact_json(value: Mapping[str, Any]) -> str:
@@ -486,6 +504,7 @@ def _canonical_spec_for_cache(spec: Mapping[str, Any], *, runner, split_percenta
         )
         optimization_mode = str(spec.get("optimization_mode", "monotone"))
         key["optimization_mode"] = optimization_mode
+        key["optimization_impl"] = "frank_wolfe_monotone_v1"
         # Only set when true so existing non-free cache hashes stay valid.
         if spec.get("free_B1"):
             key["free_B1"] = True
@@ -494,7 +513,16 @@ def _canonical_spec_for_cache(spec: Mapping[str, Any], *, runner, split_percenta
     raise ValueError(f"Unknown trial mode {mode!r}")
 
 
-def _config_cache_key(args, cfg, spec, *, runner, reference_runner, split_percentages):
+def _config_cache_key(
+    args,
+    cfg,
+    spec,
+    *,
+    runner,
+    reference_runner,
+    reference_generation_config,
+    split_percentages,
+):
     mode_spec = next(
         (s for s in runner.comparison_modes() if s.name == cfg["comparison_mode"]),
         None,
@@ -505,19 +533,42 @@ def _config_cache_key(args, cfg, spec, *, runner, reference_runner, split_percen
         "comparison_mode": cfg["comparison_mode"],
         "runner_target": _json_safe(runner.target_spec),
         "reference_cache_key": _json_safe(
-            dict(reference_runner.reference_cache_key(cfg["comparison_mode"]))
+            dict(
+                reference_runner.reference_cache_key(
+                    cfg["comparison_mode"], reference_generation_config
+                )
+            )
         ),
         "num_base_samples": int(cfg["num_base_samples"]),
         "spec": _canonical_spec_for_cache(
             spec, runner=runner, split_percentages=split_percentages
         ),
     }
+    metric_key = reference_ks_metric_cache_key(int(runner.input_dim))
+    if metric_key is not None:
+        key["reference_ks_metric"] = _json_safe(metric_key)
     if spec["mode"] == "estimate_and_sample":
-        key["x_grid"] = _json_safe(cfg["x_grid"])
+        sigma_mode = str(spec.get("sigma_estimation_mode"))
+        key["grid_free_params"] = _json_safe(
+            _normalize_grid_free_params(cfg.get("grid_free_params"))
+        )
+        key["phase1_query_params"] = _json_safe(
+            _normalize_phase1_query_params(cfg.get("phase1_query_params"))
+        )
         if spec.get("sigma_estimation_mode") == "independent":
-            key["independent_n2"] = int(cfg["independent_n2"])
-        if spec.get("sigma_estimation_mode") == "pilot_tree":
-            key["pilot_m"] = float(cfg["pilot_m"])
+            key["independent_n2"] = int(cfg.get("independent_n2", 3))
+        if spec.get("sigma_estimation_mode") == "joint":
+            key["joint_m"] = float(cfg["joint_m"])
+        if sigma_mode == "crossfit_q":
+            mlp_params = _crossfit_q_normalize_mlp_params(
+                cfg.get("crossfit_q_mlp_params")
+            )
+            key["crossfit_q_folds"] = int(
+                cfg.get("crossfit_q_folds", CROSSFIT_Q_DEFAULT_FOLDS)
+            )
+            key["crossfit_q_mlp_params"] = _json_safe(
+                mlp_params
+            )
 
     if mode_spec is None:
         raise ValueError(
@@ -526,7 +577,9 @@ def _config_cache_key(args, cfg, spec, *, runner, reference_runner, split_percen
     if mode_spec.requires_reference_cache:
         cache_path = reference_samples_path_for_key(
             reference_runner.checkpoint_path,
-            reference_runner.reference_cache_key(cfg["comparison_mode"]),
+            reference_runner.reference_cache_key(
+                cfg["comparison_mode"], reference_generation_config
+            ),
         )
         key["reference_samples_path"] = _file_identity(cache_path)
     return key
@@ -610,44 +663,25 @@ def _build_comparison_states(base_runner, cfg):
             None: base_runner.prepare_comparison_state(comparison_mode=mode)
         }
 
-    states: Dict[Any, Any] = {}
-    if mode_spec.reference_uses_sampling_config:
-        seen = set()
-        sampling_configs = list(iter_budget_resolved_sampling_configs(cfg))
-        if "solver_reference_sampling_config" in cfg:
-            sampling_configs.append(cfg["solver_reference_sampling_config"])
-        for sampling_config in sampling_configs:
-            key = _sampling_config_key(sampling_config)
-            if key in seen:
-                continue
-            seen.add(key)
-            runner = base_runner.with_sampling_config(**sampling_config)
-            samples = load_reference_samples_for_runner(
-                runner, mode, int(cfg["num_base_samples"])
-            )
-            states[key] = runner.prepare_comparison_state(
-                comparison_mode=mode, reference_samples=samples
-            )
-    else:
-        samples = load_reference_samples_for_runner(
-            base_runner, mode, int(cfg["num_base_samples"])
-        )
-        states[None] = base_runner.prepare_comparison_state(
+    reference_generation_config = base_runner.normalize_reference_generation_config(
+        mode, cfg["reference_generation_config"]
+    )
+    samples = load_reference_samples_for_runner(
+        base_runner,
+        mode,
+        reference_generation_config,
+        int(cfg["num_base_samples"]),
+    )
+    states: Dict[Any, Any] = {
+        None: base_runner.prepare_comparison_state(
             comparison_mode=mode, reference_samples=samples
         )
+    }
     return mode_spec, states
 
 
 def _state_for_spec(states, mode_spec, spec, cfg):
-    if not mode_spec.requires_reference_cache:
-        return states[None]
-    if mode_spec.reference_uses_sampling_config:
-        sampling_config = (
-            cfg["solver_reference_sampling_config"]
-            if spec["mode"] == "solver_baseline"
-            else spec["sampling_config"]
-        )
-        return states[_sampling_config_key(sampling_config)]
+    del mode_spec, spec, cfg
     return states[None]
 
 
@@ -655,17 +689,6 @@ def _runner_for_spec(base_runner, spec):
     if spec["mode"] == "solver_baseline":
         return base_runner
     return base_runner.with_sampling_config(**spec["sampling_config"])
-
-
-def _reference_runner_for_spec(base_runner, cfg, mode_spec, spec):
-    if not mode_spec.reference_uses_sampling_config:
-        return base_runner
-    sampling_config = (
-        cfg["solver_reference_sampling_config"]
-        if spec["mode"] == "solver_baseline"
-        else spec["sampling_config"]
-    )
-    return base_runner.with_sampling_config(**sampling_config)
 
 
 def _aggregate_cached_runs(spec, trials, *, base_runner, split_percentages):
@@ -787,17 +810,20 @@ def _run_split(args, cfg, base_runner, baselines, split_percentages):
         raise ValueError(
             f"Runner {base_runner.runner_name!r} does not support comparison_mode {cfg['comparison_mode']!r}"
         )
+    reference_generation_config = None
+    if mode_spec.requires_reference_cache:
+        reference_generation_config = base_runner.normalize_reference_generation_config(
+            cfg["comparison_mode"], cfg["reference_generation_config"]
+        )
     for spec in specs:
         runner_for_key = _runner_for_spec(base_runner, spec)
-        reference_runner_for_key = _reference_runner_for_spec(
-            base_runner, cfg, mode_spec, spec
-        )
         cache_key = _config_cache_key(
             args,
             cfg,
             spec,
             runner=runner_for_key,
-            reference_runner=reference_runner_for_key,
+            reference_runner=base_runner,
+            reference_generation_config=reference_generation_config,
             split_percentages=split_percentages,
         )
         digest = _config_hash(cache_key)
@@ -931,11 +957,12 @@ def main():
     )
 
     runner_cls = get_runner_class(args.runner)
+    cfg = _apply_overrides(runner_cls.get_config(args.config), args)
     base_runner = runner_cls.load_from_checkpoint(
         device=args.device,
         no_compile=args.no_compile,
+        **dict(cfg.get("runner_defaults") or {}),
     )
-    cfg = _apply_overrides(runner_cls.get_config(args.config), args)
     cfg["debug"] = bool(args.debug)
     _validate_config(cfg, runner=base_runner, config_name=args.config)
     baselines = [

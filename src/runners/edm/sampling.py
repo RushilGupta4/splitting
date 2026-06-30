@@ -43,15 +43,16 @@ class EDMSchedule:
         ) ** float(self.rho)
         sigmas = torch.cat([sigmas, torch.zeros(1, device=self.device, dtype=self.dtype)])
         object.__setattr__(self, "sigmas", sigmas)
+        object.__setattr__(self, "sigmas_cpu", tuple(float(v) for v in sigmas.detach().cpu().tolist()))
 
     @property
     def num_steps(self) -> int:
         return int(self.sampling_steps)
 
     def index_for_sigma(self, sigma: float) -> int:
-        target = torch.as_tensor(float(sigma), device=self.sigmas.device, dtype=self.sigmas.dtype)
-        idx = int(torch.argmin(torch.abs(self.sigmas - target)).item())
-        if abs(float(self.sigmas[idx].item()) - float(sigma)) > max(EPS, 1e-6 * max(1.0, abs(float(sigma)))):
+        sigma = float(sigma)
+        idx = min(range(len(self.sigmas_cpu)), key=lambda i: abs(self.sigmas_cpu[i] - sigma))
+        if abs(self.sigmas_cpu[idx] - sigma) > max(EPS, 1e-6 * max(1.0, abs(sigma))):
             raise ValueError(f"sigma {sigma} is not on the EDM schedule")
         return idx
 
@@ -134,6 +135,7 @@ def edm_sample_segment(
     S_max: float,
     S_noise: float,
     generator=None,
+    progress_callback=None,
 ):
     S_churn, S_min, S_max, S_noise = _validate_churn_args(
         S_churn,
@@ -148,8 +150,8 @@ def edm_sample_segment(
         return x
     with torch.inference_mode():
         for idx in range(start_idx, end_idx):
-            sigma_curr = float(schedule.sigmas[idx].item())
-            sigma_next = float(schedule.sigmas[idx + 1].item())
+            sigma_curr = schedule.sigmas_cpu[idx]
+            sigma_next = schedule.sigmas_cpu[idx + 1]
             x_hat, sigma_hat = _apply_stochastic_churn(
                 x,
                 sigma_curr,
@@ -170,6 +172,8 @@ def edm_sample_segment(
                 denoised_next = _denoise(model, x_euler, sigma_next)
                 d_next = (x_euler - denoised_next) / sigma_next
                 x = x_hat + 0.5 * (sigma_next - sigma_hat) * (d_curr + d_next)
+            if progress_callback is not None:
+                progress_callback(1)
     return x
 
 
@@ -185,6 +189,7 @@ def dpmpp_2s_sample_segment(
     churn_max_noise_level: float,
     noise_level_inflation_factor: float,
     generator=None,
+    progress_callback=None,
 ):
     (
         stochastic_churn_rate,
@@ -204,8 +209,8 @@ def dpmpp_2s_sample_segment(
         return x
     with torch.inference_mode():
         for idx in range(start_idx, end_idx):
-            sigma_curr = float(schedule.sigmas[idx].item())
-            sigma_next = float(schedule.sigmas[idx + 1].item())
+            sigma_curr = schedule.sigmas_cpu[idx]
+            sigma_next = schedule.sigmas_cpu[idx + 1]
             x_hat, sigma_hat = _apply_stochastic_churn(
                 x,
                 sigma_curr,
@@ -220,6 +225,8 @@ def dpmpp_2s_sample_segment(
             denoised = _denoise(model, x_hat, sigma_hat)
             if sigma_next <= 0.0:
                 x = denoised
+                if progress_callback is not None:
+                    progress_callback(1)
                 continue
 
             sigma_mid = (sigma_hat * sigma_next) ** 0.5
@@ -228,6 +235,8 @@ def dpmpp_2s_sample_segment(
             denoised_mid = _denoise(model, x_mid, sigma_mid)
             next_over_current = sigma_next / sigma_hat
             x = next_over_current * x_hat + (1.0 - next_over_current) * denoised_mid
+            if progress_callback is not None:
+                progress_callback(1)
     return x
 
 
@@ -239,6 +248,7 @@ def sde_euler_maruyama_sample_segment(
     schedule: EDMSchedule,
     *,
     generator=None,
+    progress_callback=None,
 ):
     if x.shape[0] == 0:
         return x
@@ -247,8 +257,8 @@ def sde_euler_maruyama_sample_segment(
         return x
     with torch.inference_mode():
         for idx in range(start_idx, end_idx):
-            sigma_curr = float(schedule.sigmas[idx].item())
-            sigma_next = float(schedule.sigmas[idx + 1].item())
+            sigma_curr = schedule.sigmas_cpu[idx]
+            sigma_next = schedule.sigmas_cpu[idx + 1]
             delta_var = sigma_curr ** 2 - sigma_next ** 2
             delta_var_tensor = torch.as_tensor(
                 max(delta_var, 0.0), device=x.device, dtype=x.dtype
@@ -257,6 +267,8 @@ def sde_euler_maruyama_sample_segment(
             score = (denoised - x) / (sigma_curr ** 2)
             noise = torch.randn(x.shape, device=x.device, dtype=x.dtype, generator=generator)
             x = x + delta_var * score + torch.sqrt(delta_var_tensor) * noise
+            if progress_callback is not None:
+                progress_callback(1)
     return x
 
 
@@ -272,6 +284,6 @@ def resolve_split_percentages(schedule: EDMSchedule, percentages: Sequence[float
     for i in range(len(indices) - 1):
         if indices[i] >= indices[i + 1]:
             raise ValueError("split indices must be strictly increasing along sigma trajectory")
-    split_sigmas = [float(schedule.sigmas[j].item()) for j in indices]
+    split_sigmas = [schedule.sigmas_cpu[j] for j in indices]
     remaining_steps = [N - j for j in indices]
     return remaining_steps, split_sigmas

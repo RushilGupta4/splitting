@@ -16,10 +16,3 @@ def validate_split_percentages(split_percentages):
                 f"got split_percentages[{i}]={split_percentages[i]} <= "
                 f"split_percentages[{i + 1}]={split_percentages[i + 1]}"
             )
-
-
-def parse_x_grid(x_grid_str: str):
-    x_grid = [float(x.strip()) for x in x_grid_str.split(",") if x.strip()]
-    if not x_grid:
-        raise ValueError("x_grid must have at least one threshold")
-    return x_grid

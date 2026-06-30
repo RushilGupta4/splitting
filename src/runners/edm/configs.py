@@ -12,5 +12,4 @@ _DPMPP_2S_PARAMS = {
     "noise_level_inflation_factor": 1.0,
 }
 
-
 __all__ = ["_DPMPP_2S_PARAMS", "_EDM_PARAMS"]

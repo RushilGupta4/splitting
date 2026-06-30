@@ -12,6 +12,17 @@ KS_QUAD_NODES, KS_QUAD_WEIGHTS = np.polynomial.legendre.leggauss(
 KS_QUAD_NODES = np.ascontiguousarray(KS_QUAD_NODES, dtype=np.float64)
 KS_QUAD_WEIGHTS = np.ascontiguousarray(KS_QUAD_WEIGHTS, dtype=np.float64)
 
+APPROX_LOWER_ORTHANT_KS_VERSION = 1
+APPROX_LOWER_ORTHANT_KS_DEFAULTS: Dict[str, Any] = {
+    "num_queries": 512,
+    "tail_eps": 1e-3,
+    "paired_fraction": 0.25,
+    "reference_eval_samples": 50_000,
+    "generated_eval_samples": 50_000,
+    "query_chunk_size": 32,
+    "dedup_decimals": 12,
+}
+
 
 def coerce_samples_np(samples, expected_dim: int | None = None) -> np.ndarray:
     samples_np = (
@@ -64,6 +75,63 @@ def _require_sample_dim(samples_np: np.ndarray, dim: int) -> np.ndarray:
     return samples_np
 
 
+def _normalize_approx_lower_orthant_ks_params(
+    params: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    merged = dict(APPROX_LOWER_ORTHANT_KS_DEFAULTS)
+    if params:
+        merged.update(dict(params))
+
+    for key in (
+        "num_queries",
+        "reference_eval_samples",
+        "generated_eval_samples",
+        "query_chunk_size",
+    ):
+        merged[key] = int(merged[key])
+        if merged[key] < 1:
+            raise ValueError(f"approximate KS parameter {key} must be >= 1")
+
+    merged["tail_eps"] = float(merged["tail_eps"])
+    if not math.isfinite(merged["tail_eps"]) or not (
+        0.0 <= merged["tail_eps"] < 0.5
+    ):
+        raise ValueError("approximate KS parameter tail_eps must be in [0, 0.5)")
+
+    merged["paired_fraction"] = float(merged["paired_fraction"])
+    if not math.isfinite(merged["paired_fraction"]):
+        raise ValueError("approximate KS parameter paired_fraction must be finite")
+    merged["paired_fraction"] = min(max(merged["paired_fraction"], 0.0), 1.0)
+
+    merged["dedup_decimals"] = int(merged.get("dedup_decimals", 12))
+    if merged["dedup_decimals"] < 0:
+        raise ValueError("approximate KS parameter dedup_decimals must be >= 0")
+    return merged
+
+
+def reference_ks_metric_cache_key(dimension: int) -> Dict[str, Any] | None:
+    if int(dimension) <= 2:
+        return None
+    return {
+        "metric": "approx_lower_orthant_two_sample_ks",
+        "version": int(APPROX_LOWER_ORTHANT_KS_VERSION),
+        "parameters": _normalize_approx_lower_orthant_ks_params(),
+    }
+
+
+def _deterministic_sample_subset(samples_np: np.ndarray, max_count: int) -> np.ndarray:
+    samples_np = np.asarray(samples_np, dtype=np.float64)
+    count = int(samples_np.shape[0])
+    if count == 0:
+        raise ValueError("Cannot build an evaluation subset from zero samples")
+    limit = min(int(max_count), count)
+    if limit == count:
+        return np.ascontiguousarray(samples_np, dtype=np.float64)
+    indices = np.floor((np.arange(limit, dtype=np.float64) + 0.5) * count / limit)
+    indices = np.clip(indices.astype(np.int64), 0, count - 1)
+    return np.ascontiguousarray(samples_np[indices], dtype=np.float64)
+
+
 def prepare_reference_cdf_state(samples) -> Dict[str, Any]:
     samples_np = coerce_samples_np(samples)
     if samples_np.shape[0] == 0:
@@ -78,7 +146,18 @@ def prepare_reference_cdf_state(samples) -> Dict[str, Any]:
             ),
         }
     if samples_np.shape[1] != 2:
-        raise ValueError(f"Expected 1D or 2D samples, got {samples_np.shape}")
+        params = _normalize_approx_lower_orthant_ks_params()
+        reference_eval = _deterministic_sample_subset(
+            samples_np, int(params["reference_eval_samples"])
+        )
+        return {
+            "dimension": int(samples_np.shape[1]),
+            "count": int(samples_np.shape[0]),
+            "metric": "approx_lower_orthant_two_sample_ks",
+            "metric_version": int(APPROX_LOWER_ORTHANT_KS_VERSION),
+            "metric_params": params,
+            "reference_eval_samples": reference_eval,
+        }
 
     y_values, y_ranks = np.unique(samples_np[:, 1], return_inverse=True)
     x_order = np.argsort(samples_np[:, 0], kind="mergesort")
@@ -293,6 +372,191 @@ def _exact_two_sample_lower_orthant_ks_from_state(
             x_a, y_rank_a, x_b, y_rank_b, int(union_y.shape[0])
         )
     )
+
+
+def _is_prime(value: int) -> bool:
+    if value < 2:
+        return False
+    if value == 2:
+        return True
+    if value % 2 == 0:
+        return False
+    limit = int(math.sqrt(value)) + 1
+    for factor in range(3, limit, 2):
+        if value % factor == 0:
+            return False
+    return True
+
+
+def _first_primes(count: int) -> list[int]:
+    primes: list[int] = []
+    candidate = 2
+    while len(primes) < int(count):
+        if _is_prime(candidate):
+            primes.append(candidate)
+        candidate += 1
+    return primes
+
+
+def _van_der_corput(count: int, base: int) -> np.ndarray:
+    values = np.empty(int(count), dtype=np.float64)
+    for idx in range(int(count)):
+        n = idx + 1
+        denom = 1.0
+        value = 0.0
+        while n > 0:
+            n, remainder = divmod(n, int(base))
+            denom *= float(base)
+            value += float(remainder) / denom
+        values[idx] = value
+    return values
+
+
+def _deduplicate_query_points(query_points: np.ndarray, decimals: int) -> np.ndarray:
+    query_points = np.asarray(query_points, dtype=np.float64)
+    if query_points.ndim == 1:
+        query_points = query_points.reshape(-1, 1)
+    finite = np.isfinite(query_points).all(axis=1)
+    query_points = query_points[finite]
+    if query_points.size == 0:
+        return np.empty((0, query_points.shape[1]), dtype=np.float64)
+    rounded = np.round(query_points, int(decimals))
+    _, keep = np.unique(rounded, axis=0, return_index=True)
+    return np.ascontiguousarray(query_points[np.sort(keep)], dtype=np.float64)
+
+
+def _deterministic_paired_indices(count: int, paired_count: int) -> np.ndarray:
+    if int(paired_count) <= 0:
+        return np.empty(0, dtype=np.int64)
+    if int(paired_count) == 1:
+        return np.asarray([int(count) // 2], dtype=np.int64)
+    positions = np.floor(
+        (np.arange(int(paired_count), dtype=np.float64) + 0.5)
+        * int(count)
+        / int(paired_count)
+    )
+    return np.clip(positions.astype(np.int64), 0, int(count) - 1)
+
+
+def _approx_lower_orthant_query_points(
+    generated_eval: np.ndarray,
+    reference_eval: np.ndarray,
+    params: Dict[str, Any],
+) -> np.ndarray:
+    generated_eval = np.asarray(generated_eval, dtype=np.float64)
+    reference_eval = np.asarray(reference_eval, dtype=np.float64)
+    dim = int(reference_eval.shape[1])
+    if generated_eval.ndim != 2 or int(generated_eval.shape[1]) != dim:
+        raise ValueError(
+            f"Expected generated samples of shape [N, {dim}], got {generated_eval.shape}"
+        )
+
+    pooled = np.concatenate([reference_eval, generated_eval], axis=0)
+    pooled = pooled[np.isfinite(pooled).all(axis=1)]
+    if pooled.shape[0] == 0:
+        raise ValueError("Cannot generate approximate KS queries from non-finite samples")
+
+    total = int(params["num_queries"])
+    paired_target = int(round(total * float(params["paired_fraction"])))
+    paired_count = min(paired_target, max(total - 1, 0), int(pooled.shape[0]))
+    core_count = max(total - paired_count, 1)
+
+    ranks = np.empty((core_count, dim), dtype=np.float64)
+    bases = _first_primes(dim)
+    for col in range(dim):
+        ranks[:, col] = _van_der_corput(core_count, bases[col])
+    eps = float(params["tail_eps"])
+    ranks = eps + ranks * max(1.0 - 2.0 * eps, 1e-12)
+
+    core = np.empty((core_count, dim), dtype=np.float64)
+    for col in range(dim):
+        core[:, col] = np.quantile(pooled[:, col], ranks[:, col])
+
+    pieces = [core]
+    if paired_count > 0:
+        order = np.lexsort(tuple(pooled[:, col] for col in range(dim - 1, -1, -1)))
+        paired_positions = _deterministic_paired_indices(len(order), paired_count)
+        pieces.append(pooled[order[paired_positions]])
+
+    queries = _deduplicate_query_points(
+        np.concatenate(pieces, axis=0), int(params["dedup_decimals"])
+    )
+    if queries.shape[0] == 0:
+        queries = np.mean(pooled, axis=0, keepdims=True)
+    return np.ascontiguousarray(queries, dtype=np.float64)
+
+
+def _lower_orthant_cdf_at_queries(
+    samples_np: np.ndarray,
+    queries: np.ndarray,
+    *,
+    query_chunk_size: int,
+) -> np.ndarray:
+    samples_np = np.asarray(samples_np, dtype=np.float64)
+    queries = np.asarray(queries, dtype=np.float64)
+    if samples_np.shape[0] == 0:
+        raise ValueError("Cannot compute empirical CDF from zero samples")
+    if queries.ndim == 1:
+        queries = queries.reshape(-1, 1)
+    if samples_np.ndim != 2 or queries.ndim != 2:
+        raise ValueError("samples and queries must both be 2D")
+    if samples_np.shape[1] != queries.shape[1]:
+        raise ValueError(
+            f"Sample dimension {samples_np.shape[1]} does not match query "
+            f"dimension {queries.shape[1]}"
+        )
+
+    cdf = np.empty(int(queries.shape[0]), dtype=np.float64)
+    chunk_size = max(int(query_chunk_size), 1)
+    for start in range(0, int(queries.shape[0]), chunk_size):
+        end = min(start + chunk_size, int(queries.shape[0]))
+        chunk = queries[start:end]
+        below = samples_np[:, None, :] <= chunk[None, :, :]
+        cdf[start:end] = np.count_nonzero(np.all(below, axis=2), axis=0) / float(
+            samples_np.shape[0]
+        )
+    return cdf
+
+
+def _approx_two_sample_lower_orthant_ks_from_state(
+    samples,
+    reference_cdf_state: Dict[str, Any],
+) -> float:
+    dim = int(reference_cdf_state["dimension"])
+    samples_np = _require_sample_dim(coerce_samples_np(samples), dim)
+    if samples_np.shape[0] == 0:
+        raise ValueError("Cannot compute KS distance from zero samples")
+
+    reference_eval = _require_sample_dim(
+        np.asarray(reference_cdf_state["reference_eval_samples"], dtype=np.float64),
+        dim,
+    )
+    if reference_eval.shape[0] == 0:
+        raise ValueError("Cannot compute KS distance against zero reference samples")
+
+    params = _normalize_approx_lower_orthant_ks_params(
+        reference_cdf_state.get("metric_params")
+    )
+    generated_eval = _deterministic_sample_subset(
+        samples_np, int(params["generated_eval_samples"])
+    )
+    queries = _approx_lower_orthant_query_points(
+        generated_eval, reference_eval, params
+    )
+    reference_cdf = _lower_orthant_cdf_at_queries(
+        reference_eval,
+        queries,
+        query_chunk_size=int(params["query_chunk_size"]),
+    )
+    generated_cdf = _lower_orthant_cdf_at_queries(
+        generated_eval,
+        queries,
+        query_chunk_size=int(params["query_chunk_size"]),
+    )
+    if queries.shape[0] == 0:
+        return 0.0
+    distance = float(np.max(np.abs(generated_cdf - reference_cdf)))
+    return float(min(max(distance, 0.0), 1.0))
 
 
 def _normal_cdf_np(values: np.ndarray, *, mean: float, std: float) -> np.ndarray:
@@ -598,7 +862,8 @@ def warm_ks_kernel_for_mode(reference_mode: str, target_spec: Dict[str, Any]):
 
 
 def warm_reference_ks_kernel(reference_cdf_state: Dict[str, Any]):
-    if int(reference_cdf_state.get("dimension", 2)) == 1:
+    dimension = int(reference_cdf_state.get("dimension", 2))
+    if dimension == 1 or dimension > 2:
         return
     sample_x = reference_cdf_state["x_sorted"][0]
     sample_y = reference_cdf_state["y_values"][0]
@@ -620,11 +885,16 @@ def warm_reference_ks_kernel(reference_cdf_state: Dict[str, Any]):
 
 
 def compute_reference_ks_distance(samples, reference_cdf_state: Dict[str, Any]):
-    """Compute exact KS distance against empirical reference samples."""
-    if int(reference_cdf_state.get("dimension", 2)) == 1:
+    """Compute KS distance against empirical reference samples."""
+    dimension = int(reference_cdf_state.get("dimension", 2))
+    if dimension == 1:
         ks_distance = _exact_two_sample_ks_1d_from_state(samples, reference_cdf_state)
-    else:
+    elif dimension == 2:
         ks_distance = _exact_two_sample_lower_orthant_ks_from_state(
+            samples, reference_cdf_state
+        )
+    else:
+        ks_distance = _approx_two_sample_lower_orthant_ks_from_state(
             samples, reference_cdf_state
         )
     empty = torch.empty(0)

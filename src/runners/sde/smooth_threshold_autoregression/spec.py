@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import torch
 
-from runners.sde1d.spec import SDECase, normal_initial_spec
+from runners.sde.spec import (
+    SDECase,
+    diagonal_normal_initial_spec,
+    normal_initial_spec,
+)
 
 CENTER = 0.0
 WIDTH = 0.35
@@ -39,12 +43,22 @@ def diffusion_derivative(t: float, x: torch.Tensor) -> torch.Tensor:
     return SIGMA0 * RHO * switch * (1.0 - switch) / WIDTH
 
 
-def target_spec(terminal_time: float) -> dict:
+def target_spec(
+    terminal_time: float,
+    dimension: int,
+    coupling_strength: float,
+) -> dict:
     return {
         "name": "smooth_threshold_autoregression",
         "label": "Smooth threshold autoregression",
-        "dimension": 1,
+        "dimension": int(dimension),
+        "coupling_strength": float(coupling_strength),
         "terminal_time": float(terminal_time),
+        "initial_distribution": diagonal_normal_initial_spec(
+            INITIAL_MEAN,
+            INITIAL_VARIANCE,
+            int(dimension),
+        ),
         "params": {
             "center": CENTER,
             "width": WIDTH,

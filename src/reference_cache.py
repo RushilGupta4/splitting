@@ -121,12 +121,13 @@ def save_reference_samples_with_key(
 def load_reference_samples_for_runner(
     runner,
     comparison_mode: str,
+    reference_generation_config: Mapping[str, object],
     required_count: int,
 ) -> torch.Tensor:
     """Load reference samples by the runner's cache key."""
     if runner.checkpoint_path is None:
         raise ValueError("runner must have a checkpoint_path to load reference samples")
-    cache_key = runner.reference_cache_key(comparison_mode)
+    cache_key = runner.reference_cache_key(comparison_mode, reference_generation_config)
     primary = reference_samples_path_for_key(runner.checkpoint_path, cache_key)
     samples = _try_load(primary, required_count)
     if samples is not None:

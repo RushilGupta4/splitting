@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from typing import Sequence
-
 import torch
 
 from runners.base import ComparisonModeSpec
@@ -27,7 +25,7 @@ COMPARISON_MODES = (
     ComparisonModeSpec(
         name="ddpm_samples",
         requires_reference_cache=True,
-        reference_uses_sampling_config=True,
+        reference_uses_sampling_config=False,
         description="Two-sample lower-orthant KS against generated DDPM/DDIM samples.",
     ),
 )
@@ -55,19 +53,3 @@ def train_from_args(args) -> None:
     from runners.ddpm.gmm2d.train import train
 
     train(args)
-
-
-def rectangle_indicator_grid(
-    values: torch.Tensor,
-    comparison_mode: str,
-    x_grid: Sequence[float],
-) -> torch.Tensor:
-    del comparison_mode
-    thresholds = torch.as_tensor(x_grid, device=values.device, dtype=values.dtype)
-    x1_below = values[:, 0:1] <= thresholds.unsqueeze(0)
-    x2_below = values[:, 1:2] <= thresholds.unsqueeze(0)
-    return (
-        (x1_below.unsqueeze(2) & x2_below.unsqueeze(1))
-        .to(values.dtype)
-        .reshape(values.shape[0], -1)
-    )
