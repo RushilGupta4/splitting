@@ -1,3 +1,4 @@
+import math
 import time
 from typing import List, Sequence, Tuple
 
@@ -26,16 +27,43 @@ class DDIM:
         T=1000,
         beta_start=1e-4,
         beta_end=0.02,
+        beta_schedule="linear",
+        trained_betas=None,
         device="cpu",
         eta=1.0,
         sampling_steps=None,
+        prediction_type="epsilon",
+        thresholding=False,
+        clip_sample=True,
+        clip_sample_range=1.0,
+        timestep_spacing="leading",
+        steps_offset=0,
+        rescale_betas_zero_snr=False,
     ):
         self.T = T
         self.device = device
         self.eta = eta
         self.sampling_steps = sampling_steps if sampling_steps is not None else T
+        self.prediction_type = str(prediction_type)
+        self.thresholding = bool(thresholding)
+        self.clip_sample = bool(clip_sample)
+        self.clip_sample_range = float(clip_sample_range)
+        self.timestep_spacing = str(timestep_spacing)
+        self.steps_offset = int(steps_offset)
 
-        self.betas = torch.linspace(beta_start, beta_end, T, device=device)
+        if self.thresholding:
+            raise NotImplementedError("DDIM dynamic thresholding is not implemented")
+        if self.prediction_type not in {"epsilon", "sample", "v_prediction"}:
+            raise ValueError(f"Unsupported DDIM prediction_type={self.prediction_type!r}")
+        if rescale_betas_zero_snr:
+            raise NotImplementedError("rescale_betas_zero_snr is not implemented")
+
+        self.betas = self._make_betas(
+            trained_betas=trained_betas,
+            beta_start=beta_start,
+            beta_end=beta_end,
+            beta_schedule=beta_schedule,
+        )
         self.alphas = 1.0 - self.betas
         self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
         self.alphas_cumprod_prev = torch.cat(
@@ -47,16 +75,36 @@ class DDIM:
         self._create_timestep_schedule()
         self._segment_timestep_cache = {}
 
+    def _make_betas(self, *, trained_betas, beta_start, beta_end, beta_schedule):
+        if trained_betas is not None:
+            return torch.as_tensor(trained_betas, dtype=torch.float32, device=self.device)
+        if beta_schedule == "linear":
+            return torch.linspace(beta_start, beta_end, self.T, device=self.device)
+        if beta_schedule == "scaled_linear":
+            return torch.linspace(
+                math.sqrt(beta_start), math.sqrt(beta_end), self.T, device=self.device
+            ) ** 2
+        raise ValueError(f"Unsupported DDIM beta_schedule={beta_schedule!r}")
+
     def _create_timestep_schedule(self):
-        if self.sampling_steps == self.T:
-            self.timesteps = list(range(self.T - 1, -1, -1))
+        if self.sampling_steps < 1:
+            raise ValueError("sampling_steps must be at least 1")
+        if self.sampling_steps > self.T:
+            raise ValueError("sampling_steps cannot exceed T")
+
+        if self.timestep_spacing == "linspace":
+            timesteps = np.linspace(0, self.T - 1, self.sampling_steps).round()[::-1]
+        elif self.timestep_spacing == "leading":
+            step_ratio = self.T // self.sampling_steps
+            timesteps = (np.arange(0, self.sampling_steps) * step_ratio).round()[::-1]
+            timesteps += self.steps_offset
+        elif self.timestep_spacing == "trailing":
+            step_ratio = self.T / self.sampling_steps
+            timesteps = np.round(np.arange(self.T, 0, -step_ratio)) - 1
         else:
-            step_size = max(1, self.T // self.sampling_steps)
-            self.timesteps = list(range(self.T - 1, -1, -step_size))[
-                : self.sampling_steps
-            ]
-            if self.timesteps[-1] != 0:
-                self.timesteps[-1] = 0
+            raise ValueError(f"Unsupported timestep_spacing={self.timestep_spacing!r}")
+        timesteps = np.clip(timesteps.astype(np.int64), 0, self.T - 1)
+        self.timesteps = timesteps.tolist()
 
     def segment_cost(self, start_t: int, end_t: int) -> int:
         return len(self._segment_timesteps(start_t, end_t))
@@ -72,7 +120,7 @@ class DDIM:
     def p_sample(self, model, x_t, t, t_prev, generator: torch.Generator | None = None):
         batch_size = x_t.shape[0]
         t_tensor = torch.full((batch_size,), t, device=self.device, dtype=torch.long)
-        eps_pred = model(x_t, t_tensor)
+        model_output = model(x_t, t_tensor)
 
         alpha_bar_t = self.alphas_cumprod[t]
         alpha_bar_t_prev = (
@@ -83,7 +131,21 @@ class DDIM:
 
         sqrt_alpha_bar_t = torch.sqrt(alpha_bar_t)
         sqrt_one_minus_alpha_bar_t = torch.sqrt(1.0 - alpha_bar_t)
-        x0_pred = (x_t - sqrt_one_minus_alpha_bar_t * eps_pred) / sqrt_alpha_bar_t
+        if self.prediction_type == "epsilon":
+            eps_pred = model_output
+            x0_pred = (x_t - sqrt_one_minus_alpha_bar_t * eps_pred) / sqrt_alpha_bar_t
+        elif self.prediction_type == "sample":
+            x0_pred = model_output
+            eps_pred = (x_t - sqrt_alpha_bar_t * x0_pred) / sqrt_one_minus_alpha_bar_t
+        else:
+            x0_pred = sqrt_alpha_bar_t * x_t - sqrt_one_minus_alpha_bar_t * model_output
+            eps_pred = sqrt_alpha_bar_t * model_output + sqrt_one_minus_alpha_bar_t * x_t
+
+        if self.clip_sample:
+            x0_pred = x0_pred.clamp(
+                -self.clip_sample_range,
+                self.clip_sample_range,
+            )
 
         if t_prev >= 0 and self.eta > 0:
             sigma = self.eta * torch.sqrt(

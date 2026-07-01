@@ -14,6 +14,8 @@ IMAGE_SHAPE = (1, 28, 28)
 INPUT_DIM = 1 * 28 * 28
 REFERENCE_T = 1000
 REFERENCE_SAMPLING_STEPS = 1000
+MNIST_DATASET_REFERENCE_MODE = "mnist_dataset_samples"
+MNIST_DATASET_TRANSFORM = "to_tensor_flat_0_1_v1"
 
 
 def _json_safe(value):
@@ -47,7 +49,9 @@ def _stable_scheduler_config(config):
         "rescale_betas_zero_snr",
     }
     raw = dict(config)
-    return _json_safe({key: raw.get(key) for key in sorted(behavior_keys) if key in raw})
+    return _json_safe(
+        {key: raw.get(key) for key in sorted(behavior_keys) if key in raw}
+    )
 
 
 class _FlatMNISTUNet(torch.nn.Module):
@@ -76,13 +80,22 @@ class DDPMMNISTRunner(DDPMRunner):
     runner_name = "ddpm_mnist"
     config_module = "runners.ddpm.mnist.configs"
     supported_samplers = ("ddim",)
-    supported_solvers = ("dpmpp_2m",)
+    supported_solvers = (
+        "ddim",
+        "dpmpp_2m",
+    )
     comparison_mode_specs = (
         ComparisonModeSpec(
             name="true_samples",
             requires_reference_cache=True,
             reference_uses_sampling_config=False,
             description="Two-sample KS against 1000-step 1aurent/ddpm-mnist samples.",
+        ),
+        ComparisonModeSpec(
+            name=MNIST_DATASET_REFERENCE_MODE,
+            requires_reference_cache=True,
+            reference_uses_sampling_config=False,
+            description="Two-sample KS against true torchvision MNIST samples.",
         ),
     )
 
@@ -140,7 +153,10 @@ class DDPMMNISTRunner(DDPMRunner):
         if input_dim is not None:
             return int(input_dim)
         orig_model = getattr(model, "_orig_mod", None)
-        if orig_model is not None and getattr(orig_model, "input_dim", None) is not None:
+        if (
+            orig_model is not None
+            and getattr(orig_model, "input_dim", None) is not None
+        ):
             return int(orig_model.input_dim)
         return int(INPUT_DIM)
 
@@ -170,6 +186,53 @@ class DDPMMNISTRunner(DDPMRunner):
                 f"reference_generation_config is required for comparison_mode={comparison_mode!r}"
             )
         cfg = dict(reference_generation_config)
+        if comparison_mode == MNIST_DATASET_REFERENCE_MODE:
+            required = {"method", "split"}
+            missing = sorted(required - set(cfg))
+            if missing:
+                raise ValueError(
+                    f"reference_generation_config missing required keys: {missing}"
+                )
+            allowed = {
+                "method",
+                "split",
+                "data_root",
+                "download",
+                "seed",
+                "selection",
+                "transform",
+            }
+            unknown = set(cfg) - allowed
+            if unknown:
+                raise ValueError(
+                    f"Unknown reference_generation_config keys: {sorted(unknown)}"
+                )
+            if str(cfg["method"]) != "torchvision_mnist":
+                raise ValueError(
+                    "MNIST dataset reference_generation_config must set "
+                    "method='torchvision_mnist'"
+                )
+            split = str(cfg["split"])
+            if split not in {"train", "test"}:
+                raise ValueError("MNIST dataset split must be 'train' or 'test'")
+            selection = str(cfg.get("selection", "seeded_without_replacement"))
+            if selection != "seeded_without_replacement":
+                raise ValueError(
+                    "MNIST dataset selection must be 'seeded_without_replacement'"
+                )
+            transform = str(cfg.get("transform", MNIST_DATASET_TRANSFORM))
+            if transform != MNIST_DATASET_TRANSFORM:
+                raise ValueError(f"Unknown MNIST dataset transform {transform!r}")
+            return {
+                "method": "torchvision_mnist",
+                "split": split,
+                "data_root": str(cfg.get("data_root", "data")),
+                "download": bool(cfg.get("download", True)),
+                "seed": int(cfg.get("seed", 0)),
+                "selection": selection,
+                "transform": transform,
+            }
+
         required = {"method", "T", "sampling_steps"}
         missing = sorted(required - set(cfg))
         if missing:
@@ -214,6 +277,29 @@ class DDPMMNISTRunner(DDPMRunner):
         )
         if batch_size < 1:
             raise ValueError("batch_size must be at least 1")
+        if comparison_mode == MNIST_DATASET_REFERENCE_MODE:
+            from torchvision.datasets import MNIST
+
+            dataset = MNIST(
+                root=str(ref_cfg["data_root"]),
+                train=str(ref_cfg["split"]) == "train",
+                download=bool(ref_cfg["download"]),
+            )
+            if int(num_samples) > len(dataset):
+                raise ValueError(
+                    f"Requested {num_samples} MNIST reference samples from "
+                    f"split={ref_cfg['split']!r}, but only {len(dataset)} are available"
+                )
+            generator_cpu = torch.Generator(device="cpu")
+            generator_cpu.manual_seed(int(ref_cfg["seed"]))
+            indices = torch.randperm(len(dataset), generator=generator_cpu)[: int(num_samples)]
+            data = dataset.data[indices].to(dtype=torch.float32).div(255.0)
+            data = data.reshape(int(num_samples), INPUT_DIM).contiguous()
+            if progress is not None:
+                for _ in range(0, int(num_samples), int(batch_size)):
+                    progress["batch"](1)
+            return data
+
         from diffusers import DDPMScheduler
 
         scheduler = DDPMScheduler.from_config(self._target_spec["scheduler_config"])

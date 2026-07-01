@@ -78,6 +78,8 @@ CONFIGS = {
         "split_percentages_list": [
             [0.8, 0.6, 0.4, 0.2],
         ],
+        "optimization_modes": ["monotone", "monotone_cvar95"],
+        "crossfit_q_mlp_losses": ["bce", "mse"],
         "num_base_samples": 5_000_000,
         "n_runs": 50,
     },

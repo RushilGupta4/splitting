@@ -1,6 +1,7 @@
 import logging
 import math
 from concurrent.futures import ThreadPoolExecutor
+from threading import Lock
 from typing import Any, Dict, List, Mapping, Sequence, Tuple
 
 import numpy as np
@@ -25,23 +26,24 @@ from trials import (
 log = logging.getLogger(__name__)
 
 CROSSFIT_Q_DEFAULT_FOLDS = 1
-CROSSFIT_Q_DEFAULT_MLP_HIDDEN_DIMS = [64, 64]
+CROSSFIT_Q_DEFAULT_MLP_HIDDEN_DIMS = [128, 64]
 CROSSFIT_Q_DEFAULT_MLP_ACTIVATION = "silu"
 CROSSFIT_Q_DEFAULT_MLP_EPOCHS = 10
-CROSSFIT_Q_DEFAULT_MLP_BATCH_SIZE = 8196
+CROSSFIT_Q_DEFAULT_MLP_BATCH_SIZE = 16392
 CROSSFIT_Q_DEFAULT_MLP_LR = 1e-3
 CROSSFIT_Q_DEFAULT_MLP_WEIGHT_DECAY = 3e-4
-CROSSFIT_Q_DEFAULT_MLP_LOSS = "mse"
+CROSSFIT_Q_DEFAULT_MLP_LOSS = "bce"
 CROSSFIT_Q_DEFAULT_MLP_DEVICE = "runner"
-CROSSFIT_Q_DEFAULT_MLP_NUM_THREADS = 4
+CROSSFIT_Q_DEFAULT_MLP_NUM_THREADS = 2
+CROSSFIT_Q_DEFAULT_MLP_RUN_PARALLELISM = 5
 CROSSFIT_Q_DEFAULT_NUM_QUERIES = 1024
 CROSSFIT_Q_DEFAULT_TAIL_EPS = 1e-3
-CROSSFIT_Q_DEFAULT_SUBSET_SIZES = [2, 4, 8, 16]
-CROSSFIT_Q_DEFAULT_MASS_MIN = 0.2
-CROSSFIT_Q_DEFAULT_MASS_MAX = 0.8
-CROSSFIT_Q_DEFAULT_RANK_SPREAD = 0
+CROSSFIT_Q_DEFAULT_SUBSET_SIZES = [8, 16, 32, 64]
+CROSSFIT_Q_DEFAULT_MASS_MIN = 0.05
+CROSSFIT_Q_DEFAULT_MASS_MAX = 0.95
+CROSSFIT_Q_DEFAULT_RANK_SPREAD = 0.4
 CROSSFIT_Q_DEFAULT_SUBSET_SEED = 0
-CROSSFIT_Q_DEFAULT_MASS_BINS = 32
+CROSSFIT_Q_DEFAULT_MASS_BINS = 16
 
 _DEFAULT_CROSSFIT_Q_MLP_PARAMS: Dict[str, Any] = {
     "hidden_dims": list(CROSSFIT_Q_DEFAULT_MLP_HIDDEN_DIMS),
@@ -71,6 +73,9 @@ _DEFAULT_PHASE1_QUERY_PARAMS: Dict[str, Any] = {
 
 _ALLOCATION_VARIANCE_PRIOR_STRENGTH = 8.0
 _ALLOCATION_SHARE_PRIOR_STRENGTH = 4.0
+_CROSSFIT_Q_MLP_INIT_LOCK = Lock()
+_MONOTONE_CVAR95_ALPHA = 0.95
+SUPPORTED_OPTIMIZATION_MODES = {"monotone", "monotone_cvar95"}
 
 
 def _debug(enabled: bool, message: str):
@@ -602,6 +607,112 @@ def _solve_frank_wolfe_monotone_allocation(
     return best_y
 
 
+def _weighted_cvar_profile(
+    M: np.ndarray,
+    losses: np.ndarray,
+    row_weights: np.ndarray,
+    *,
+    alpha: float,
+):
+    alpha = float(alpha)
+    if not 0.0 <= alpha < 1.0:
+        raise ValueError("CVaR alpha must be in [0, 1)")
+    losses = np.asarray(losses, dtype=float).reshape(-1)
+    row_weights = _normalize_query_weights(row_weights, losses.shape[0])
+    if M.shape[0] != losses.shape[0]:
+        raise ValueError("CVaR losses must match allocation matrix rows")
+    if not np.isfinite(losses).all():
+        raise ValueError("CVaR losses must be finite")
+
+    tail_mass = 1.0 - alpha
+    caps = row_weights / tail_mass
+    adversary = np.zeros_like(row_weights, dtype=float)
+    remaining = 1.0
+    for idx in np.argsort(losses)[::-1]:
+        take = min(float(caps[idx]), remaining)
+        if take > 0.0:
+            adversary[idx] = take
+            remaining -= take
+        if remaining <= 1e-12:
+            break
+    total = float(adversary.sum())
+    if total <= 0.0:
+        raise ValueError("CVaR adversary weights have zero total")
+    adversary /= total
+    return adversary @ M, float(adversary @ losses)
+
+
+def _query_weights_for_allocation(query_metadata, count: int):
+    return _normalize_query_weights(
+        None if query_metadata is None else query_metadata.get("weights"),
+        int(count),
+    )
+
+
+def _solve_cvar_monotone_allocation(
+    M: np.ndarray,
+    *,
+    cost_w: np.ndarray,
+    row_weights: np.ndarray,
+    alpha: float = _MONOTONE_CVAR95_ALPHA,
+    relative_tol: float = 1e-5,
+    max_iters: int = 1000,
+):
+    M = np.asarray(M, dtype=float)
+    num_points, num_levels = M.shape
+    if num_points == 0 or num_levels == 0:
+        raise ValueError("M must be non-empty")
+    row_weights = _normalize_query_weights(row_weights, num_points)
+    weighted_M = M * cost_w[None, :]
+    row_scores = np.sqrt(np.maximum(weighted_M, 0.0)).sum(axis=1)
+    profile, _ = _weighted_cvar_profile(
+        M,
+        row_scores,
+        row_weights,
+        alpha=alpha,
+    )
+
+    best_y = np.asarray(cost_w, dtype=float).copy()
+    best_upper = math.inf
+    for iter_idx in range(max_iters):
+        dual_lower, y = _monotone_dual_value_and_simplex(profile, cost_w)
+        full_values = _objective_values(weighted_M, y)
+        target_profile, full_upper = _weighted_cvar_profile(
+            M,
+            full_values,
+            row_weights,
+            alpha=alpha,
+        )
+        if full_upper < best_upper:
+            best_upper = full_upper
+            best_y = y.copy()
+        gap = max(full_upper - dual_lower, 0.0) / max(abs(full_upper), 1.0)
+        if gap <= relative_tol:
+            return y
+
+        gamma, candidate_lower, candidate_y = _monotone_line_search(
+            profile, target_profile, cost_w
+        )
+        if gamma <= 0.0 or candidate_lower <= dual_lower + 1e-14:
+            step = 2.0 / float(iter_idx + 3.0)
+            profile = (1.0 - step) * profile + step * target_profile
+        else:
+            profile = (1.0 - gamma) * profile + gamma * target_profile
+            if candidate_lower > dual_lower:
+                candidate_values = _objective_values(weighted_M, candidate_y)
+                _, candidate_upper = _weighted_cvar_profile(
+                    M,
+                    candidate_values,
+                    row_weights,
+                    alpha=alpha,
+                )
+                if candidate_upper < best_upper:
+                    best_upper = candidate_upper
+                    best_y = candidate_y.copy()
+
+    return best_y
+
+
 def _normalize_query_weights(weights, count: int):
     if weights is None:
         return np.full(int(count), 1.0 / float(count), dtype=float)
@@ -688,7 +799,7 @@ def _solve_optimal_split_factors(
     query_metadata: Mapping[str, Any] | None = None,
 ) -> List[float]:
     """Solve for optimal split factors given per-level variance grids and tau^2."""
-    if optimization_mode != "monotone":
+    if optimization_mode not in SUPPORTED_OPTIMIZATION_MODES:
         raise ValueError(f"unknown optimization_mode '{optimization_mode}'")
 
     variance2_per_level = np.asarray(variance2_per_level, dtype=float)
@@ -714,8 +825,21 @@ def _solve_optimal_split_factors(
         tau2,
         query_metadata=query_metadata,
     )
-    simplex = _solve_frank_wolfe_monotone_allocation(M, cost_w=cost_w)
-    simplex = np.asarray(simplex, dtype=float)
+    row_weights = _query_weights_for_allocation(query_metadata, M.shape[0])
+    if optimization_mode == "monotone":
+        simplex = _solve_frank_wolfe_monotone_allocation(M, cost_w=cost_w)
+    elif optimization_mode == "monotone_cvar95":
+        simplex = _solve_cvar_monotone_allocation(
+            M,
+            cost_w=cost_w,
+            row_weights=row_weights,
+            alpha=_MONOTONE_CVAR95_ALPHA,
+        )
+    else:
+        raise ValueError(f"unknown optimization_mode '{optimization_mode}'")
+    simplex = np.asarray(simplex, dtype=float).reshape(-1)
+    if simplex.shape != (num_levels,):
+        raise ValueError(f"optimizer simplex shape {simplex.shape} != ({num_levels},)")
     if not np.isfinite(simplex).all() or float(simplex.sum()) <= 0.0:
         raise ValueError("optimizer produced invalid simplex")
     simplex /= float(simplex.sum())
@@ -723,6 +847,8 @@ def _solve_optimal_split_factors(
     allocation /= float(cost_w @ allocation)
     if not np.isfinite(allocation).all() or np.any(allocation <= 0.0):
         raise ValueError("optimizer produced invalid allocation")
+    if np.any(np.diff(allocation) < -1e-8 * np.maximum(1.0, np.abs(allocation[:-1]))):
+        raise ValueError("optimizer produced non-monotone allocation")
     return (allocation[1:] / allocation[:-1]).tolist()
 
 
@@ -768,8 +894,8 @@ def _crossfit_q_normalize_mlp_params(params: Mapping[str, Any] | None):
         )
 
     merged["loss"] = str(merged.get("loss", "bce")).lower()
-    if merged["loss"] not in {"bce", "mse", "brier"}:
-        raise ValueError("crossfit_q_mlp_params.loss must be bce, mse, or brier")
+    if merged["loss"] not in {"bce", "mse"}:
+        raise ValueError("crossfit_q_mlp_params.loss must be bce or mse")
 
     merged["device"] = str(merged.get("device", "runner"))
 
@@ -784,6 +910,15 @@ def _crossfit_q_normalize_mlp_params(params: Mapping[str, Any] | None):
             )
 
     return merged
+
+
+def _crossfit_q_normalize_mlp_run_parallelism(value: Any = None) -> int:
+    if value is None or value == "":
+        return int(CROSSFIT_Q_DEFAULT_MLP_RUN_PARALLELISM)
+    workers = int(value)
+    if workers < 1:
+        raise ValueError("crossfit_q_mlp_run_parallelism must be at least 1")
+    return workers
 
 
 class _TorchNumThreadsContext:
@@ -908,10 +1043,13 @@ def _crossfit_q_mlp_predict_all_levels(
     params: Mapping[str, Any] | None,
     runner_device: str | None,
     seed: int | None,
+    manage_num_threads: bool = True,
 ):
     params = _crossfit_q_normalize_mlp_params(params)
     device = _crossfit_q_mlp_device(params, runner_device)
-    with _TorchNumThreadsContext(params.get("num_threads"), device.type == "cpu"):
+    with _TorchNumThreadsContext(
+        params.get("num_threads"), manage_num_threads and device.type == "cpu"
+    ):
         return _crossfit_q_mlp_predict_all_levels_impl(
             train_states_by_level,
             train_labels,
@@ -1025,16 +1163,18 @@ def _crossfit_q_mlp_predict_all_levels_impl(
 
     input_dim = int(x_train.shape[2]) + int(q_features.shape[1]) + max_active + 1
     if seed is None:
-        model = _crossfit_q_build_mlp(input_dim, 1, params).to(device=device)
+        with _CROSSFIT_Q_MLP_INIT_LOCK:
+            model = _crossfit_q_build_mlp(input_dim, 1, params).to(device=device)
     else:
         fork_devices = (
             list(range(torch.cuda.device_count())) if device.type == "cuda" else []
         )
-        with torch.random.fork_rng(devices=fork_devices):
-            torch.manual_seed(int(seed))
-            if device.type == "cuda":
-                torch.cuda.manual_seed_all(int(seed))
-            model = _crossfit_q_build_mlp(input_dim, 1, params).to(device=device)
+        with _CROSSFIT_Q_MLP_INIT_LOCK:
+            with torch.random.fork_rng(devices=fork_devices):
+                torch.manual_seed(int(seed))
+                if device.type == "cuda":
+                    torch.cuda.manual_seed_all(int(seed))
+                model = _crossfit_q_build_mlp(input_dim, 1, params).to(device=device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=float(params["lr"]),
@@ -1109,6 +1249,7 @@ def _crossfit_q_predict_all_levels(
     mlp_params: Mapping[str, Any] | None,
     mlp_device: str | None,
     seed: int | None,
+    manage_mlp_num_threads: bool = True,
 ):
     num_levels, num_paths, obs_dim = (
         states_by_level.shape[0],
@@ -1128,6 +1269,7 @@ def _crossfit_q_predict_all_levels(
             params=mlp_params,
             runner_device=mlp_device,
             seed=fold_seed,
+            manage_num_threads=manage_mlp_num_threads,
         )
         finite = np.isfinite(predictions)
         if not finite.all():
@@ -1187,6 +1329,7 @@ def _estimate_crossfit_q_variance_payload(
     mlp_params: Mapping[str, Any] | None = None,
     mlp_device: str | None = None,
     seed: int | None = None,
+    manage_mlp_num_threads: bool = True,
 ):
     labels = np.asarray(labels, dtype=float)
     if labels.ndim != 2:
@@ -1219,6 +1362,7 @@ def _estimate_crossfit_q_variance_payload(
         mlp_params=mlp_params_normalized,
         mlp_device=mlp_device,
         seed=seed,
+        manage_mlp_num_threads=manage_mlp_num_threads,
     )
     for level_idx in range(num_levels):
         level_predictions = predictions_by_level[level_idx]
@@ -1537,6 +1681,31 @@ def _grid_free_query_payload(samples, grid_free_params, phase1_query_params):
     return query_spec, labels, query_metadata
 
 
+def _estimate_crossfit_q_variance_for_run(
+    run_idx: int,
+    states_by_level: np.ndarray,
+    spec: Mapping[str, Any],
+    *,
+    level_times,
+    n_folds: int,
+    mlp_params: Mapping[str, Any],
+    mlp_device: str | None,
+    seed: int | None,
+    manage_mlp_num_threads: bool,
+):
+    return int(run_idx), _estimate_crossfit_q_variance_payload(
+        states_by_level,
+        spec["labels"],
+        query_spec=spec["query_spec"],
+        level_times=level_times,
+        n_folds=int(n_folds),
+        mlp_params=mlp_params,
+        mlp_device=mlp_device,
+        seed=seed,
+        manage_mlp_num_threads=manage_mlp_num_threads,
+    )
+
+
 # --- Phase 1 builders -------------------------------------------------------
 
 
@@ -1762,6 +1931,7 @@ def _run_crossfit_q_phase1_sampling_batch(
     B1,
     split_percentages,
     crossfit_q_folds,
+    crossfit_q_mlp_run_parallelism=1,
     crossfit_q_mlp_params=None,
     grid_free_params=None,
     phase1_query_params=None,
@@ -1773,7 +1943,11 @@ def _run_crossfit_q_phase1_sampling_batch(
     grid_free_params = _normalize_grid_free_params(grid_free_params)
     phase1_query_params = _normalize_phase1_query_params(phase1_query_params)
     mlp_params_normalized = _crossfit_q_normalize_mlp_params(crossfit_q_mlp_params)
+    mlp_run_parallelism = _crossfit_q_normalize_mlp_run_parallelism(
+        crossfit_q_mlp_run_parallelism
+    )
     effective_folds = int(crossfit_q_folds)
+    mlp_device = _crossfit_q_mlp_device(mlp_params_normalized, str(runner.device))
 
     _, split_points = runner.resolve_split_percentages(split_percentages)
     level_times = [runner.start_time] + list(split_points)
@@ -1797,7 +1971,8 @@ def _run_crossfit_q_phase1_sampling_batch(
     _debug(
         debug,
         f"Phase 1 crossfit_q: chunk={chunk_size} paths_per_run={paths_per_run} "
-        f"folds={effective_folds}",
+        f"folds={effective_folds} mlp_workers={min(mlp_run_parallelism, int(chunk_size))} "
+        f"mlp_device={mlp_device} mlp_num_threads={mlp_params_normalized.get('num_threads')}",
     )
 
     states_by_run, x0 = _simulate_crossfit_q_trajectories(
@@ -1830,17 +2005,51 @@ def _run_crossfit_q_phase1_sampling_batch(
         )
 
     estimates_by_run: List[Any] = [None] * int(chunk_size)
-    for run_idx, spec in enumerate(run_specs):
-        estimates_by_run[run_idx] = _estimate_crossfit_q_variance_payload(
-            states_by_run[:, run_idx, :, :],
-            spec["labels"],
-            query_spec=spec["query_spec"],
-            level_times=level_times,
-            n_folds=int(effective_folds),
-            mlp_params=mlp_params_normalized,
-            mlp_device=str(runner.device),
-            seed=7919 + int(run_idx),
+    effective_mlp_workers = min(int(mlp_run_parallelism), int(chunk_size))
+    if effective_mlp_workers <= 1:
+        for run_idx, spec in enumerate(run_specs):
+            _, estimates_by_run[run_idx] = _estimate_crossfit_q_variance_for_run(
+                run_idx,
+                states_by_run[:, run_idx, :, :],
+                spec,
+                level_times=level_times,
+                n_folds=int(effective_folds),
+                mlp_params=mlp_params_normalized,
+                mlp_device=str(runner.device),
+                seed=7919 + int(run_idx),
+                manage_mlp_num_threads=True,
+            )
+    else:
+        _debug(
+            debug,
+            f"Phase 1 crossfit_q MLP run parallelism enabled: "
+            f"workers={effective_mlp_workers} chunk={chunk_size}",
         )
+        with _TorchNumThreadsContext(
+            mlp_params_normalized.get("num_threads"), mlp_device.type == "cpu"
+        ):
+            with ThreadPoolExecutor(max_workers=effective_mlp_workers) as mlp_executor:
+                futures = []
+                for run_idx, spec in enumerate(run_specs):
+                    futures.append(
+                        (
+                            run_idx,
+                            mlp_executor.submit(
+                                _estimate_crossfit_q_variance_for_run,
+                                run_idx,
+                                states_by_run[:, run_idx, :, :],
+                                spec,
+                                level_times=level_times,
+                                n_folds=int(effective_folds),
+                                mlp_params=mlp_params_normalized,
+                                mlp_device=str(runner.device),
+                                seed=7919 + int(run_idx),
+                                manage_mlp_num_threads=False,
+                            ),
+                        )
+                    )
+                for run_idx, future in futures:
+                    _, estimates_by_run[run_idx] = future.result()
 
     payloads = []
     for run_idx, spec in enumerate(run_specs):
@@ -1987,6 +2196,7 @@ def run_estimate_and_sample(
     n_runs: int,
     seed: int | None,
     crossfit_q_folds: int = CROSSFIT_Q_DEFAULT_FOLDS,
+    crossfit_q_mlp_run_parallelism: int = CROSSFIT_Q_DEFAULT_MLP_RUN_PARALLELISM,
     crossfit_q_mlp_params: Mapping[str, Any] | None = None,
     grid_free_params: Mapping[str, Any] | None = None,
     phase1_query_params: Mapping[str, Any] | None = None,
@@ -2008,13 +2218,19 @@ def run_estimate_and_sample(
     grid_free_params_normalized = _normalize_grid_free_params(grid_free_params)
     phase1_query_params_normalized = _normalize_phase1_query_params(phase1_query_params)
     crossfit_q_mlp_params_normalized = None
+    crossfit_q_mlp_run_parallelism_normalized = int(
+        CROSSFIT_Q_DEFAULT_MLP_RUN_PARALLELISM
+    )
     if variance_estimation_mode == "crossfit_q":
         if int(crossfit_q_folds) < 1:
             raise ValueError("crossfit_q_folds must be at least 1")
+        crossfit_q_mlp_run_parallelism_normalized = (
+            _crossfit_q_normalize_mlp_run_parallelism(crossfit_q_mlp_run_parallelism)
+        )
         crossfit_q_mlp_params_normalized = _crossfit_q_normalize_mlp_params(
             crossfit_q_mlp_params
         )
-    if optimization_mode != "monotone":
+    if optimization_mode not in SUPPORTED_OPTIMIZATION_MODES:
         raise ValueError(f"unknown optimization_mode '{optimization_mode}'")
 
     common_phase1_extra = {
@@ -2038,6 +2254,9 @@ def run_estimate_and_sample(
         phase1_extra = {
             **common_phase1_extra,
             "crossfit_q_folds": int(crossfit_q_folds),
+            "crossfit_q_mlp_run_parallelism": int(
+                crossfit_q_mlp_run_parallelism_normalized
+            ),
             "crossfit_q_mlp_params": dict(crossfit_q_mlp_params_normalized or {}),
         }
     else:

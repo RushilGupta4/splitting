@@ -56,6 +56,8 @@ _METADATA_DEFAULTS = {
         "eta": 1.0,
     },
     "split_percentages_list": _SPLITS,
+    "optimization_modes": ["monotone", "monotone_cvar95"],
+    "crossfit_q_mlp_losses": ["bce", "mse"],
     "num_base_samples": 1_000_000,
     "n_runs": 200,
 }

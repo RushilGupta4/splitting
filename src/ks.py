@@ -6,9 +6,7 @@ import torch
 from numba import njit
 
 KS_QUADRATURE_POINTS = 96
-KS_QUAD_NODES, KS_QUAD_WEIGHTS = np.polynomial.legendre.leggauss(
-    KS_QUADRATURE_POINTS
-)
+KS_QUAD_NODES, KS_QUAD_WEIGHTS = np.polynomial.legendre.leggauss(KS_QUADRATURE_POINTS)
 KS_QUAD_NODES = np.ascontiguousarray(KS_QUAD_NODES, dtype=np.float64)
 KS_QUAD_WEIGHTS = np.ascontiguousarray(KS_QUAD_WEIGHTS, dtype=np.float64)
 
@@ -44,7 +42,9 @@ def coerce_samples_np(samples, expected_dim: int | None = None) -> np.ndarray:
     return samples_np
 
 
-def coerce_samples_tensor(samples, device=None, expected_dim: int | None = None) -> torch.Tensor:
+def coerce_samples_tensor(
+    samples, device=None, expected_dim: int | None = None
+) -> torch.Tensor:
     if isinstance(samples, torch.Tensor):
         tensor = samples.detach()
         if device is not None:
@@ -71,7 +71,9 @@ def coerce_samples_tensor(samples, device=None, expected_dim: int | None = None)
 def _require_sample_dim(samples_np: np.ndarray, dim: int) -> np.ndarray:
     samples_np = np.asarray(samples_np, dtype=float)
     if samples_np.ndim != 2 or samples_np.shape[1] != int(dim):
-        raise ValueError(f"Expected samples of shape [N, {int(dim)}], got {samples_np.shape}")
+        raise ValueError(
+            f"Expected samples of shape [N, {int(dim)}], got {samples_np.shape}"
+        )
     return samples_np
 
 
@@ -93,9 +95,7 @@ def _normalize_approx_lower_orthant_ks_params(
             raise ValueError(f"approximate KS parameter {key} must be >= 1")
 
     merged["tail_eps"] = float(merged["tail_eps"])
-    if not math.isfinite(merged["tail_eps"]) or not (
-        0.0 <= merged["tail_eps"] < 0.5
-    ):
+    if not math.isfinite(merged["tail_eps"]) or not (0.0 <= merged["tail_eps"] < 0.5):
         raise ValueError("approximate KS parameter tail_eps must be in [0, 0.5)")
 
     merged["paired_fraction"] = float(merged["paired_fraction"])
@@ -454,7 +454,9 @@ def _approx_lower_orthant_query_points(
     pooled = np.concatenate([reference_eval, generated_eval], axis=0)
     pooled = pooled[np.isfinite(pooled).all(axis=1)]
     if pooled.shape[0] == 0:
-        raise ValueError("Cannot generate approximate KS queries from non-finite samples")
+        raise ValueError(
+            "Cannot generate approximate KS queries from non-finite samples"
+        )
 
     total = int(params["num_queries"])
     paired_target = int(round(total * float(params["paired_fraction"])))
@@ -540,9 +542,7 @@ def _approx_two_sample_lower_orthant_ks_from_state(
     generated_eval = _deterministic_sample_subset(
         samples_np, int(params["generated_eval_samples"])
     )
-    queries = _approx_lower_orthant_query_points(
-        generated_eval, reference_eval, params
-    )
+    queries = _approx_lower_orthant_query_points(generated_eval, reference_eval, params)
     reference_cdf = _lower_orthant_cdf_at_queries(
         reference_eval,
         queries,
@@ -562,7 +562,9 @@ def _approx_two_sample_lower_orthant_ks_from_state(
 def _normal_cdf_np(values: np.ndarray, *, mean: float, std: float) -> np.ndarray:
     if float(std) <= 0.0:
         raise ValueError("normal CDF std must be positive")
-    z = (np.asarray(values, dtype=np.float64) - float(mean)) / (float(std) * math.sqrt(2.0))
+    z = (np.asarray(values, dtype=np.float64) - float(mean)) / (
+        float(std) * math.sqrt(2.0)
+    )
     erf = np.vectorize(math.erf, otypes=[np.float64])
     return 0.5 * (1.0 + erf(z))
 
@@ -802,7 +804,9 @@ def _exact_empirical_target_lower_orthant_ks_numba(
     return best
 
 
-def _exact_empirical_target_lower_orthant_ks(samples, target_spec: Dict[str, Any]) -> float:
+def _exact_empirical_target_lower_orthant_ks(
+    samples, target_spec: Dict[str, Any]
+) -> float:
     samples_np = _require_sample_dim(coerce_samples_np(samples), 2)
     n_samples = int(samples_np.shape[0])
     if n_samples == 0:

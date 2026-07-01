@@ -28,6 +28,7 @@ CSV_FIELDS = {
     "B",
     "B1",
     "sigma_mode",
+    "crossfit_q_mlp_loss",
     "reuse",
     "free_B1",
     "optimizer",
@@ -68,6 +69,7 @@ class Row:
     B: int
     B1: int | None
     sigma_mode: str
+    crossfit_q_mlp_loss: str
     reuse: bool | None
     free_B1: bool
     optimizer: str
@@ -187,7 +189,7 @@ def _load_rows(csv_path: str):
     rows = []
     with open(csv_path, newline="") as f:
         reader = csv.DictReader(f)
-        missing = sorted((CSV_FIELDS - {"optimizer"}) - set(reader.fieldnames or []))
+        missing = sorted(CSV_FIELDS - set(reader.fieldnames or []))
         if missing:
             raise ValueError(
                 "CSV is missing structured field(s): "
@@ -209,8 +211,8 @@ def _load_rows(csv_path: str):
             reuse = _parse_bool(raw_row.get("reuse", ""))
             free_b1 = _parse_bool(raw_row.get("free_B1", ""))
             optimizer = (raw_row.get("optimizer") or "").strip()
-            if mode == "adaptive" and not optimizer:
-                optimizer = "monotone"
+            sigma_mode = (raw_row.get("sigma_mode") or "").strip()
+            crossfit_q_mlp_loss = (raw_row.get("crossfit_q_mlp_loss") or "").strip()
             rows.append(
                 Row(
                     mode=mode,
@@ -220,7 +222,8 @@ def _load_rows(csv_path: str):
                     step_schedule=(raw_row.get("step_schedule") or "default").strip(),
                     B=B,
                     B1=_parse_int(raw_row.get("B1", "")),
-                    sigma_mode=(raw_row.get("sigma_mode") or "").strip(),
+                    sigma_mode=sigma_mode,
+                    crossfit_q_mlp_loss=crossfit_q_mlp_loss,
                     reuse=reuse,
                     free_B1=bool(free_b1),
                     optimizer=optimizer,
@@ -351,9 +354,10 @@ def _method_key(row: Row):
     return (
         "adaptive",
         row.sigma_mode,
+        row.crossfit_q_mlp_loss if row.sigma_mode == "crossfit_q" else "",
         bool(row.reuse),
         bool(row.free_B1),
-        row.optimizer or "monotone",
+        row.optimizer,
     )
 
 
@@ -401,9 +405,10 @@ def _solver_rows(rows):
 def _mode_key(row: Row):
     return (
         row.sigma_mode,
+        row.crossfit_q_mlp_loss if row.sigma_mode == "crossfit_q" else "",
         bool(row.reuse),
         bool(row.free_B1),
-        row.optimizer or "monotone",
+        row.optimizer,
     )
 
 
@@ -412,8 +417,10 @@ def _mode_keys(rows):
 
 
 def _mode_title(mode_key):
-    sigma_mode, reuse, free_b1, optimizer = mode_key
+    sigma_mode, crossfit_q_mlp_loss, reuse, free_b1, optimizer = mode_key
     label = f"{_short_sigma_mode(sigma_mode)} {'reuse' if reuse else 'fresh'}"
+    if sigma_mode == "crossfit_q" and crossfit_q_mlp_loss:
+        label += f" {crossfit_q_mlp_loss}"
     if free_b1:
         label += " free"
     if optimizer:

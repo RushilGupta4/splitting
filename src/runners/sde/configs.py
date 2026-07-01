@@ -64,10 +64,10 @@ SDE_SAMPLING_BASE = {
     },
     "B_list": [
         # 10_000,
-        20_000,
-        50_000,
+        # 20_000,
+        # 50_000,
         100_000,
-        # 200_000,
+        200_000,
         # 500_000,
         # 1_000_000,
         # 2_000_000,
@@ -94,6 +94,8 @@ SDE_SAMPLING_BASE = {
 SDE_METADATA_BASE = {
     **crossfit_q_config(),
     "split_percentages_list": [list(split) for split in SDE_SPLITS],
+    "optimization_modes": ["monotone_cvar95"],
+    "crossfit_q_mlp_losses": ["mse"],
     "num_base_samples": 500_000,
     "n_runs": 25,
     "n_parallel": 25,

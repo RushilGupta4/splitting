@@ -32,6 +32,28 @@ from runners.base import (
 )
 
 
+def _ddim_kwargs_from_scheduler_config(config: Mapping[str, Any] | None):
+    if not config:
+        return {}
+    supported = {
+        "beta_start",
+        "beta_end",
+        "beta_schedule",
+        "trained_betas",
+        "variance_type",
+        "clip_sample",
+        "clip_sample_range",
+        "prediction_type",
+        "thresholding",
+        "timestep_spacing",
+        "steps_offset",
+        "rescale_betas_zero_snr",
+    }
+    kwargs = {key: config[key] for key in supported if key in config and config[key] is not None}
+    kwargs.pop("variance_type", None)
+    return kwargs
+
+
 class DDPMRunner(BaseRunner):
     runner_name = "ddpm"
     target_adapter = None
@@ -76,11 +98,13 @@ class DDPMRunner(BaseRunner):
         self._sampler = sampler
         self._device = str(device)
         self._checkpoint_path = checkpoint_path or type(self).default_checkpoint_path()
+        scheduler_config = dict(self._target_spec.get("scheduler_config") or {})
         self._ddim = DDIM(
             T=self._T,
             device=self._device,
             eta=self._eta,
             sampling_steps=self._sampling_steps,
+            **_ddim_kwargs_from_scheduler_config(scheduler_config),
         )
 
     # ------------------------------------------------------------------
@@ -123,7 +147,8 @@ class DDPMRunner(BaseRunner):
             path, device, no_compile=no_compile
         )
         if T is None:
-            T = 1000
+            scheduler_config = dict(target_spec.get("scheduler_config") or {})
+            T = int(scheduler_config.get("num_train_timesteps") or 1000)
         if sampling_steps is None:
             sampling_steps = int(T)
         return cls(

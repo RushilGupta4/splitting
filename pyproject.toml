@@ -11,11 +11,15 @@ dependencies = [
     "pandas>=3.0.3",
     "scipy>=1.17.1",
     "torch==2.11.0",
+    "torchvision>=0.26.0",
     "tqdm>=4.68.3",
 ]
 
 [tool.uv.sources]
 torch = [
+    { index = "pytorch-cu128", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" },
+]
+torchvision = [
     { index = "pytorch-cu128", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" },
 ]
 
