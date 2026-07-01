@@ -86,7 +86,7 @@ def _gaussian_pdf_1d(x, mean, std):
 
 
 def _mixture_marginal_pdf_1d(x, weights, means, stds):
-    pdf = np.zeros_like(x, dtype=np.float64)
+    pdf = np.zeros_like(x, dtype=np.float32)
     for weight, mean, std in zip(weights, means, stds):
         pdf += float(weight) * _gaussian_pdf_1d(x, float(mean), float(std))
     return pdf
@@ -109,9 +109,9 @@ def plot_final_marginals(
 
     generated_np = generated.detach().cpu().numpy()
     target_spec = get_target_distribution_spec()
-    weights = np.asarray(target_spec["weights"], dtype=np.float64)
-    means = np.asarray(target_spec["means"], dtype=np.float64)
-    covariances = np.asarray(target_spec["covariances"], dtype=np.float64)
+    weights = np.asarray(target_spec["weights"], dtype=np.float32)
+    means = np.asarray(target_spec["means"], dtype=np.float32)
+    covariances = np.asarray(target_spec["covariances"], dtype=np.float32)
     marginal_stds = np.sqrt(
         np.stack([covariances[:, 0, 0], covariances[:, 1, 1]], axis=1)
     )

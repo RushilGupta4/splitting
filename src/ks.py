@@ -7,8 +7,8 @@ from numba import njit
 
 KS_QUADRATURE_POINTS = 96
 KS_QUAD_NODES, KS_QUAD_WEIGHTS = np.polynomial.legendre.leggauss(KS_QUADRATURE_POINTS)
-KS_QUAD_NODES = np.ascontiguousarray(KS_QUAD_NODES, dtype=np.float64)
-KS_QUAD_WEIGHTS = np.ascontiguousarray(KS_QUAD_WEIGHTS, dtype=np.float64)
+KS_QUAD_NODES = np.ascontiguousarray(KS_QUAD_NODES, dtype=np.float32)
+KS_QUAD_WEIGHTS = np.ascontiguousarray(KS_QUAD_WEIGHTS, dtype=np.float32)
 
 APPROX_LOWER_ORTHANT_KS_VERSION = 1
 APPROX_LOWER_ORTHANT_KS_DEFAULTS: Dict[str, Any] = {
@@ -120,16 +120,16 @@ def reference_ks_metric_cache_key(dimension: int) -> Dict[str, Any] | None:
 
 
 def _deterministic_sample_subset(samples_np: np.ndarray, max_count: int) -> np.ndarray:
-    samples_np = np.asarray(samples_np, dtype=np.float64)
+    samples_np = np.asarray(samples_np, dtype=np.float32)
     count = int(samples_np.shape[0])
     if count == 0:
         raise ValueError("Cannot build an evaluation subset from zero samples")
     limit = min(int(max_count), count)
     if limit == count:
-        return np.ascontiguousarray(samples_np, dtype=np.float64)
-    indices = np.floor((np.arange(limit, dtype=np.float64) + 0.5) * count / limit)
+        return np.ascontiguousarray(samples_np, dtype=np.float32)
+    indices = np.floor((np.arange(limit, dtype=np.float32) + 0.5) * count / limit)
     indices = np.clip(indices.astype(np.int64), 0, count - 1)
-    return np.ascontiguousarray(samples_np[indices], dtype=np.float64)
+    return np.ascontiguousarray(samples_np[indices], dtype=np.float32)
 
 
 def prepare_reference_cdf_state(samples) -> Dict[str, Any]:
@@ -142,7 +142,7 @@ def prepare_reference_cdf_state(samples) -> Dict[str, Any]:
             "dimension": 1,
             "count": int(samples_np.shape[0]),
             "x_sorted": np.ascontiguousarray(
-                np.sort(samples_np[:, 0]), dtype=np.float64
+                np.sort(samples_np[:, 0]), dtype=np.float32
             ),
         }
     if samples_np.shape[1] != 2:
@@ -164,11 +164,11 @@ def prepare_reference_cdf_state(samples) -> Dict[str, Any]:
     return {
         "dimension": 2,
         "count": int(samples_np.shape[0]),
-        "x_sorted": np.ascontiguousarray(samples_np[x_order, 0], dtype=np.float64),
+        "x_sorted": np.ascontiguousarray(samples_np[x_order, 0], dtype=np.float32),
         "y_ranks_sorted": np.ascontiguousarray(
             y_ranks[x_order].astype(np.int64) + 1, dtype=np.int64
         ),
-        "y_values": np.ascontiguousarray(y_values, dtype=np.float64),
+        "y_values": np.ascontiguousarray(y_values, dtype=np.float32),
     }
 
 
@@ -210,7 +210,7 @@ def _empirical_lower_orthant_cdf_numba(
     sample_count: int,
 ) -> np.ndarray:
     query_order = np.argsort(points_np[:, 0])
-    counts = np.empty(points_np.shape[0], dtype=np.float64)
+    counts = np.empty(points_np.shape[0], dtype=np.float32)
     tree = np.zeros(y_values.shape[0] + 1, dtype=np.int64)
 
     sample_idx = 0
@@ -262,9 +262,9 @@ def _exact_two_sample_lower_orthant_ks_numba(
         size *= 2
 
     tree_len = 2 * size
-    sums = np.zeros(tree_len, dtype=np.float64)
-    max_prefix = np.zeros(tree_len, dtype=np.float64)
-    min_prefix = np.zeros(tree_len, dtype=np.float64)
+    sums = np.zeros(tree_len, dtype=np.float32)
+    max_prefix = np.zeros(tree_len, dtype=np.float32)
+    min_prefix = np.zeros(tree_len, dtype=np.float32)
 
     n_a = x_a.shape[0]
     n_b = x_b.shape[0]
@@ -302,12 +302,12 @@ def _exact_two_sample_lower_orthant_ks_numba(
 
 def _sorted_empirical_ks_inputs(samples: np.ndarray, union_y: np.ndarray):
     samples_np = np.ascontiguousarray(
-        np.asarray(samples, dtype=np.float64).reshape(-1, 2)
+        np.asarray(samples, dtype=np.float32).reshape(-1, 2)
     )
     if samples_np.shape[0] == 0:
         raise ValueError("Cannot compute KS distance from zero samples")
     order = np.argsort(samples_np[:, 0], kind="mergesort")
-    x_sorted = np.ascontiguousarray(samples_np[order, 0], dtype=np.float64)
+    x_sorted = np.ascontiguousarray(samples_np[order, 0], dtype=np.float32)
     y_ranks = np.searchsorted(union_y, samples_np[order, 1]).astype(np.int64)
     return x_sorted, np.ascontiguousarray(y_ranks, dtype=np.int64)
 
@@ -320,8 +320,8 @@ def _exact_two_sample_ks_1d_from_state(
     if samples_np.shape[0] == 0:
         raise ValueError("Cannot compute KS distance from zero samples")
 
-    x_a = np.ascontiguousarray(np.sort(samples_np[:, 0]), dtype=np.float64)
-    x_b = np.ascontiguousarray(reference_cdf_state["x_sorted"], dtype=np.float64)
+    x_a = np.ascontiguousarray(np.sort(samples_np[:, 0]), dtype=np.float32)
+    x_b = np.ascontiguousarray(reference_cdf_state["x_sorted"], dtype=np.float32)
     if x_b.shape[0] == 0:
         raise ValueError("Cannot compute KS distance against zero reference samples")
 
@@ -356,7 +356,7 @@ def _exact_two_sample_lower_orthant_ks_from_state(
     if ref_count == 0:
         raise ValueError("Cannot compute KS distance against zero reference samples")
 
-    ref_y_values = np.asarray(reference_cdf_state["y_values"], dtype=np.float64)
+    ref_y_values = np.asarray(reference_cdf_state["y_values"], dtype=np.float32)
     union_y = np.unique(np.concatenate([samples_np[:, 1], ref_y_values]))
     x_a, y_rank_a = _sorted_empirical_ks_inputs(samples_np, union_y)
 
@@ -364,7 +364,7 @@ def _exact_two_sample_lower_orthant_ks_from_state(
     y_rank_b = ref_rank_map[
         np.asarray(reference_cdf_state["y_ranks_sorted"], dtype=np.int64) - 1
     ]
-    x_b = np.ascontiguousarray(reference_cdf_state["x_sorted"], dtype=np.float64)
+    x_b = np.ascontiguousarray(reference_cdf_state["x_sorted"], dtype=np.float32)
     y_rank_b = np.ascontiguousarray(y_rank_b, dtype=np.int64)
 
     return float(
@@ -399,7 +399,7 @@ def _first_primes(count: int) -> list[int]:
 
 
 def _van_der_corput(count: int, base: int) -> np.ndarray:
-    values = np.empty(int(count), dtype=np.float64)
+    values = np.empty(int(count), dtype=np.float32)
     for idx in range(int(count)):
         n = idx + 1
         denom = 1.0
@@ -413,16 +413,16 @@ def _van_der_corput(count: int, base: int) -> np.ndarray:
 
 
 def _deduplicate_query_points(query_points: np.ndarray, decimals: int) -> np.ndarray:
-    query_points = np.asarray(query_points, dtype=np.float64)
+    query_points = np.asarray(query_points, dtype=np.float32)
     if query_points.ndim == 1:
         query_points = query_points.reshape(-1, 1)
     finite = np.isfinite(query_points).all(axis=1)
     query_points = query_points[finite]
     if query_points.size == 0:
-        return np.empty((0, query_points.shape[1]), dtype=np.float64)
+        return np.empty((0, query_points.shape[1]), dtype=np.float32)
     rounded = np.round(query_points, int(decimals))
     _, keep = np.unique(rounded, axis=0, return_index=True)
-    return np.ascontiguousarray(query_points[np.sort(keep)], dtype=np.float64)
+    return np.ascontiguousarray(query_points[np.sort(keep)], dtype=np.float32)
 
 
 def _deterministic_paired_indices(count: int, paired_count: int) -> np.ndarray:
@@ -431,7 +431,7 @@ def _deterministic_paired_indices(count: int, paired_count: int) -> np.ndarray:
     if int(paired_count) == 1:
         return np.asarray([int(count) // 2], dtype=np.int64)
     positions = np.floor(
-        (np.arange(int(paired_count), dtype=np.float64) + 0.5)
+        (np.arange(int(paired_count), dtype=np.float32) + 0.5)
         * int(count)
         / int(paired_count)
     )
@@ -443,8 +443,8 @@ def _approx_lower_orthant_query_points(
     reference_eval: np.ndarray,
     params: Dict[str, Any],
 ) -> np.ndarray:
-    generated_eval = np.asarray(generated_eval, dtype=np.float64)
-    reference_eval = np.asarray(reference_eval, dtype=np.float64)
+    generated_eval = np.asarray(generated_eval, dtype=np.float32)
+    reference_eval = np.asarray(reference_eval, dtype=np.float32)
     dim = int(reference_eval.shape[1])
     if generated_eval.ndim != 2 or int(generated_eval.shape[1]) != dim:
         raise ValueError(
@@ -463,14 +463,14 @@ def _approx_lower_orthant_query_points(
     paired_count = min(paired_target, max(total - 1, 0), int(pooled.shape[0]))
     core_count = max(total - paired_count, 1)
 
-    ranks = np.empty((core_count, dim), dtype=np.float64)
+    ranks = np.empty((core_count, dim), dtype=np.float32)
     bases = _first_primes(dim)
     for col in range(dim):
         ranks[:, col] = _van_der_corput(core_count, bases[col])
     eps = float(params["tail_eps"])
     ranks = eps + ranks * max(1.0 - 2.0 * eps, 1e-12)
 
-    core = np.empty((core_count, dim), dtype=np.float64)
+    core = np.empty((core_count, dim), dtype=np.float32)
     for col in range(dim):
         core[:, col] = np.quantile(pooled[:, col], ranks[:, col])
 
@@ -485,7 +485,7 @@ def _approx_lower_orthant_query_points(
     )
     if queries.shape[0] == 0:
         queries = np.mean(pooled, axis=0, keepdims=True)
-    return np.ascontiguousarray(queries, dtype=np.float64)
+    return np.ascontiguousarray(queries, dtype=np.float32)
 
 
 def _lower_orthant_cdf_at_queries(
@@ -494,8 +494,8 @@ def _lower_orthant_cdf_at_queries(
     *,
     query_chunk_size: int,
 ) -> np.ndarray:
-    samples_np = np.asarray(samples_np, dtype=np.float64)
-    queries = np.asarray(queries, dtype=np.float64)
+    samples_np = np.asarray(samples_np, dtype=np.float32)
+    queries = np.asarray(queries, dtype=np.float32)
     if samples_np.shape[0] == 0:
         raise ValueError("Cannot compute empirical CDF from zero samples")
     if queries.ndim == 1:
@@ -508,7 +508,7 @@ def _lower_orthant_cdf_at_queries(
             f"dimension {queries.shape[1]}"
         )
 
-    cdf = np.empty(int(queries.shape[0]), dtype=np.float64)
+    cdf = np.empty(int(queries.shape[0]), dtype=np.float32)
     chunk_size = max(int(query_chunk_size), 1)
     for start in range(0, int(queries.shape[0]), chunk_size):
         end = min(start + chunk_size, int(queries.shape[0]))
@@ -530,7 +530,7 @@ def _approx_two_sample_lower_orthant_ks_from_state(
         raise ValueError("Cannot compute KS distance from zero samples")
 
     reference_eval = _require_sample_dim(
-        np.asarray(reference_cdf_state["reference_eval_samples"], dtype=np.float64),
+        np.asarray(reference_cdf_state["reference_eval_samples"], dtype=np.float32),
         dim,
     )
     if reference_eval.shape[0] == 0:
@@ -562,10 +562,10 @@ def _approx_two_sample_lower_orthant_ks_from_state(
 def _normal_cdf_np(values: np.ndarray, *, mean: float, std: float) -> np.ndarray:
     if float(std) <= 0.0:
         raise ValueError("normal CDF std must be positive")
-    z = (np.asarray(values, dtype=np.float64) - float(mean)) / (
+    z = (np.asarray(values, dtype=np.float32) - float(mean)) / (
         float(std) * math.sqrt(2.0)
     )
-    erf = np.vectorize(math.erf, otypes=[np.float64])
+    erf = np.vectorize(math.erf, otypes=[np.float32])
     return 0.5 * (1.0 + erf(z))
 
 
@@ -574,7 +574,7 @@ def _target_cdf_1d(values: np.ndarray, target_spec: Dict[str, Any]) -> np.ndarra
     if not isinstance(cdf_spec, dict):
         raise ValueError("1D true_dist target_spec must include a CDF spec")
     kind = cdf_spec.get("kind")
-    values_np = np.asarray(values, dtype=np.float64)
+    values_np = np.asarray(values, dtype=np.float32)
     if kind == "normal":
         return _normal_cdf_np(
             values_np,
@@ -589,18 +589,18 @@ def _exact_empirical_target_ks_1d(samples, target_spec: Dict[str, Any]) -> float
     n_samples = int(samples_np.shape[0])
     if n_samples == 0:
         raise ValueError("Cannot compute KS distance from zero samples")
-    y = np.sort(np.ascontiguousarray(samples_np[:, 0], dtype=np.float64))
+    y = np.sort(np.ascontiguousarray(samples_np[:, 0], dtype=np.float32))
     cdf = np.clip(_target_cdf_1d(y, target_spec), 0.0, 1.0)
-    j = np.arange(1, n_samples + 1, dtype=np.float64)
+    j = np.arange(1, n_samples + 1, dtype=np.float32)
     d_plus = np.max(j / float(n_samples) - cdf)
     d_minus = np.max(cdf - (j - 1.0) / float(n_samples))
     return float(max(d_plus, d_minus))
 
 
 def _target_spec_arrays(target_spec: Dict[str, Any]):
-    weights = np.ascontiguousarray(target_spec["weights"], dtype=np.float64)
-    means = np.ascontiguousarray(target_spec["means"], dtype=np.float64)
-    covariances = np.ascontiguousarray(target_spec["covariances"], dtype=np.float64)
+    weights = np.ascontiguousarray(target_spec["weights"], dtype=np.float32)
+    means = np.ascontiguousarray(target_spec["means"], dtype=np.float32)
+    covariances = np.ascontiguousarray(target_spec["covariances"], dtype=np.float32)
     return weights, means, covariances
 
 
@@ -819,9 +819,9 @@ def _exact_empirical_target_lower_orthant_ks(
     weights, means, covariances = _target_spec_arrays(target_spec)
     return float(
         _exact_empirical_target_lower_orthant_ks_numba(
-            np.ascontiguousarray(x_values, dtype=np.float64),
+            np.ascontiguousarray(x_values, dtype=np.float32),
             np.ascontiguousarray(x_counts, dtype=np.int64),
-            np.ascontiguousarray(y_values, dtype=np.float64),
+            np.ascontiguousarray(y_values, dtype=np.float32),
             y_ranks_by_x,
             weights,
             means,
@@ -836,9 +836,9 @@ def _exact_empirical_target_lower_orthant_ks(
 def _warm_target_ks_kernel(target_spec: Dict[str, Any]):
     weights, means, covariances = _target_spec_arrays(target_spec)
     _exact_empirical_target_lower_orthant_ks_numba(
-        np.ascontiguousarray([0.0], dtype=np.float64),
+        np.ascontiguousarray([0.0], dtype=np.float32),
         np.ascontiguousarray([1], dtype=np.int64),
-        np.ascontiguousarray([0.0], dtype=np.float64),
+        np.ascontiguousarray([0.0], dtype=np.float32),
         np.ascontiguousarray([0], dtype=np.int64),
         weights,
         means,
@@ -852,14 +852,14 @@ def _warm_target_ks_kernel(target_spec: Dict[str, Any]):
 def warm_ks_kernel_for_mode(reference_mode: str, target_spec: Dict[str, Any]):
     if reference_mode == "true_dist":
         if int(target_spec.get("dimension", 2)) == 1:
-            _target_cdf_1d(np.asarray([0.0], dtype=np.float64), target_spec)
+            _target_cdf_1d(np.asarray([0.0], dtype=np.float32), target_spec)
             return
         _warm_target_ks_kernel(target_spec)
     elif reference_mode in {"true_samples", "ddpm_samples", "edm_samples"}:
         _exact_two_sample_lower_orthant_ks_numba(
-            np.ascontiguousarray([0.0], dtype=np.float64),
+            np.ascontiguousarray([0.0], dtype=np.float32),
             np.ascontiguousarray([0], dtype=np.int64),
-            np.ascontiguousarray([0.0], dtype=np.float64),
+            np.ascontiguousarray([0.0], dtype=np.float32),
             np.ascontiguousarray([0], dtype=np.int64),
             1,
         )
@@ -871,7 +871,7 @@ def warm_reference_ks_kernel(reference_cdf_state: Dict[str, Any]):
         return
     sample_x = reference_cdf_state["x_sorted"][0]
     sample_y = reference_cdf_state["y_values"][0]
-    warm_points = np.ascontiguousarray([[sample_x, sample_y]], dtype=np.float64)
+    warm_points = np.ascontiguousarray([[sample_x, sample_y]], dtype=np.float32)
     _empirical_lower_orthant_cdf_numba(
         reference_cdf_state["x_sorted"],
         reference_cdf_state["y_ranks_sorted"],
@@ -880,9 +880,9 @@ def warm_reference_ks_kernel(reference_cdf_state: Dict[str, Any]):
         int(reference_cdf_state["count"]),
     )
     _exact_two_sample_lower_orthant_ks_numba(
-        np.ascontiguousarray([sample_x], dtype=np.float64),
+        np.ascontiguousarray([sample_x], dtype=np.float32),
         np.ascontiguousarray([0], dtype=np.int64),
-        np.ascontiguousarray([sample_x], dtype=np.float64),
+        np.ascontiguousarray([sample_x], dtype=np.float32),
         np.ascontiguousarray([0], dtype=np.int64),
         1,
     )

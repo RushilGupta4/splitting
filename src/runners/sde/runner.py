@@ -87,7 +87,7 @@ class SDERunner(BaseRunner):
         self._dimension = int(dimension)
         self._coupling_strength = float(effective_coupling)
         self._device = str(device)
-        self._dtype = torch.float64
+        self._dtype = torch.float32
         self._checkpoint_path = checkpoint_path or self.default_checkpoint_path()
         self._target_spec = self._case.target_spec_factory(
             self._terminal_time,

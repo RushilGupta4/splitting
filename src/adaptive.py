@@ -426,10 +426,10 @@ if njit is not None:
         Q_proj = np.empty_like(Q_raw)
         starts = np.empty(num_times, dtype=np.int64)
         ends = np.empty(num_times, dtype=np.int64)
-        weights = np.empty(num_times, dtype=np.float64)
-        sums = np.empty(num_times, dtype=np.float64)
-        levels = np.empty(num_times, dtype=np.float64)
-        clipped = np.empty(num_times, dtype=np.float64)
+        weights = np.empty(num_times, dtype=np.float32)
+        sums = np.empty(num_times, dtype=np.float32)
+        levels = np.empty(num_times, dtype=np.float32)
+        clipped = np.empty(num_times, dtype=np.float32)
 
         for obs_idx in range(obs_dim):
             F = float(F_hat[obs_idx])
@@ -1313,8 +1313,8 @@ def _crossfit_q_project_sequences(Q_raw: np.ndarray, F_hat: np.ndarray):
     ):
         return _crossfit_q_project_sequences_reference(Q_raw, F_hat)
     Q_proj = _crossfit_q_project_sequences_numba(
-        np.ascontiguousarray(Q_raw, dtype=np.float64),
-        np.ascontiguousarray(F_hat, dtype=np.float64),
+        np.ascontiguousarray(Q_raw, dtype=np.float32),
+        np.ascontiguousarray(F_hat, dtype=np.float32),
     )
     return Q_proj
 

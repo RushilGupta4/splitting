@@ -93,7 +93,7 @@ def balanced_branch_counts_by_group(
     factors = torch.as_tensor(
         branching_factors_by_group,
         device=group_ids.device,
-        dtype=torch.float64,
+        dtype=torch.float32,
     ).reshape(-1)
     if factors.numel() != num_groups:
         raise ValueError("branching_factors_by_group must have length num_groups")
