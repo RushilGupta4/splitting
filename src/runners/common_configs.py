@@ -5,7 +5,7 @@ def crossfit_q_config(num_queries: int | None = None, losses=None) -> dict:
     only for runner-specific sweep overrides.
     """
     cfg = {
-        "sigma_modes": ["crossfit_q", "independent"],
+        "sigma_modes": ["crossfit_q"],
         "joint_m": 2.0,
     }
     if num_queries is not None:

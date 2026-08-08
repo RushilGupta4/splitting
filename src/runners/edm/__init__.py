@@ -5,4 +5,8 @@ EDM_RUNNER_CLASSES = {
     EDMGMM2DRunner.runner_name: EDMGMM2DRunner,
 }
 
-__all__ = ["EDMGMM2DRunner", "EDMRunner", "EDM_RUNNER_CLASSES"]
+__all__ = [
+    "EDMGMM2DRunner",
+    "EDMRunner",
+    "EDM_RUNNER_CLASSES",
+]

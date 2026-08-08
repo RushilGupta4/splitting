@@ -10,7 +10,7 @@ from runners.sde.spec import (
 
 R_RATE = 0.1
 SIGMA = 0.2
-GAMMA = 1.0
+GAMMA = 0.5
 INITIAL_MEAN = 40.0
 INITIAL_VARIANCE = 1.0
 EPS = 1e-12

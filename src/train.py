@@ -7,13 +7,13 @@ from runners.registry import get_runner_class, names
 
 def parse_args():
     bootstrap = argparse.ArgumentParser(add_help=False)
-    bootstrap.add_argument("--runner", default="ddpm_gmm2d")
+    bootstrap.add_argument("--runner", choices=names())
     known, _ = bootstrap.parse_known_args()
-    runner_cls = get_runner_class(known.runner)
 
     parser = argparse.ArgumentParser(description="Train a registered runner")
-    parser.add_argument("--runner", default="ddpm_gmm2d", choices=names())
-    runner_cls.add_train_args(parser)
+    parser.add_argument("--runner", required=True, choices=names())
+    if known.runner is not None:
+        get_runner_class(known.runner).add_train_args(parser)
     return parser.parse_args()
 
 

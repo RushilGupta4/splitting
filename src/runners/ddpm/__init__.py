@@ -1,15 +1,12 @@
-from runners.ddpm.gmm2d.runner import DDPMGMM2DRunner
-from runners.ddpm.mnist.runner import DDPMMNISTRunner
+from runners.ddpm.cifar10.runner import DDPMCIFAR10HFRunner
 from runners.ddpm.runner import DDPMRunner
 
 DDPM_RUNNER_CLASSES = {
-    DDPMGMM2DRunner.runner_name: DDPMGMM2DRunner,
-    DDPMMNISTRunner.runner_name: DDPMMNISTRunner,
+    DDPMCIFAR10HFRunner.runner_name: DDPMCIFAR10HFRunner,
 }
 
 __all__ = [
-    "DDPMGMM2DRunner",
-    "DDPMMNISTRunner",
+    "DDPMCIFAR10HFRunner",
     "DDPMRunner",
     "DDPM_RUNNER_CLASSES",
 ]

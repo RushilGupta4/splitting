@@ -5,6 +5,8 @@ import itertools
 import json
 import logging
 import os
+from decimal import Decimal, DecimalException, ROUND_FLOOR, localcontext
+from numbers import Real
 from typing import Any, Dict, List, Mapping
 
 import numpy as np
@@ -22,7 +24,15 @@ from adaptive import (
     run_estimate_and_sample,
 )
 from baselines import run_fixed_N_sampling, run_solver_baseline_sampling
-from ks import reference_ks_metric_cache_key
+from metrics import (
+    aggregate_cached_metric_rows,
+    metric_cache_key,
+    normalize_metric_params,
+    normalize_metrics,
+    prepare_metric_states,
+    uses_reference_samples,
+    validate_metric_dimensions,
+)
 from reference_cache import (
     load_reference_samples_for_runner,
     reference_samples_path_for_key,
@@ -36,6 +46,7 @@ from runners.base import (
     steps_for_budget,
 )
 from runners.registry import get_runner_class, names
+from runners.splitting import normalize_max_sampling_batch_size
 from trials import mean_vector, std_vector
 from utils import validate_split_percentages
 
@@ -56,6 +67,7 @@ CSV_FIELDS = [
     "step_schedule",
     "B",
     "B1",
+    "B1_spec",
     "sigma_mode",
     "crossfit_q_mlp_loss",
     "reuse",
@@ -65,6 +77,9 @@ CSV_FIELDS = [
     "solver_steps",
     "solver_params",
     "nfe_per_sample",
+    "mean_mmd",
+    "std_mmd",
+    "n_valid_mmd",
     "mean_ks",
     "std_ks",
     "n_valid_runs",
@@ -82,6 +97,7 @@ def parse_args():
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--n_runs", type=int, default=None)
     parser.add_argument("--n_parallel", type=int, default=None)
+    parser.add_argument("--crossfit_q_folds", type=int, default=None)
     parser.add_argument("--crossfit_q_mlp_run_parallelism", type=int, default=None)
     parser.add_argument(
         "--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu"
@@ -89,6 +105,130 @@ def parse_args():
     parser.add_argument("--no_compile", action="store_true")
     parser.add_argument("--debug", action="store_true")
     return parser.parse_args()
+
+
+def _canonical_decimal(value: Decimal) -> str:
+    if value == 0:
+        return "0"
+    return format(value.normalize(), "f")
+
+
+def _resolve_b1_entry(value, budget: int, *, config_key: str = "B1"):
+    """Resolve one absolute, ratio, or power-law B1 config entry."""
+    budget_value = int(budget)
+    if budget_value < 1:
+        raise ValueError(f"B must be positive, got {budget!r}")
+
+    if isinstance(value, str):
+        parts = [part.strip() for part in value.split(",")]
+        if len(parts) != 2 or not all(parts):
+            raise ValueError(
+                f"{config_key} power entry must have format 'C,alpha', got {value!r}"
+            )
+        try:
+            coefficient = Decimal(parts[0])
+            exponent = Decimal(parts[1])
+        except DecimalException as exc:
+            raise ValueError(
+                f"{config_key} power entry must contain decimal C and alpha, "
+                f"got {value!r}"
+            ) from exc
+        if not coefficient.is_finite() or coefficient <= 0:
+            raise ValueError(
+                f"{config_key} power coefficient C must be finite and > 0, "
+                f"got {parts[0]!r}"
+            )
+        if not exponent.is_finite() or not Decimal(0) <= exponent <= Decimal(1):
+            raise ValueError(
+                f"{config_key} power exponent alpha must be finite and in [0, 1], "
+                f"got {parts[1]!r}"
+            )
+        try:
+            with localcontext() as context:
+                context.prec = 50
+                decimal_budget = coefficient * (
+                    Decimal(budget_value) ** exponent
+                )
+        except DecimalException as exc:
+            raise ValueError(
+                f"could not resolve {config_key} power entry {value!r} for "
+                f"B={budget_value}"
+            ) from exc
+        if not decimal_budget.is_finite():
+            raise ValueError(
+                f"{config_key} power entry {value!r} is not finite for B={budget_value}"
+            )
+        resolved = int(decimal_budget.to_integral_value(rounding=ROUND_FLOOR))
+        if resolved < 1:
+            raise ValueError(
+                f"{config_key} power entry {value!r} resolves to {resolved} for "
+                f"B={budget_value}; increase C, alpha, or the budget"
+            )
+        spec = (
+            f"power:{_canonical_decimal(coefficient)},"
+            f"{_canonical_decimal(exponent)}"
+        )
+        return resolved, spec
+
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(
+            f"{config_key} entry must be a real number or 'C,alpha', got {value!r}"
+        )
+
+    decimal_value = Decimal(str(value))
+    if not decimal_value.is_finite():
+        raise ValueError(f"{config_key} entry must be finite, got {value!r}")
+    if decimal_value <= 0:
+        raise ValueError(f"{config_key} entry must be positive, got {value!r}")
+
+    if decimal_value < 1:
+        resolved = int(
+            (decimal_value * Decimal(budget_value)).to_integral_value(
+                rounding=ROUND_FLOOR
+            )
+        )
+        if resolved < 1:
+            raise ValueError(
+                f"{config_key} fraction {value!r} resolves to {resolved} for "
+                f"B={budget_value}; increase the fraction or budget"
+            )
+        return resolved, f"ratio:{_canonical_decimal(decimal_value)}"
+
+    if decimal_value != decimal_value.to_integral_value():
+        raise ValueError(
+            f"absolute {config_key} entry must be an integer, got {value!r}"
+        )
+    resolved = int(decimal_value)
+    return resolved, f"absolute:{resolved}"
+
+
+def _resolve_b1_for_budget(value, budget: int, *, config_key: str = "B1") -> int:
+    return _resolve_b1_entry(value, budget, config_key=config_key)[0]
+
+
+def _validate_b1_lists(cfg: Mapping[str, Any]) -> None:
+    for budget in cfg["B_list"]:
+        for config_key in ("B1_list", "free_B1_list"):
+            for value in cfg.get(config_key, []):
+                _resolve_b1_for_budget(value, int(budget), config_key=config_key)
+
+
+def _resolve_unique_b1_entries(values, budget: int, *, config_key: str):
+    entries = []
+    seen_specs = set()
+    for value in values:
+        resolved, spec = _resolve_b1_entry(value, budget, config_key=config_key)
+        if spec in seen_specs:
+            log.info(
+                "Skipping duplicate %s entry %s for B=%s",
+                config_key,
+                value,
+                budget,
+            )
+            continue
+        seen_specs.add(spec)
+        entries.append((resolved, spec))
+    return entries
 
 
 def _validate_config(cfg: dict, *, runner, config_name: str):
@@ -100,7 +240,6 @@ def _validate_config(cfg: dict, *, runner, config_name: str):
         "sigma_modes",
         "baselines",
         "split_percentages_list",
-        "num_base_samples",
         "n_runs",
     }
     missing = sorted(required - set(cfg))
@@ -114,7 +253,29 @@ def _validate_config(cfg: dict, *, runner, config_name: str):
     mode_spec = next(
         s for s in runner.comparison_modes() if s.name == cfg["comparison_mode"]
     )
-    if mode_spec.requires_reference_cache:
+    cfg["metrics"] = normalize_metrics(
+        cfg.get("metrics"), supported=getattr(runner, "supported_metrics", ("ks",))
+    )
+    validate_metric_dimensions(runner, cfg["metrics"])
+    cfg["metric_params"] = normalize_metric_params(cfg.get("metric_params"))
+    extra_metric_params = sorted(set(cfg["metric_params"]) - set(cfg["metrics"]))
+    if extra_metric_params:
+        raise ValueError(
+            f"metric_params configured for inactive metrics: {extra_metric_params}"
+        )
+    cfg["primary_metric"] = str(cfg.get("primary_metric", cfg["metrics"][0])).lower()
+    if cfg["primary_metric"] not in cfg["metrics"]:
+        raise ValueError("primary_metric must be one of metrics")
+    if "mmd" in cfg["metrics"] and not mode_spec.requires_reference_cache:
+        raise ValueError(
+            "mmd requires a comparison_mode backed by cached reference samples; "
+            f"comparison_mode {cfg['comparison_mode']!r} is analytic"
+        )
+    if mode_spec.requires_reference_cache and uses_reference_samples(cfg["metrics"]):
+        if "num_base_samples" not in cfg:
+            raise ValueError(
+                "num_base_samples is required when a metric uses cached reference samples"
+            )
         if "reference_generation_config" not in cfg:
             raise ValueError(
                 "reference_generation_config is required when comparison_mode "
@@ -125,6 +286,25 @@ def _validate_config(cfg: dict, *, runner, config_name: str):
                 cfg["comparison_mode"], cfg["reference_generation_config"]
             )
         )
+    cifar_reference_metrics = {"ks", "mmd"}.intersection(cfg["metrics"])
+    if (
+        cfg["comparison_mode"] == "cifar10_dataset_samples"
+        and cifar_reference_metrics
+    ):
+        if int(cfg.get("num_base_samples", 0)) != 50_000:
+            raise ValueError(
+                "CIFAR reference-sample metrics require num_base_samples=50000 "
+                "(the complete CIFAR-10 training distribution)"
+            )
+        reference_cfg = cfg.get("reference_generation_config") or {}
+        if (
+            reference_cfg.get("method") != "torchvision_cifar10"
+            or reference_cfg.get("split") != "train"
+        ):
+            raise ValueError(
+                "CIFAR reference-sample metrics require the torchvision "
+                "CIFAR-10 training set"
+            )
     sigma_modes = set(cfg["sigma_modes"])
     if not sigma_modes <= SUPPORTED_SIGMA_ESTIMATION_MODES:
         raise ValueError(
@@ -168,12 +348,14 @@ def _validate_config(cfg: dict, *, runner, config_name: str):
     cfg["optimization_modes"] = optimization_modes
     if "independent" in sigma_modes and int(cfg.get("independent_n2", 3)) < 2:
         raise ValueError("independent_n2 must be at least 2")
-    if any(int(b1) <= 0 for b1 in cfg.get("free_B1_list", [])):
-        raise ValueError("free_B1_list entries must be positive")
     if int(cfg["n_runs"]) < 1 or int(cfg.get("n_parallel", 1)) < 1:
         raise ValueError("n_runs and n_parallel must be at least 1")
+    cfg["max_sampling_batch_size"] = normalize_max_sampling_batch_size(
+        cfg.get("max_sampling_batch_size")
+    )
     if not cfg["B_list"]:
         raise ValueError("B_list must be non-empty")
+    _validate_b1_lists(cfg)
     if not cfg["sampling_configs"]:
         raise ValueError("sampling_configs must be non-empty")
     for sampling_config in iter_budget_resolved_sampling_configs(cfg):
@@ -238,6 +420,8 @@ def _apply_overrides(cfg: dict, args):
         cfg["n_parallel"] = int(args.n_parallel)
     else:
         cfg["n_parallel"] = int(cfg.get("n_parallel", 1))
+    if args.crossfit_q_folds is not None:
+        cfg["crossfit_q_folds"] = int(args.crossfit_q_folds)
     if args.crossfit_q_mlp_run_parallelism is not None:
         cfg["crossfit_q_mlp_run_parallelism"] = int(
             args.crossfit_q_mlp_run_parallelism
@@ -299,26 +483,38 @@ def _build_trial_specs(cfg, baselines):
     solver_baselines = [b for b in baselines if b["mode"] == "solver_baseline"]
 
     for resolved in iter_budget_resolved_sampling_config_specs(cfg):
+        resolved_B1_list = _resolve_unique_b1_entries(
+            B1_list, resolved.budget, config_key="B1_list"
+        )
+        resolved_free_B1_list = _resolve_unique_b1_entries(
+            free_B1_list, resolved.budget, config_key="free_B1_list"
+        )
         for sigma_mode in sigma_modes:
-            for B1, reuse, optimizer, mlp_loss in itertools.product(
-                B1_list,
+            for B1_entry, reuse, optimizer, mlp_loss in itertools.product(
+                resolved_B1_list,
                 reuse_flags,
                 optimization_modes,
                 _crossfit_q_loss_options_for_mode(cfg, sigma_mode),
             ):
-                if int(B1) >= int(resolved.budget):
-                    log.info("Skipping config with B1=%s >= B=%s", B1, resolved.budget)
+                B1, B1_spec = B1_entry
+                if B1 >= int(resolved.budget):
+                    log.info(
+                        "Skipping config with resolved B1=%s >= B=%s",
+                        B1,
+                        resolved.budget,
+                    )
                     continue
                 spec = {
                     "mode": "estimate_and_sample",
                     "B": int(resolved.budget),
-                    "B1": int(B1),
+                    "B1": B1,
                     "sampling_config": dict(resolved.sampling_config),
                     "step_schedule": str(resolved.step_schedule),
                     "sigma_estimation_mode": str(sigma_mode),
                     "optimization_mode": str(optimizer),
                     "reuse_phase1_samples": bool(reuse),
                     "free_B1": False,
+                    "B1_spec": B1_spec,
                 }
                 if mlp_loss is not None:
                     spec["crossfit_q_mlp_loss"] = str(mlp_loss)
@@ -327,21 +523,23 @@ def _build_trial_specs(cfg, baselines):
         # allowed. Pilot samples are never reused for KS — they only inform
         # the N_i estimate.
         for sigma_mode in sigma_modes:
-            for B1, optimizer, mlp_loss in itertools.product(
-                free_B1_list,
+            for B1_entry, optimizer, mlp_loss in itertools.product(
+                resolved_free_B1_list,
                 optimization_modes,
                 _crossfit_q_loss_options_for_mode(cfg, sigma_mode),
             ):
+                B1, B1_spec = B1_entry
                 spec = {
                     "mode": "estimate_and_sample",
                     "B": int(resolved.budget),
-                    "B1": int(B1),
+                    "B1": B1,
                     "sampling_config": dict(resolved.sampling_config),
                     "step_schedule": str(resolved.step_schedule),
                     "sigma_estimation_mode": str(sigma_mode),
                     "optimization_mode": str(optimizer),
                     "reuse_phase1_samples": False,
                     "free_B1": True,
+                    "B1_spec": B1_spec,
                 }
                 if mlp_loss is not None:
                     spec["crossfit_q_mlp_loss"] = str(mlp_loss)
@@ -390,6 +588,7 @@ def _run_trial(
         runner=runner,
         comparison_state=comparison_state,
         comparison_mode=cfg["comparison_mode"],
+        metrics=cfg["metrics"],
         B=int(spec["B"]),
         n_runs=n_runs,
         seed=seed,
@@ -397,6 +596,7 @@ def _run_trial(
         n_parallel=int(cfg["n_parallel"]),
         run_offset=run_offset,
         return_trial_results=return_trial_results,
+        max_sampling_batch_size=cfg.get("max_sampling_batch_size"),
     )
     if spec["mode"] == "solver_baseline":
         return run_solver_baseline_sampling(
@@ -582,6 +782,18 @@ def _canonical_spec_for_cache(spec: Mapping[str, Any], *, runner, split_percenta
                 "reuse_phase1_samples": bool(spec["reuse_phase1_samples"]),
             }
         )
+        B1_mode, B1_payload = str(spec["B1_spec"]).split(":", 1)
+        if B1_mode == "ratio":
+            # Retain the existing ratio cache shape for cache compatibility.
+            key["B1_ratio"] = float(B1_payload)
+        elif B1_mode == "power":
+            coefficient, exponent = B1_payload.split(",", 1)
+            key["B1_power"] = {
+                "C": coefficient,
+                "alpha": exponent,
+            }
+        elif B1_mode != "absolute":
+            raise ValueError(f"Unknown B1 spec mode {B1_mode!r}")
         optimization_mode = str(spec.get("optimization_mode", "monotone"))
         key["optimization_mode"] = optimization_mode
         if spec.get("free_B1"):
@@ -610,21 +822,22 @@ def _config_cache_key(
         "checkpoint": _file_identity(runner.checkpoint_path),
         "comparison_mode": cfg["comparison_mode"],
         "runner_target": _json_safe(runner.target_spec),
-        "reference_cache_key": _json_safe(
+        "metric_config": _json_safe(
+            metric_cache_key(runner, cfg["metrics"], cfg.get("metric_params") or {})
+        ),
+        "spec": _canonical_spec_for_cache(
+            spec, runner=runner, split_percentages=split_percentages
+        ),
+    }
+    if mode_spec.requires_reference_cache and uses_reference_samples(cfg["metrics"]):
+        key["reference_cache_key"] = _json_safe(
             dict(
                 reference_runner.reference_cache_key(
                     cfg["comparison_mode"], reference_generation_config
                 )
             )
-        ),
-        "num_base_samples": int(cfg["num_base_samples"]),
-        "spec": _canonical_spec_for_cache(
-            spec, runner=runner, split_percentages=split_percentages
-        ),
-    }
-    metric_key = reference_ks_metric_cache_key(int(runner.input_dim))
-    if metric_key is not None:
-        key["reference_ks_metric"] = _json_safe(metric_key)
+        )
+        key["num_base_samples"] = int(cfg["num_base_samples"])
     if spec["mode"] == "estimate_and_sample":
         sigma_mode = str(spec.get("sigma_estimation_mode"))
         key["grid_free_params"] = _json_safe(
@@ -652,7 +865,7 @@ def _config_cache_key(
         raise ValueError(
             f"Runner {runner.runner_name!r} does not support comparison_mode {cfg['comparison_mode']!r}"
         )
-    if mode_spec.requires_reference_cache:
+    if mode_spec.requires_reference_cache and uses_reference_samples(cfg["metrics"]):
         cache_path = reference_samples_path_for_key(
             reference_runner.checkpoint_path,
             reference_runner.reference_cache_key(
@@ -686,10 +899,19 @@ def _runs_jsonl_path(config_dir):
 
 
 def _trial_to_cache_record(spec, trial):
+    metrics = dict(trial.get("metrics") or {})
+    if "ks" not in metrics and "ks_distance" in trial:
+        metrics["ks"] = float(trial["ks_distance"])
     record = {
-        "ks_distance": float(trial["ks_distance"]),
+        "metrics": metrics,
         "extinct": bool(int(trial.get("leaf_count", 0)) == 0),
     }
+    if "ks" in metrics:
+        record["ks_distance"] = float(metrics["ks"])
+    if trial.get("metric_payloads"):
+        record["metric_payloads"] = trial["metric_payloads"]
+    if "leaf_count" in trial:
+        record["leaf_count"] = int(trial["leaf_count"])
     if spec["mode"] == "estimate_and_sample":
         record["N_i"] = [float(x) for x in trial["N_i"]]
         record["n0"] = int(trial["n0"])
@@ -736,9 +958,16 @@ def _build_comparison_states(base_runner, cfg):
         raise ValueError(
             f"Runner {base_runner.runner_name!r} does not support comparison_mode {mode!r}"
         )
-    if not mode_spec.requires_reference_cache:
+    if not mode_spec.requires_reference_cache or not uses_reference_samples(
+        cfg["metrics"]
+    ):
         return mode_spec, {
-            None: base_runner.prepare_comparison_state(comparison_mode=mode)
+            None: prepare_metric_states(
+                base_runner,
+                comparison_mode=mode,
+                metrics=cfg["metrics"],
+                metric_params=cfg.get("metric_params") or {},
+            )
         }
 
     reference_generation_config = base_runner.normalize_reference_generation_config(
@@ -751,8 +980,12 @@ def _build_comparison_states(base_runner, cfg):
         int(cfg["num_base_samples"]),
     )
     states: Dict[Any, Any] = {
-        None: base_runner.prepare_comparison_state(
-            comparison_mode=mode, reference_samples=samples
+        None: prepare_metric_states(
+            base_runner,
+            comparison_mode=mode,
+            reference_samples=samples,
+            metrics=cfg["metrics"],
+            metric_params=cfg.get("metric_params") or {},
         )
     }
     return mode_spec, states
@@ -769,18 +1002,9 @@ def _runner_for_spec(base_runner, spec):
     return base_runner.with_sampling_config(**spec["sampling_config"])
 
 
-def _aggregate_cached_runs(spec, trials, *, base_runner, split_percentages):
+def _aggregate_cached_runs(spec, trials, *, base_runner, split_percentages, cfg):
     runner = _runner_for_spec(base_runner, spec)
-    if not trials:
-        values = np.array([], dtype=float)
-    else:
-        values = np.array(
-            [t.get("ks_distance", np.nan) for t in trials],
-            dtype=float,
-        )
-    valid = values[~np.isnan(values)]
-    mean_ks = float(valid.mean()) if valid.size else float("nan")
-    std_ks = float(valid.std(ddof=1)) if valid.size > 1 else float("nan")
+    metric_summary = aggregate_cached_metric_rows(trials, cfg["metrics"])
     if spec["mode"] == "solver_baseline":
         nfe_per_sample = runner.solver_cost(
             spec["solver"], **spec.get("solver_kwargs", {})
@@ -799,6 +1023,7 @@ def _aggregate_cached_runs(spec, trials, *, base_runner, split_percentages):
         "step_schedule": str(spec.get("step_schedule", "default")),
         "B": int(spec["B"]),
         "B1": "",
+        "B1_spec": "",
         "sigma_mode": "",
         "crossfit_q_mlp_loss": "",
         "reuse": "",
@@ -808,9 +1033,8 @@ def _aggregate_cached_runs(spec, trials, *, base_runner, split_percentages):
         "solver_steps": int(solver_steps) if solver_steps != "" else "",
         "solver_params": solver_params,
         "nfe_per_sample": int(nfe_per_sample),
-        "mean_ks": mean_ks,
-        "std_ks": std_ks,
-        "n_valid_runs": int(valid.size),
+        "primary_metric": str(cfg.get("primary_metric", cfg["metrics"][0])),
+        **metric_summary,
         "N_i": [],
         "N_i_std": [],
     }
@@ -821,6 +1045,7 @@ def _aggregate_cached_runs(spec, trials, *, base_runner, split_percentages):
     return {
         **base,
         "B1": int(spec["B1"]),
+        "B1_spec": str(spec["B1_spec"]),
         "sigma_mode": str(spec["sigma_estimation_mode"]),
         "crossfit_q_mlp_loss": str(spec.get("crossfit_q_mlp_loss") or ""),
         "reuse": bool(spec["reuse_phase1_samples"]),
@@ -832,9 +1057,10 @@ def _aggregate_cached_runs(spec, trials, *, base_runner, split_percentages):
 
 
 def _sort_key(row):
-    mean_ks = row.get("mean_ks")
-    valid = mean_ks is not None and not (
-        isinstance(mean_ks, float) and np.isnan(mean_ks)
+    metric = row.get("primary_metric", "ks")
+    value = row.get(f"mean_{metric}")
+    valid = value is not None and not (
+        isinstance(value, float) and np.isnan(value)
     )
     return (
         int(row["B"]),
@@ -846,7 +1072,8 @@ def _sort_key(row):
         int(row.get("solver_steps") or 0),
         str(row.get("solver_params", "")),
         not valid,
-        mean_ks if valid else 0.0,
+        value if valid else 0.0,
+        str(row.get("B1_spec", "")),
         int(row["B1"] or 0),
         str(row.get("sigma_mode", "")),
         str(row.get("crossfit_q_mlp_loss", "")),
@@ -892,7 +1119,7 @@ def _run_split(args, cfg, base_runner, baselines, split_percentages):
             f"Runner {base_runner.runner_name!r} does not support comparison_mode {cfg['comparison_mode']!r}"
         )
     reference_generation_config = None
-    if mode_spec.requires_reference_cache:
+    if mode_spec.requires_reference_cache and uses_reference_samples(cfg["metrics"]):
         reference_generation_config = base_runner.normalize_reference_generation_config(
             cfg["comparison_mode"], cfg["reference_generation_config"]
         )
@@ -998,6 +1225,7 @@ def _run_split(args, cfg, base_runner, baselines, split_percentages):
                 trials,
                 base_runner=base_runner,
                 split_percentages=split_percentages,
+                cfg=cfg,
             )
         )
 
@@ -1008,9 +1236,11 @@ def _run_split(args, cfg, base_runner, baselines, split_percentages):
     print(f"Attempted {total_remaining} remaining runs")
 
     grouped: Dict[Any, Dict[str, Any]] = {}
+    primary_metric = str(cfg.get("primary_metric", cfg["metrics"][0]))
+    primary_field = f"mean_{primary_metric}"
     for r in records:
-        mean_ks = r.get("mean_ks")
-        if mean_ks is None or (isinstance(mean_ks, float) and np.isnan(mean_ks)):
+        value = r.get(primary_field)
+        if value is None or (isinstance(value, float) and np.isnan(value)):
             continue
         key = (
             int(r["B"]),
@@ -1018,12 +1248,12 @@ def _run_split(args, cfg, base_runner, baselines, split_percentages):
             str(r.get("sampling_params", "{}")),
             str(r.get("step_schedule", "default")),
         )
-        if key not in grouped or r["mean_ks"] < grouped[key]["mean_ks"]:
+        if key not in grouped or r[primary_field] < grouped[key][primary_field]:
             grouped[key] = r
     for (_, _, _, _), best in sorted(grouped.items()):
         print(
             f"  B={best['B']}, {_sampling_display(best)}: best={_method_display(best)} "
-            f"(B1={best.get('B1', '')}) mean ks={best['mean_ks']:.6f}"
+            f"(B1={best.get('B1', '')}) {primary_field}={best[primary_field]:.6f}"
         )
     return csv_output
 

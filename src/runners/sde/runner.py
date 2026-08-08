@@ -16,10 +16,34 @@ from ks import (
 from runners.base import BaseRunner, ComparisonModeSpec, SamplingConfig
 from runners.sde.cases import SDE_CASES
 from runners.sde.sampling import SDE_SAMPLERS, sample_sde_segment
-from runners.splitting import balanced_split_with_run_ids
+from runners.splitting import (
+    apply_to_run_batches,
+    balanced_branch_counts_by_group,
+    balanced_split_with_run_ids,
+    child_counts_by_run,
+    iter_child_parent_batches_by_run,
+    normalize_max_sampling_batch_size,
+    split_counts_by_run_batches,
+)
 from utils import validate_split_percentages
 
 SUPPORTED_SAMPLERS = SDE_SAMPLERS
+
+
+def _append_by_counts(parts_by_run, values: torch.Tensor, counts_by_run):
+    offset = 0
+    for run_idx, count in enumerate(counts_by_run):
+        count = int(count)
+        if count > 0:
+            parts_by_run[run_idx].append(values[offset : offset + count])
+        offset += count
+
+
+def _cat_parts_by_run(parts_by_run, empty_template: torch.Tensor):
+    return [
+        torch.cat(parts, dim=0) if parts else empty_template[:0]
+        for parts in parts_by_run
+    ]
 
 
 class SDERunner(BaseRunner):
@@ -61,24 +85,40 @@ class SDERunner(BaseRunner):
         dimension = int(dimension)
         if dimension < 1:
             raise ValueError("dimension must be at least 1")
+        case = SDE_CASES[self.case_name]
         if dimension > 1 and (sampler == "milstein" or reference_sampler == "milstein"):
             raise ValueError("Milstein sampler is only supported for dimension=1 for now")
+        if str(case.diffusion_structure) != "diagonal" and (
+            sampler == "milstein" or reference_sampler == "milstein"
+        ):
+            raise ValueError("Milstein sampler requires diagonal diffusion")
         if coupling_strength is not None and not math.isfinite(
             float(coupling_strength)
         ):
             raise ValueError("coupling_strength must be finite")
         if dimension == 1:
             effective_coupling = 0.0
+        elif case.mean_field_coupling_default is None:
+            effective_coupling = (
+                0.0 if coupling_strength is None else float(coupling_strength)
+            )
+            if effective_coupling != 0.0:
+                raise ValueError(
+                    f"{case.name} has native multivariate dynamics and does not "
+                    "support generic mean-field coupling"
+                )
         else:
             effective_coupling = (
-                0.25 if coupling_strength is None else float(coupling_strength)
+                float(case.mean_field_coupling_default)
+                if coupling_strength is None
+                else float(coupling_strength)
             )
             if effective_coupling <= 0.0:
                 raise ValueError(
                     "coupling_strength must be positive when dimension > 1"
                 )
 
-        self._case = SDE_CASES[self.case_name]
+        self._case = case
         self._sampler = str(sampler)
         self._sampling_steps = int(sampling_steps)
         self._terminal_time = float(terminal_time)
@@ -214,6 +254,15 @@ class SDERunner(BaseRunner):
             )
 
     def sample_prior(self, num_samples: int, *, generator=None) -> torch.Tensor:
+        if self._case.initial_sampler is not None:
+            values = self._case.initial_sampler(
+                num_samples=int(num_samples),
+                dimension=self._dimension,
+                device=self._device,
+                dtype=self._dtype,
+                generator=generator,
+            )
+            return self._coerce_sample_tensor(values, name="initial_samples")
         noise = torch.randn(
             (int(num_samples), self._dimension),
             device=self._device,
@@ -281,7 +330,10 @@ class SDERunner(BaseRunner):
         return values.to(device=self._device, dtype=self._dtype).contiguous()
 
     def postprocess_samples(self, native_samples: torch.Tensor) -> torch.Tensor:
-        return self._coerce_sample_tensor(native_samples, name="native_samples")
+        values = self._coerce_sample_tensor(native_samples, name="native_samples")
+        if self._case.terminal_transform is not None:
+            values = self._case.terminal_transform(values)
+        return self._coerce_sample_tensor(values, name="terminal_samples")
 
     def resolve_split_percentages(self, split_percentages: Sequence[float]):
         validate_split_percentages(split_percentages)
@@ -327,10 +379,9 @@ class SDERunner(BaseRunner):
     ) -> float:
         if not split_points:
             return self.segment_cost(self.start_time, self.end_time)
-        if len(split_factors) != len(split_points):
-            raise ValueError("split_factors must match split_points length")
-        starts = [self.start_time] + list(split_points)
-        ends = list(split_points) + [self.end_time]
+        points = list(split_points)
+        starts = [self.start_time] + points
+        ends = points + [self.end_time]
         cost = self.segment_cost(starts[0], ends[0])
         cumulative_split = 1.0
         for idx, split_factor in enumerate(split_factors):
@@ -345,6 +396,7 @@ class SDERunner(BaseRunner):
         split_points: Sequence[Any],
         split_factors_by_run: Sequence[Sequence[float]],
         generator=None,
+        max_sampling_batch_size=None,
     ):
         if len(n0_by_run) == 0:
             return [], [], 0.0
@@ -355,15 +407,64 @@ class SDERunner(BaseRunner):
         n0_tensor = torch.as_tensor(n0_by_run, device=self._device, dtype=torch.long)
         if torch.any(n0_tensor < 1):
             raise ValueError("all n0 values must be at least 1")
+        max_sampling_batch_size = normalize_max_sampling_batch_size(
+            max_sampling_batch_size
+        )
 
         split_points = [self._coerce_index(p, name="split_point") for p in split_points]
         num_runs = int(n0_tensor.numel())
+        realized_costs = torch.zeros(num_runs, device=self._device, dtype=torch.long)
+        sampling_start = time.perf_counter()
+
+        if max_sampling_batch_size is not None and not split_points:
+            parts_by_run = [[] for _ in range(num_runs)]
+            empty_template = self.postprocess_samples(self.sample_prior(0))
+            segment_cost = int(self.segment_cost(self.start_time, self.end_time))
+            for counts in split_counts_by_run_batches(
+                n0_by_run,
+                max_sampling_batch_size,
+            ):
+                total = int(sum(counts))
+                if total <= 0:
+                    continue
+                counts_tensor = torch.as_tensor(
+                    counts, device=self._device, dtype=torch.long
+                )
+                x = self.sample_prior(total, generator=generator)
+                realized_costs += counts_tensor * segment_cost
+                x = self.sample_segment(
+                    x, self.start_time, self.end_time, generator=generator
+                )
+                x = self.postprocess_samples(x)
+                empty_template = x
+                _append_by_counts(parts_by_run, x, counts)
+            sampling_time = time.perf_counter() - sampling_start
+            return (
+                _cat_parts_by_run(parts_by_run, empty_template),
+                realized_costs.detach().cpu().tolist(),
+                sampling_time,
+            )
+
         run_ids = torch.repeat_interleave(
             torch.arange(num_runs, device=self._device, dtype=torch.long), n0_tensor
         )
-        x = self.sample_prior(int(n0_tensor.sum().item()), generator=generator)
-        realized_costs = torch.zeros(num_runs, device=self._device, dtype=torch.long)
-        sampling_start = time.perf_counter()
+        if max_sampling_batch_size is None:
+            x = self.sample_prior(int(n0_tensor.sum().item()), generator=generator)
+        else:
+            initial_parts_by_run = [[] for _ in range(num_runs)]
+            for counts in split_counts_by_run_batches(
+                n0_by_run,
+                max_sampling_batch_size,
+            ):
+                total = int(sum(counts))
+                if total <= 0:
+                    continue
+                batch = self.sample_prior(total, generator=generator)
+                batch = self.sample_segment(
+                    batch, self.start_time, split_points[0], generator=generator
+                )
+                _append_by_counts(initial_parts_by_run, batch, counts)
+            x = torch.cat([torch.cat(parts, dim=0) for parts in initial_parts_by_run], dim=0)
 
         if not split_points:
             realized_costs += n0_tensor * int(
@@ -376,28 +477,78 @@ class SDERunner(BaseRunner):
             realized_costs += n0_tensor * int(
                 self.segment_cost(self.start_time, split_points[0])
             )
-            x = self.sample_segment(
-                x, self.start_time, split_points[0], generator=generator
-            )
-            split_factors_tensor = torch.as_tensor(
-                np.asarray(split_factors_by_run, dtype=float),
-                device=self._device,
-                dtype=x.dtype,
-            )
-            if split_factors_tensor.shape != (num_runs, len(split_points)):
-                raise ValueError("split_factors_by_run has incompatible shape")
-            for idx, split_point in enumerate(split_points):
-                x, run_ids = balanced_split_with_run_ids(
-                    x, run_ids, split_factors_tensor[:, idx], generator=generator
+            if max_sampling_batch_size is None:
+                x = self.sample_segment(
+                    x, self.start_time, split_points[0], generator=generator
                 )
+            split_factors_array = np.asarray(split_factors_by_run, dtype=float)
+            if not np.isfinite(split_factors_array).all() or np.any(
+                split_factors_array < 0.0
+            ):
+                raise ValueError("split_factors_by_run must contain finite nonnegative values")
+            if split_factors_array.shape != (num_runs, len(split_points)):
+                raise ValueError("split_factors_by_run has incompatible shape")
+            split_factors_tensor = torch.as_tensor(
+                split_factors_array,
+                device=self._device,
+                dtype=torch.float64,
+            )
+            for idx, split_point in enumerate(split_points):
                 end_t = (
                     split_points[idx + 1]
                     if idx + 1 < len(split_points)
                     else self.end_time
                 )
+                if max_sampling_batch_size is not None and idx + 1 == len(split_points):
+                    child_counts = balanced_branch_counts_by_group(
+                        run_ids,
+                        split_factors_tensor[:, idx],
+                        num_groups=num_runs,
+                        generator=generator,
+                    )
+                    counts = child_counts_by_run(
+                        run_ids,
+                        child_counts,
+                        num_runs=num_runs,
+                    )
+                    realized_costs += counts * int(self.segment_cost(split_point, end_t))
+                    parts_by_run = [[] for _ in range(num_runs)]
+                    empty_template = self.postprocess_samples(x[:0])
+                    for batch_parent_indices, batch_counts in iter_child_parent_batches_by_run(
+                        run_ids,
+                        child_counts,
+                        num_runs=num_runs,
+                        max_count_per_run=max_sampling_batch_size,
+                    ):
+                        if batch_parent_indices.numel() == 0:
+                            continue
+                        batch = x.index_select(0, batch_parent_indices)
+                        batch = self.sample_segment(
+                            batch, split_point, end_t, generator=generator
+                        )
+                        batch = self.postprocess_samples(batch)
+                        empty_template = batch
+                        _append_by_counts(parts_by_run, batch, batch_counts)
+                    sampling_time = time.perf_counter() - sampling_start
+                    return (
+                        _cat_parts_by_run(parts_by_run, empty_template),
+                        realized_costs.detach().cpu().tolist(),
+                        sampling_time,
+                    )
+                x, run_ids = balanced_split_with_run_ids(
+                    x, run_ids, split_factors_tensor[:, idx], generator=generator
+                )
                 counts = torch.bincount(run_ids, minlength=num_runs)
                 realized_costs += counts * int(self.segment_cost(split_point, end_t))
-                x = self.sample_segment(x, split_point, end_t, generator=generator)
+                x = apply_to_run_batches(
+                    x,
+                    run_ids,
+                    num_runs=num_runs,
+                    max_count_per_run=max_sampling_batch_size,
+                    fn=lambda batch, split_point=split_point, end_t=end_t: self.sample_segment(
+                        batch, split_point, end_t, generator=generator
+                    ),
+                )
 
         x = self.postprocess_samples(x)
         sampling_time = time.perf_counter() - sampling_start
@@ -432,6 +583,7 @@ class SDERunner(BaseRunner):
         chunk_size: int,
         n0: int,
         generator=None,
+        max_sampling_batch_size=None,
         **solver_kwargs,
     ):
         if solver not in SUPPORTED_SAMPLERS:
@@ -445,7 +597,31 @@ class SDERunner(BaseRunner):
                 solver_kwargs.get("terminal_time", self._terminal_time)
             ),
         )
+        max_sampling_batch_size = normalize_max_sampling_batch_size(
+            max_sampling_batch_size
+        )
         sampling_start = time.perf_counter()
+        if max_sampling_batch_size is not None:
+            counts_by_run = [int(n0)] * int(chunk_size)
+            parts_by_run = [[] for _ in range(int(chunk_size))]
+            empty_template = runner.postprocess_samples(runner.sample_prior(0))
+            for counts in split_counts_by_run_batches(
+                counts_by_run,
+                max_sampling_batch_size,
+            ):
+                total = int(sum(counts))
+                if total <= 0:
+                    continue
+                x = runner.sample_prior(total, generator=generator)
+                x = runner.sample_segment(
+                    x, runner.start_time, runner.end_time, generator=generator
+                )
+                x = runner.postprocess_samples(x).to(dtype=torch.float32)
+                empty_template = x
+                _append_by_counts(parts_by_run, x, counts)
+            sampling_time = time.perf_counter() - sampling_start
+            return _cat_parts_by_run(parts_by_run, empty_template), sampling_time
+
         x = runner.sample_prior(int(chunk_size) * int(n0), generator=generator)
         x = runner.sample_segment(
             x, runner.start_time, runner.end_time, generator=generator
@@ -586,8 +762,11 @@ class SDERunner(BaseRunner):
         *,
         comparison_mode: str,
         reference_samples=None,
+        metric_params=None,
     ):
         self._validate_mode(comparison_mode)
+        if metric_params:
+            raise ValueError("ks no longer accepts metric parameters")
         if reference_samples is None:
             raise ValueError(
                 f"comparison_mode={comparison_mode!r} requires reference_samples"
@@ -644,8 +823,17 @@ class SmoothThresholdAutoregressionRunner(SDERunner):
     config_module = "runners.sde.smooth_threshold_autoregression.configs"
 
 
+class CoupledDoubleWellLangevinRunner(SDERunner):
+    """SDE runner for coupled double-well overdamped Langevin dynamics."""
+
+    runner_name = "coupled_double_well_langevin"
+    case_name = "coupled_double_well_langevin"
+    config_module = "runners.sde.coupled_double_well_langevin.configs"
+
+
 SDE_RUNNER_CLASSES = {
     SimpleOURunner.runner_name: SimpleOURunner,
     CEVSecurityPriceRunner.runner_name: CEVSecurityPriceRunner,
     SmoothThresholdAutoregressionRunner.runner_name: SmoothThresholdAutoregressionRunner,
+    CoupledDoubleWellLangevinRunner.runner_name: CoupledDoubleWellLangevinRunner,
 }

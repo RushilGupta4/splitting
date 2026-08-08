@@ -3,11 +3,8 @@ import numpy as np
 from runners.common_configs import crossfit_q_config
 from runners.sde.sampling import SDE_SAMPLERS
 
-START_SPLITS, END_SPLITS = 4, 4
-SDE_SPLITS = [
-    np.round(np.arange(j, 0, -1) / (j + 1), 2).tolist()
-    for j in range(START_SPLITS, END_SPLITS + 1)
-]
+SPLIT_LISTS = [4, 9]
+SDE_SPLITS = [np.round(np.arange(j, 0, -1) / (j + 1), 2).tolist() for j in SPLIT_LISTS]
 
 
 def _sampling_configs() -> list[dict[str, str]]:
@@ -24,6 +21,7 @@ _EULER_CALIBRATED = {
     1_000_000: 280,
     2_000_000: 350,
     5_000_000: 475,
+    10_000_000: 600,
 }
 
 _MILSTEIN_CALIBRATED = {
@@ -41,7 +39,7 @@ _MILSTEIN_CALIBRATED = {
 
 SDE_SAMPLING_BASE = {
     "runner_defaults": {
-        "dimension": 50,
+        "dimension": 2,
     },
     "sampling_defaults": {
         "terminal_time": 1.0,
@@ -63,30 +61,31 @@ SDE_SAMPLING_BASE = {
         },
     },
     "B_list": [
-        # 10_000,
-        # 20_000,
-        # 50_000,
         100_000,
         200_000,
-        # 500_000,
-        # 1_000_000,
-        # 2_000_000,
-        # 5_000_000,
+        500_000,
+        1_000_000,
+        2_000_000,
+        5_000_000,
         # 10_000_000,
     ],
     "B1_list": [
-        # 2_000,
+        # 0.01,
+        # 0.02,
+        # 0.05,
+        "5,0.66",
+        # "10,0.66",
+        # "500,0.20",
+        # "500,0.1",
         # 5_000,
-        10_000,
-        25_000,
+        # 10_000,
+        # 25_000,
         # 50_000,
         # 75_000,
         # 100_000,
         # 150_000,
         # 200_000,
         # 250_000,
-        # 500_000,
-        # 750_000,
     ],
     "baselines": ["fixed_N"],
 }
@@ -96,10 +95,14 @@ SDE_METADATA_BASE = {
     "split_percentages_list": [list(split) for split in SDE_SPLITS],
     "optimization_modes": ["monotone_cvar95"],
     "crossfit_q_mlp_losses": ["mse"],
-    "num_base_samples": 500_000,
+    "num_base_samples": 2_500_000,
     "n_runs": 25,
     "n_parallel": 25,
 }
 
+SDE_MMD_SELECTION = {
+    "metrics": ["mmd"],
+    "primary_metric": "mmd",
+}
 
-__all__ = ["SDE_METADATA_BASE", "SDE_SAMPLING_BASE"]
+__all__ = ["SDE_MMD_SELECTION", "SDE_METADATA_BASE", "SDE_SAMPLING_BASE"]

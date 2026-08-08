@@ -6,6 +6,7 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 import torch
 
+from reference_cache import checkpoint_fingerprint
 from ks import (
     coerce_samples_np,
     compute_reference_ks_distance,
@@ -22,7 +23,15 @@ from runners.edm.sampling import (
     resolve_split_percentages as _resolve_split_percentages,
     sde_euler_maruyama_sample_segment,
 )
-from runners.splitting import balanced_split_with_run_ids
+from runners.splitting import (
+    apply_to_run_batches,
+    balanced_branch_counts_by_group,
+    balanced_split_with_run_ids,
+    child_counts_by_run,
+    iter_child_parent_batches_by_run,
+    normalize_max_sampling_batch_size,
+    split_counts_by_run_batches,
+)
 
 EDM_STOCHASTIC_DEFAULT_PARAMS = {
     "S_churn": 0.0,
@@ -42,6 +51,22 @@ SAMPLER_PARAM_DEFAULTS = {
     "sde_euler_maruyama": {},
 }
 FLAT_EDM_PARAM_KEYS = frozenset(EDM_STOCHASTIC_DEFAULT_PARAMS)
+
+
+def _append_by_counts(parts_by_run, values: torch.Tensor, counts_by_run):
+    offset = 0
+    for run_idx, count in enumerate(counts_by_run):
+        count = int(count)
+        if count > 0:
+            parts_by_run[run_idx].append(values[offset : offset + count])
+        offset += count
+
+
+def _cat_parts_by_run(parts_by_run, empty_template: torch.Tensor):
+    return [
+        torch.cat(parts, dim=0) if parts else empty_template[:0]
+        for parts in parts_by_run
+    ]
 
 
 class EDMRunner(BaseRunner):
@@ -99,11 +124,17 @@ class EDMRunner(BaseRunner):
         self._target_spec = dict(target_spec)
         self._data_mean = data_mean
         self._data_std = data_std
-        self._sampling_steps = int(sampling_steps)
+        schedule_config = self._normalize_schedule_config(
+            sampling_steps=sampling_steps,
+            sigma_min=sigma_min,
+            sigma_max=sigma_max,
+            rho=rho,
+        )
+        self._sampling_steps = schedule_config["sampling_steps"]
         self._sampler = sampler
-        self._sigma_min = float(sigma_min)
-        self._sigma_max = float(sigma_max)
-        self._rho = float(rho)
+        self._sigma_min = schedule_config["sigma_min"]
+        self._sigma_max = schedule_config["sigma_max"]
+        self._rho = schedule_config["rho"]
         self._sigma_data = float(sigma_data)
         self._device = str(device)
         self._checkpoint_path = checkpoint_path or type(self).default_checkpoint_path()
@@ -114,6 +145,37 @@ class EDMRunner(BaseRunner):
             rho=self._rho,
             device=self._device,
         )
+
+    @staticmethod
+    def _normalize_schedule_config(
+        *,
+        sampling_steps: int,
+        sigma_min: float,
+        sigma_max: float,
+        rho: float,
+    ) -> dict[str, int | float]:
+        normalized = {
+            "sampling_steps": int(sampling_steps),
+            "sigma_min": float(sigma_min),
+            "sigma_max": float(sigma_max),
+            "rho": float(rho),
+        }
+        if normalized["sampling_steps"] < 2:
+            raise ValueError("EDM sampling_steps must be at least 2")
+        schedule_values = (
+            normalized["sigma_min"],
+            normalized["sigma_max"],
+            normalized["rho"],
+        )
+        if not np.isfinite(schedule_values).all():
+            raise ValueError("EDM sigma_min, sigma_max, and rho must be finite")
+        if normalized["sigma_min"] <= 0.0:
+            raise ValueError("EDM sigma_min must be > 0")
+        if normalized["sigma_max"] <= normalized["sigma_min"]:
+            raise ValueError("EDM sigma_max must be > sigma_min")
+        if normalized["rho"] <= 0.0:
+            raise ValueError("EDM rho must be > 0")
+        return normalized
 
     @staticmethod
     def _normalize_sampler_params(
@@ -147,6 +209,8 @@ class EDMRunner(BaseRunner):
             )
 
         normalized = {key: float(value) for key, value in params.items()}
+        if normalized and not np.isfinite(tuple(normalized.values())).all():
+            raise ValueError("EDM sampler parameters must be finite")
         if sampler == "edm_stochastic":
             if normalized["S_churn"] < 0.0:
                 raise ValueError("S_churn must be >= 0")
@@ -395,8 +459,9 @@ class EDMRunner(BaseRunner):
         return float(total)
 
     def segment_costs(self, split_points: Sequence[Any]) -> list:
-        starts = [self.start_time] + [float(p) for p in split_points]
-        ends = [float(p) for p in split_points] + [self.end_time]
+        points = [float(p) for p in split_points]
+        starts = [self.start_time] + points
+        ends = points + [self.end_time]
         return [self.segment_cost(s, e) for s, e in zip(starts, ends)]
 
     def expected_cost_per_root(self, split_points, split_factors) -> float:
@@ -413,7 +478,13 @@ class EDMRunner(BaseRunner):
         return float(cost)
 
     def run_split_batch(
-        self, *, n0_by_run, split_points, split_factors_by_run, generator=None
+        self,
+        *,
+        n0_by_run,
+        split_points,
+        split_factors_by_run,
+        generator=None,
+        max_sampling_batch_size=None,
     ):
         if len(n0_by_run) == 0:
             return [], [], 0.0
@@ -424,15 +495,64 @@ class EDMRunner(BaseRunner):
         n0_tensor = torch.as_tensor(n0_by_run, device=self._device, dtype=torch.long)
         if torch.any(n0_tensor < 1):
             raise ValueError("all n0 values must be at least 1")
-        num_runs = int(n0_tensor.numel())
-        run_ids = torch.repeat_interleave(
-            torch.arange(num_runs, device=self._device), n0_tensor
+        max_sampling_batch_size = normalize_max_sampling_batch_size(
+            max_sampling_batch_size
         )
-        x = self.sample_prior(int(n0_tensor.sum().item()), generator=generator)
+        num_runs = int(n0_tensor.numel())
         realized_costs = torch.zeros(num_runs, device=self._device, dtype=torch.long)
         sampling_start = time.perf_counter()
 
         split_points = [float(p) for p in split_points]
+        if max_sampling_batch_size is not None and not split_points:
+            parts_by_run = [[] for _ in range(num_runs)]
+            empty_template = self.postprocess_samples(self.sample_prior(0))
+            segment_cost = int(self.segment_cost(self.start_time, self.end_time))
+            for counts in split_counts_by_run_batches(
+                n0_by_run,
+                max_sampling_batch_size,
+            ):
+                total = int(sum(counts))
+                if total <= 0:
+                    continue
+                counts_tensor = torch.as_tensor(
+                    counts, device=self._device, dtype=torch.long
+                )
+                x = self.sample_prior(total, generator=generator)
+                realized_costs += counts_tensor * segment_cost
+                x = self.sample_segment(
+                    x, self.start_time, self.end_time, generator=generator
+                )
+                x = self.postprocess_samples(x)
+                empty_template = x
+                _append_by_counts(parts_by_run, x, counts)
+            sampling_time = time.perf_counter() - sampling_start
+            return (
+                _cat_parts_by_run(parts_by_run, empty_template),
+                realized_costs.detach().cpu().tolist(),
+                sampling_time,
+            )
+
+        run_ids = torch.repeat_interleave(
+            torch.arange(num_runs, device=self._device), n0_tensor
+        )
+        if max_sampling_batch_size is None:
+            x = self.sample_prior(int(n0_tensor.sum().item()), generator=generator)
+        else:
+            initial_parts_by_run = [[] for _ in range(num_runs)]
+            for counts in split_counts_by_run_batches(
+                n0_by_run,
+                max_sampling_batch_size,
+            ):
+                total = int(sum(counts))
+                if total <= 0:
+                    continue
+                batch = self.sample_prior(total, generator=generator)
+                batch = self.sample_segment(
+                    batch, self.start_time, split_points[0], generator=generator
+                )
+                _append_by_counts(initial_parts_by_run, batch, counts)
+            x = torch.cat([torch.cat(parts, dim=0) for parts in initial_parts_by_run], dim=0)
+
         if not split_points:
             realized_costs += n0_tensor * int(
                 self.segment_cost(self.start_time, self.end_time)
@@ -444,28 +564,78 @@ class EDMRunner(BaseRunner):
             realized_costs += n0_tensor * int(
                 self.segment_cost(self.start_time, split_points[0])
             )
-            x = self.sample_segment(
-                x, self.start_time, split_points[0], generator=generator
-            )
-            split_factors_tensor = torch.as_tensor(
-                np.asarray(split_factors_by_run, dtype=float),
-                device=self._device,
-                dtype=x.dtype,
-            )
-            if split_factors_tensor.shape != (num_runs, len(split_points)):
-                raise ValueError("split_factors_by_run has incompatible shape")
-            for idx, split_point in enumerate(split_points):
-                x, run_ids = balanced_split_with_run_ids(
-                    x, run_ids, split_factors_tensor[:, idx], generator=generator
+            if max_sampling_batch_size is None:
+                x = self.sample_segment(
+                    x, self.start_time, split_points[0], generator=generator
                 )
+            split_factors_array = np.asarray(split_factors_by_run, dtype=float)
+            if not np.isfinite(split_factors_array).all() or np.any(
+                split_factors_array < 0.0
+            ):
+                raise ValueError("split_factors_by_run must contain finite nonnegative values")
+            if split_factors_array.shape != (num_runs, len(split_points)):
+                raise ValueError("split_factors_by_run has incompatible shape")
+            split_factors_tensor = torch.as_tensor(
+                split_factors_array,
+                device=self._device,
+                dtype=torch.float64,
+            )
+            for idx, split_point in enumerate(split_points):
                 end_t = (
                     split_points[idx + 1]
                     if idx + 1 < len(split_points)
                     else self.end_time
                 )
+                if max_sampling_batch_size is not None and idx + 1 == len(split_points):
+                    child_counts = balanced_branch_counts_by_group(
+                        run_ids,
+                        split_factors_tensor[:, idx],
+                        num_groups=num_runs,
+                        generator=generator,
+                    )
+                    counts = child_counts_by_run(
+                        run_ids,
+                        child_counts,
+                        num_runs=num_runs,
+                    )
+                    realized_costs += counts * int(self.segment_cost(split_point, end_t))
+                    parts_by_run = [[] for _ in range(num_runs)]
+                    empty_template = self.postprocess_samples(x[:0])
+                    for batch_parent_indices, batch_counts in iter_child_parent_batches_by_run(
+                        run_ids,
+                        child_counts,
+                        num_runs=num_runs,
+                        max_count_per_run=max_sampling_batch_size,
+                    ):
+                        if batch_parent_indices.numel() == 0:
+                            continue
+                        batch = x.index_select(0, batch_parent_indices)
+                        batch = self.sample_segment(
+                            batch, split_point, end_t, generator=generator
+                        )
+                        batch = self.postprocess_samples(batch)
+                        empty_template = batch
+                        _append_by_counts(parts_by_run, batch, batch_counts)
+                    sampling_time = time.perf_counter() - sampling_start
+                    return (
+                        _cat_parts_by_run(parts_by_run, empty_template),
+                        realized_costs.detach().cpu().tolist(),
+                        sampling_time,
+                    )
+                x, run_ids = balanced_split_with_run_ids(
+                    x, run_ids, split_factors_tensor[:, idx], generator=generator
+                )
                 counts = torch.bincount(run_ids, minlength=num_runs)
                 realized_costs += counts * int(self.segment_cost(split_point, end_t))
-                x = self.sample_segment(x, split_point, end_t, generator=generator)
+                x = apply_to_run_batches(
+                    x,
+                    run_ids,
+                    num_runs=num_runs,
+                    max_count_per_run=max_sampling_batch_size,
+                    fn=lambda batch, split_point=split_point, end_t=end_t: self.sample_segment(
+                        batch, split_point, end_t, generator=generator
+                    ),
+                )
 
         x = self.postprocess_samples(x)
         sampling_time = time.perf_counter() - sampling_start
@@ -602,6 +772,7 @@ class EDMRunner(BaseRunner):
         chunk_size: int,
         n0: int,
         generator=None,
+        max_sampling_batch_size=None,
         **solver_kwargs,
     ):
         self._validate_solver_kwargs(solver, solver_kwargs)
@@ -616,7 +787,31 @@ class EDMRunner(BaseRunner):
             rho=float(solver_kwargs.get("rho", self._rho)),
             sampler_params=sampler_params,
         )
+        max_sampling_batch_size = normalize_max_sampling_batch_size(
+            max_sampling_batch_size
+        )
         sampling_start = time.perf_counter()
+        if max_sampling_batch_size is not None:
+            counts_by_run = [int(n0)] * int(chunk_size)
+            parts_by_run = [[] for _ in range(int(chunk_size))]
+            empty_template = runner.postprocess_samples(runner.sample_prior(0))
+            for counts in split_counts_by_run_batches(
+                counts_by_run,
+                max_sampling_batch_size,
+            ):
+                total = int(sum(counts))
+                if total <= 0:
+                    continue
+                x = runner.sample_prior(total, generator=generator)
+                x = runner.sample_segment(
+                    x, runner.start_time, runner.end_time, generator=generator
+                )
+                x = runner.postprocess_samples(x).to(dtype=torch.float32)
+                empty_template = x
+                _append_by_counts(parts_by_run, x, counts)
+            sampling_time = time.perf_counter() - sampling_start
+            return _cat_parts_by_run(parts_by_run, empty_template), sampling_time
+
         x = runner.sample_prior(int(chunk_size) * int(n0), generator=generator)
         x = runner.sample_segment(
             x, runner.start_time, runner.end_time, generator=generator
@@ -671,7 +866,8 @@ class EDMRunner(BaseRunner):
             raise ValueError(
                 f"reference_generation_config missing required keys: {missing}"
             )
-        unknown = set(cfg) - required
+        allowed = required | {"seed"}
+        unknown = set(cfg) - allowed
         if unknown:
             raise ValueError(
                 f"Unknown reference_generation_config keys: {sorted(unknown)}"
@@ -682,22 +878,26 @@ class EDMRunner(BaseRunner):
                 f"Unknown EDM reference sampler {sampler!r}. "
                 f"Available: {tuple(type(self).supported_samplers)}"
             )
-        sampling_steps = int(cfg["sampling_steps"])
-        if sampling_steps < 1:
-            raise ValueError("sampling_steps must be at least 1")
+        schedule_config = self._normalize_schedule_config(
+            sampling_steps=cfg["sampling_steps"],
+            sigma_min=cfg["sigma_min"],
+            sigma_max=cfg["sigma_max"],
+            rho=cfg["rho"],
+        )
         sampler_params = self._normalize_sampler_params(
             sampler,
             sampler_params=dict(cfg["sampler_params"]),
             flat_edm_params={key: None for key in FLAT_EDM_PARAM_KEYS},
         )
+        seed = int(cfg.get("seed", 0))
+        if seed < 0:
+            raise ValueError("reference seed must be nonnegative")
         return {
             "method": "edm_samples",
             "sampler": sampler,
-            "sampling_steps": sampling_steps,
-            "sigma_min": float(cfg["sigma_min"]),
-            "sigma_max": float(cfg["sigma_max"]),
-            "rho": float(cfg["rho"]),
+            **schedule_config,
             "sampler_params": sampler_params,
+            "seed": seed,
         }
 
     def reference_cache_key(
@@ -716,6 +916,10 @@ class EDMRunner(BaseRunner):
         }
         if comparison_mode != "true_dist":
             base["reference_generation_config"] = dict(ref_cfg)
+        if comparison_mode == "edm_samples":
+            fingerprint = checkpoint_fingerprint(self._checkpoint_path)
+            if fingerprint is not None:
+                base["checkpoint_fingerprint"] = fingerprint
         return base
 
     def generate_reference_samples(
@@ -747,6 +951,14 @@ class EDMRunner(BaseRunner):
                 sampler_params=ref_cfg["sampler_params"],
             )
         batches = []
+        output = None
+        offset = 0
+        if comparison_mode == "edm_samples":
+            output = torch.empty(
+                (int(num_samples), ref_runner.input_dim),
+                dtype=torch.float32,
+                device="cpu",
+            )
         remaining = int(num_samples)
         with torch.inference_mode():
             while remaining > 0:
@@ -775,14 +987,34 @@ class EDMRunner(BaseRunner):
                         if progress is not None:
                             progress["finish_steps"]()
                     generated = ref_runner.postprocess_samples(generated)
-                batches.append(generated.cpu())
+                generated = generated.to(device="cpu", dtype=torch.float32)
+                if output is None:
+                    batches.append(generated)
+                else:
+                    if generated.shape != (current, ref_runner.input_dim):
+                        raise ValueError(
+                            "EDM reference generator returned unexpected shape "
+                            f"{tuple(generated.shape)}"
+                        )
+                    output[offset : offset + current].copy_(generated)
+                    offset += current
                 remaining -= current
                 if progress is not None:
                     progress["batch"](1)
+        if output is not None:
+            return output
         return torch.cat(batches, dim=0)
 
-    def prepare_comparison_state(self, *, comparison_mode: str, reference_samples=None):
+    def prepare_comparison_state(
+        self,
+        *,
+        comparison_mode: str,
+        reference_samples=None,
+        metric_params=None,
+    ):
         self._validate_mode(comparison_mode)
+        if metric_params:
+            raise ValueError("ks no longer accepts metric parameters")
         if comparison_mode == "true_dist":
             warm_ks_kernel_for_mode(comparison_mode, self._target_spec)
             return None

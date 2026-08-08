@@ -2,6 +2,8 @@ import hashlib
 import json
 import os
 import re
+import tempfile
+from functools import lru_cache
 from typing import Any, Mapping
 
 import torch
@@ -57,9 +59,23 @@ def _try_load(
     """Return truncated samples tensor or None on miss/mismatch/insufficient."""
     if not os.path.exists(path):
         return None
-    payload = torch.load(path, map_location="cpu")
-    samples = payload["samples"] if isinstance(payload, dict) else payload
-    samples = torch.as_tensor(samples)
+    try:
+        payload = torch.load(path, map_location="cpu", mmap=True)
+    except Exception:
+        try:
+            payload = torch.load(path, map_location="cpu")
+        except Exception:
+            return None
+    try:
+        if isinstance(payload, dict):
+            if "samples" not in payload:
+                return None
+            samples = payload["samples"]
+        else:
+            samples = payload
+        samples = torch.as_tensor(samples)
+    except Exception:
+        return None
     if samples.ndim != 2:
         return None
     if int(samples.shape[0]) < int(required_count):
@@ -99,6 +115,99 @@ def reference_is_sufficient(path: str, required_count: int) -> bool:
     return _try_load(path, required_count) is not None
 
 
+def load_reference_samples_if_sufficient(
+    path: str,
+    required_count: int,
+) -> torch.Tensor | None:
+    """Load a sufficient cache once, using mmap to avoid an eager full copy."""
+    return _try_load(path, required_count)
+
+
+def reference_preview_path(reference_path: str) -> str:
+    stem, _ = os.path.splitext(reference_path)
+    return f"{stem}_preview_5x5.png"
+
+
+@lru_cache(maxsize=32)
+def _fingerprint_file(real_path: str, size: int, mtime_ns: int) -> dict[str, object]:
+    del mtime_ns
+    digest = hashlib.sha256()
+    with open(real_path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return {
+        "size": int(size),
+        "sha256": digest.hexdigest(),
+    }
+
+
+def checkpoint_fingerprint(path: str | None) -> dict[str, object] | None:
+    """Return a process-cached content fingerprint for a local checkpoint."""
+    if path is None or not os.path.isfile(path):
+        return None
+    real_path = os.path.realpath(path)
+    stat = os.stat(real_path)
+    return _fingerprint_file(real_path, int(stat.st_size), int(stat.st_mtime_ns))
+
+
+def save_reference_preview(
+    reference_path: str,
+    samples: torch.Tensor,
+    *,
+    image_shape,
+) -> str:
+    """Atomically save the first 25 CIFAR samples as a 5x5 PNG grid."""
+    shape = tuple(int(v) for v in image_shape)
+    if shape != (3, 32, 32):
+        raise ValueError(
+            "Reference previews currently require CIFAR image_shape=(3, 32, 32), "
+            f"got {shape}"
+        )
+    values = torch.as_tensor(samples)
+    if values.ndim != 2 or int(values.shape[1]) != 3 * 32 * 32:
+        raise ValueError(
+            "CIFAR reference preview expects flattened samples with shape "
+            f"[N, 3072], got {tuple(values.shape)}"
+        )
+    if int(values.shape[0]) < 25:
+        raise ValueError(
+            f"CIFAR reference preview requires at least 25 samples, got {values.shape[0]}"
+        )
+    images = values[:25].to(dtype=torch.float32).reshape(25, 3, 32, 32)
+    if not torch.isfinite(images).all():
+        raise ValueError("CIFAR reference preview samples contain non-finite values")
+    if bool(torch.any(images < 0.0)) or bool(torch.any(images > 1.0)):
+        raise ValueError("CIFAR reference preview samples must lie in [0, 1]")
+
+    from torchvision.utils import save_image
+
+    path = reference_preview_path(reference_path)
+    parent = os.path.dirname(path) or "."
+    os.makedirs(parent, exist_ok=True)
+    handle = tempfile.NamedTemporaryFile(
+        prefix=f".{os.path.basename(path)}.",
+        suffix=".png",
+        dir=parent,
+        delete=False,
+    )
+    temp_path = handle.name
+    handle.close()
+    try:
+        save_image(
+            images,
+            temp_path,
+            nrow=5,
+            padding=2,
+            pad_value=1.0,
+            normalize=False,
+        )
+        os.replace(temp_path, path)
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+    return path
+
+
 def save_reference_samples_with_key(
     path: str,
     samples: torch.Tensor,
@@ -115,7 +224,21 @@ def save_reference_samples_with_key(
         "num_samples": int(samples.shape[0]),
         "samples": samples.cpu(),
     }
-    torch.save(payload, path)
+    directory = parent or "."
+    handle = tempfile.NamedTemporaryFile(
+        prefix=f".{os.path.basename(path)}.",
+        suffix=".tmp",
+        dir=directory,
+        delete=False,
+    )
+    temp_path = handle.name
+    handle.close()
+    try:
+        torch.save(payload, temp_path)
+        os.replace(temp_path, path)
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
 
 
 def load_reference_samples_for_runner(

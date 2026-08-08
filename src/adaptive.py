@@ -10,9 +10,12 @@ from tqdm import tqdm
 from numba import njit
 
 from runners.splitting import (
+    apply_to_run_batches,
     balanced_branch_counts_by_group,
     floor_split_total_count,
+    normalize_max_sampling_batch_size,
     repeat_by_counts,
+    split_counts_by_run_batches,
 )
 from ks import coerce_samples_np
 from trials import (
@@ -28,16 +31,17 @@ log = logging.getLogger(__name__)
 CROSSFIT_Q_DEFAULT_FOLDS = 1
 CROSSFIT_Q_DEFAULT_MLP_HIDDEN_DIMS = [128, 64]
 CROSSFIT_Q_DEFAULT_MLP_ACTIVATION = "silu"
-CROSSFIT_Q_DEFAULT_MLP_EPOCHS = 10
-CROSSFIT_Q_DEFAULT_MLP_BATCH_SIZE = 16392
-CROSSFIT_Q_DEFAULT_MLP_LR = 1e-3
+CROSSFIT_Q_DEFAULT_MLP_EPOCHS = 5
+CROSSFIT_Q_DEFAULT_MLP_BATCH_SIZE = 24000
+CROSSFIT_Q_DEFAULT_MLP_LR = 5e-3
 CROSSFIT_Q_DEFAULT_MLP_WEIGHT_DECAY = 3e-4
-CROSSFIT_Q_DEFAULT_MLP_LOSS = "bce"
+CROSSFIT_Q_DEFAULT_MLP_LOSS = "mse"
 CROSSFIT_Q_DEFAULT_MLP_DEVICE = "runner"
 CROSSFIT_Q_DEFAULT_MLP_NUM_THREADS = 2
-CROSSFIT_Q_DEFAULT_MLP_RUN_PARALLELISM = 5
+CROSSFIT_Q_DEFAULT_MLP_COMPILE = False
+CROSSFIT_Q_DEFAULT_MLP_RUN_PARALLELISM = 10
 CROSSFIT_Q_DEFAULT_NUM_QUERIES = 1024
-CROSSFIT_Q_DEFAULT_TAIL_EPS = 1e-3
+CROSSFIT_Q_DEFAULT_TAIL_EPS = 1e-4
 CROSSFIT_Q_DEFAULT_SUBSET_SIZES = [8, 16, 32, 64]
 CROSSFIT_Q_DEFAULT_MASS_MIN = 0.05
 CROSSFIT_Q_DEFAULT_MASS_MAX = 0.95
@@ -55,6 +59,7 @@ _DEFAULT_CROSSFIT_Q_MLP_PARAMS: Dict[str, Any] = {
     "loss": CROSSFIT_Q_DEFAULT_MLP_LOSS,
     "device": CROSSFIT_Q_DEFAULT_MLP_DEVICE,
     "num_threads": CROSSFIT_Q_DEFAULT_MLP_NUM_THREADS,
+    "compile": CROSSFIT_Q_DEFAULT_MLP_COMPILE,
 }
 
 _DEFAULT_GRID_FREE_PARAMS: Dict[str, Any] = {
@@ -71,9 +76,8 @@ _DEFAULT_PHASE1_QUERY_PARAMS: Dict[str, Any] = {
     "mass_bins": CROSSFIT_Q_DEFAULT_MASS_BINS,
 }
 
-_ALLOCATION_VARIANCE_PRIOR_STRENGTH = 8.0
-_ALLOCATION_SHARE_PRIOR_STRENGTH = 4.0
 _CROSSFIT_Q_MLP_INIT_LOCK = Lock()
+_CROSSFIT_Q_FEATURE_CACHE_CHUNK_SIZE = 262_144
 _MONOTONE_CVAR95_ALPHA = 0.95
 SUPPORTED_OPTIMIZATION_MODES = {"monotone", "monotone_cvar95"}
 
@@ -81,6 +85,80 @@ SUPPORTED_OPTIMIZATION_MODES = {"monotone", "monotone_cvar95"}
 def _debug(enabled: bool, message: str):
     if enabled:
         log.debug(message)
+
+
+def _append_by_counts(parts_by_run, values: torch.Tensor, counts_by_run):
+    offset = 0
+    for run_idx, count in enumerate(counts_by_run):
+        count = int(count)
+        if count > 0:
+            parts_by_run[run_idx].append(values[offset : offset + count])
+        offset += count
+
+
+def _sample_prior_by_run_batches(
+    runner,
+    counts_by_run,
+    *,
+    max_sampling_batch_size=None,
+    generator=None,
+):
+    max_sampling_batch_size = normalize_max_sampling_batch_size(max_sampling_batch_size)
+    counts_by_run = [int(count) for count in counts_by_run]
+    num_runs = len(counts_by_run)
+    if max_sampling_batch_size is None:
+        counts_tensor = torch.as_tensor(
+            counts_by_run, device=runner.device, dtype=torch.long
+        )
+        run_ids = torch.repeat_interleave(
+            torch.arange(num_runs, device=runner.device, dtype=torch.long),
+            counts_tensor,
+        )
+        return (
+            runner.sample_prior(int(sum(counts_by_run)), generator=generator),
+            run_ids,
+        )
+
+    parts_by_run = [[] for _ in range(num_runs)]
+    for counts in split_counts_by_run_batches(counts_by_run, max_sampling_batch_size):
+        total = int(sum(counts))
+        if total <= 0:
+            continue
+        x = runner.sample_prior(total, generator=generator)
+        _append_by_counts(parts_by_run, x, counts)
+    x_by_run = [torch.cat(parts, dim=0) for parts in parts_by_run]
+    counts_tensor = torch.as_tensor(
+        counts_by_run, device=runner.device, dtype=torch.long
+    )
+    run_ids = torch.repeat_interleave(
+        torch.arange(num_runs, device=runner.device, dtype=torch.long), counts_tensor
+    )
+    return torch.cat(x_by_run, dim=0), run_ids
+
+
+def _sample_segment_by_run_batches(
+    runner,
+    x: torch.Tensor,
+    run_ids: torch.Tensor,
+    *,
+    num_runs: int,
+    start_time,
+    end_time,
+    max_sampling_batch_size=None,
+    generator=None,
+):
+    return apply_to_run_batches(
+        x,
+        run_ids,
+        num_runs=int(num_runs),
+        max_count_per_run=max_sampling_batch_size,
+        fn=lambda batch: runner.sample_segment(
+            batch,
+            start_time,
+            end_time,
+            generator=generator,
+        ),
+    )
 
 
 # --- Joint-tree shape derivation --------------------------------------------
@@ -225,11 +303,14 @@ def _build_joint_tree_batch(
     joint_roots: int,
     split_points: Sequence[Any],
     joint_m: float,
+    max_sampling_batch_size=None,
     generator=None,
 ):
-    x = runner.sample_prior(chunk_size * joint_roots, generator=generator)
-    run_ids = torch.repeat_interleave(
-        torch.arange(chunk_size, device=runner.device, dtype=torch.long), joint_roots
+    x, run_ids = _sample_prior_by_run_batches(
+        runner,
+        [int(joint_roots)] * int(chunk_size),
+        max_sampling_batch_size=max_sampling_batch_size,
+        generator=generator,
     )
 
     child_counts_by_level: List[torch.Tensor] = []
@@ -254,7 +335,16 @@ def _build_joint_tree_batch(
         parent_run_ids_by_level.append(run_ids)
         x = repeat_by_counts(x, child_counts)
         run_ids = run_ids.repeat_interleave(child_counts, dim=0)
-        x = runner.sample_segment(x, start_t, end_t, generator=generator)
+        x = _sample_segment_by_run_batches(
+            runner,
+            x,
+            run_ids,
+            num_runs=chunk_size,
+            start_time=start_t,
+            end_time=end_t,
+            max_sampling_batch_size=max_sampling_batch_size,
+            generator=generator,
+        )
         used_B1_by_run = used_B1_by_run + torch.bincount(
             run_ids, minlength=chunk_size
         ) * int(runner.segment_cost(start_t, end_t))
@@ -727,69 +817,6 @@ def _normalize_query_weights(weights, count: int):
     return weights / total
 
 
-def _prepare_allocation_matrix(
-    variance2_per_level: np.ndarray,
-    tau2: np.ndarray,
-    *,
-    query_metadata: Mapping[str, Any] | None,
-):
-    M = np.maximum(variance2_per_level, 0.0).T.copy()
-    M[:, 0] += np.maximum(tau2, 0.0)
-    num_points, num_levels = M.shape
-    weights = _normalize_query_weights(
-        None if query_metadata is None else query_metadata.get("weights"), num_points
-    )
-    if query_metadata is None:
-        return M
-
-    empirical_mass = np.asarray(
-        query_metadata.get("empirical_mass"), dtype=float
-    ).reshape(-1)
-    target_mass = np.asarray(query_metadata.get("target_mass"), dtype=float).reshape(-1)
-    if empirical_mass.shape != (num_points,) or target_mass.shape != (num_points,):
-        raise ValueError("query mass metadata must match allocation matrix rows")
-    n_paths = int(query_metadata.get("n_paths", 0))
-    if n_paths < 1:
-        raise ValueError("query_metadata.n_paths must be positive")
-
-    empirical_mass = np.clip(empirical_mass, 0.0, 1.0)
-    target_mass = np.clip(target_mass, 1e-12, 1.0 - 1e-12)
-    prior = float(_ALLOCATION_VARIANCE_PRIOR_STRENGTH)
-    alpha = n_paths * empirical_mass + prior * target_mass
-    beta = n_paths * (1.0 - empirical_mass) + prior * (1.0 - target_mass)
-    posterior_total = (alpha * beta) / ((alpha + beta) * (alpha + beta + 1.0))
-    posterior_total = np.maximum(posterior_total, 0.0)
-
-    row_totals = M.sum(axis=1)
-    positive = row_totals > 0.0
-    if bool(np.any(positive)):
-        shares = np.zeros_like(M)
-        shares[positive] = M[positive] / row_totals[positive, None]
-        pooled = (weights[positive, None] * shares[positive]).sum(axis=0)
-        pooled_total = float(pooled.sum())
-        if pooled_total > 0.0:
-            pooled = pooled / pooled_total
-        else:
-            pooled = np.full(num_levels, 1.0 / num_levels, dtype=float)
-    else:
-        shares = np.full_like(M, 1.0 / num_levels)
-        pooled = np.full(num_levels, 1.0 / num_levels, dtype=float)
-    shares[~positive] = pooled
-    share_prior = float(_ALLOCATION_SHARE_PRIOR_STRENGTH)
-    if share_prior > 0.0:
-        data_weight = n_paths / (n_paths + share_prior)
-        shares = data_weight * shares + (1.0 - data_weight) * pooled.reshape(1, -1)
-    shares = np.maximum(shares, 0.0)
-    share_totals = shares.sum(axis=1)
-    shares = np.divide(
-        shares,
-        share_totals[:, None],
-        out=np.full_like(shares, 1.0 / num_levels),
-        where=share_totals[:, None] > 0.0,
-    )
-    return shares * posterior_total[:, None]
-
-
 def _solve_optimal_split_factors(
     variance2_per_level: np.ndarray,
     tau2: np.ndarray,
@@ -820,11 +847,8 @@ def _solve_optimal_split_factors(
         raise ValueError("cost_weights must be finite and positive")
     cost_w = cost_w / float(cost_w.sum())
 
-    M = _prepare_allocation_matrix(
-        variance2_per_level,
-        tau2,
-        query_metadata=query_metadata,
-    )
+    M = np.maximum(variance2_per_level, 0.0).T.copy()
+    M[:, 0] += np.maximum(tau2, 0.0)
     row_weights = _query_weights_for_allocation(query_metadata, M.shape[0])
     if optimization_mode == "monotone":
         simplex = _solve_frank_wolfe_monotone_allocation(M, cost_w=cost_w)
@@ -896,6 +920,7 @@ def _crossfit_q_normalize_mlp_params(params: Mapping[str, Any] | None):
     merged["loss"] = str(merged.get("loss", "bce")).lower()
     if merged["loss"] not in {"bce", "mse"}:
         raise ValueError("crossfit_q_mlp_params.loss must be bce or mse")
+    merged["compile"] = bool(merged.get("compile", False))
 
     merged["device"] = str(merged.get("device", "runner"))
 
@@ -1162,6 +1187,25 @@ def _crossfit_q_mlp_predict_all_levels_impl(
         return torch.cat([state_part, query_part, gathered, time_part], dim=1)
 
     input_dim = int(x_train.shape[2]) + int(q_features.shape[1]) + max_active + 1
+
+    def materialize_triple_features(states: torch.Tensor, paths_per_level: int):
+        pair_count = int(num_levels) * int(paths_per_level) * int(num_queries)
+        features = torch.empty(
+            (pair_count, input_dim),
+            device=device,
+            dtype=torch.float32,
+        )
+        chunk_size = int(_CROSSFIT_Q_FEATURE_CACHE_CHUNK_SIZE)
+        for start in range(0, pair_count, chunk_size):
+            end = min(start + chunk_size, pair_count)
+            pair_idx = torch.arange(start, end, device=device, dtype=torch.long)
+            features[start:end] = triple_features(states, pair_idx, paths_per_level)
+        return features
+
+    train_features = materialize_triple_features(x_train, train_paths)
+    train_targets = y_train.unsqueeze(0).expand(num_levels, -1, -1).reshape(-1, 1)
+    del x_train
+
     if seed is None:
         with _CROSSFIT_Q_MLP_INIT_LOCK:
             model = _crossfit_q_build_mlp(input_dim, 1, params).to(device=device)
@@ -1175,11 +1219,17 @@ def _crossfit_q_mlp_predict_all_levels_impl(
                 if device.type == "cuda":
                     torch.cuda.manual_seed_all(int(seed))
                 model = _crossfit_q_build_mlp(input_dim, 1, params).to(device=device)
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=float(params["lr"]),
-        weight_decay=float(params["weight_decay"]),
-    )
+    if bool(params.get("compile", False)):
+        if not hasattr(torch, "compile"):
+            raise RuntimeError("crossfit_q MLP compilation requires torch.compile")
+        model = torch.compile(model, dynamic=True, mode="reduce-overhead")
+    optimizer_params = {
+        "lr": float(params["lr"]),
+        "weight_decay": float(params["weight_decay"]),
+    }
+    if device.type == "cuda":
+        optimizer_params["fused"] = True
+    optimizer = torch.optim.AdamW(model.parameters(), **optimizer_params)
     pair_count = int(num_levels) * int(train_paths) * int(num_queries)
     batch_size = min(int(params["batch_size"]), int(pair_count))
     epochs = int(params["epochs"])
@@ -1198,32 +1248,30 @@ def _crossfit_q_mlp_predict_all_levels_impl(
         order = torch.randperm(pair_count, device=device, generator=gen)
         for start in range(0, int(order.numel()), batch_size):
             idx = order[start : start + batch_size]
-            xb = triple_features(x_train, idx, train_paths)
-            level_path_idx = torch.div(idx, num_queries, rounding_mode="floor")
-            query_idx = idx - level_path_idx * num_queries
-            path_idx = (
-                level_path_idx
-                - torch.div(level_path_idx, train_paths, rounding_mode="floor")
-                * train_paths
-            )
-            yb = y_train[path_idx, query_idx].reshape(-1, 1)
+            xb = train_features[idx]
+            yb = train_targets[idx]
             logits = model(xb)
             loss = supervised_loss(logits, yb)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
 
+    del train_features, train_targets
     model.eval()
     test_paths = int(x_test.shape[1])
     test_pair_count = int(num_levels) * int(test_paths) * int(num_queries)
+    test_features = materialize_triple_features(x_test, test_paths)
+    del x_test
     predictions_flat = np.empty(test_pair_count, dtype=np.float32)
     with torch.inference_mode():
         for start in range(0, test_pair_count, batch_size):
             end = min(start + batch_size, test_pair_count)
-            pair_idx = torch.arange(start, end, device=device, dtype=torch.long)
-            xb = triple_features(x_test, pair_idx, test_paths)
             predictions_flat[start:end] = (
-                torch.sigmoid(model(xb)).reshape(-1).detach().cpu().numpy()
+                torch.sigmoid(model(test_features[start:end]))
+                .reshape(-1)
+                .detach()
+                .cpu()
+                .numpy()
             )
     return predictions_flat.reshape(num_levels, test_paths, num_queries)
 
@@ -1468,23 +1516,35 @@ def _mass_grid(count: int, mass_min: float, mass_max: float):
     )
 
 
-def _sparse_query_weights(
-    subset_sizes: np.ndarray, target_mass: np.ndarray, mass_bins: int
+def _empirical_query_weights(
+    subset_sizes: np.ndarray, empirical_mass: np.ndarray, mass_bins: int
 ):
+    """Balance subset sizes, then occupied empirical-CDF bins within each size."""
     subset_sizes = np.asarray(subset_sizes, dtype=np.int64)
-    target_mass = np.asarray(target_mass, dtype=float)
-    if subset_sizes.ndim != 1 or target_mass.shape != subset_sizes.shape:
+    empirical_mass = np.asarray(empirical_mass, dtype=float)
+    if subset_sizes.ndim != 1 or empirical_mass.shape != subset_sizes.shape:
         raise ValueError("query weight metadata must be 1D with matching shapes")
-    bins = np.floor(np.clip(target_mass, 0.0, 1.0 - 1e-15) * int(mass_bins)).astype(int)
+    if not np.isfinite(empirical_mass).all():
+        raise ValueError("empirical query CDF masses must be finite")
+    mass_bins = int(mass_bins)
+    if mass_bins < 1:
+        raise ValueError("query weights require at least one mass bin")
+    bins = np.floor(
+        np.clip(empirical_mass, 0.0, 1.0 - 1e-15) * mass_bins
+    ).astype(int)
     bins = np.clip(bins, 0, int(mass_bins) - 1)
-    strata = list(zip(subset_sizes.tolist(), bins.tolist()))
-    unique = sorted(set(strata))
     weights = np.zeros(subset_sizes.shape[0], dtype=float)
-    if not unique:
+    unique_sizes = np.unique(subset_sizes)
+    if unique_sizes.size == 0:
         raise ValueError("query weights require at least one query")
-    for stratum in unique:
-        mask = np.array([item == stratum for item in strata], dtype=bool)
-        weights[mask] = 1.0 / (len(unique) * int(mask.sum()))
+    for subset_size in unique_sizes:
+        size_mask = subset_sizes == subset_size
+        occupied_bins = np.unique(bins[size_mask])
+        for mass_bin in occupied_bins:
+            mask = size_mask & (bins == mass_bin)
+            weights[mask] = 1.0 / (
+                int(unique_sizes.size) * int(occupied_bins.size) * int(mask.sum())
+            )
     weights /= float(weights.sum())
     return weights
 
@@ -1522,18 +1582,40 @@ def _generate_grid_free_queries(
         for mass in masses:
             dims = np.sort(rng.choice(dim, size=int(subset_size), replace=False))
             base_rank = float(mass) ** (1.0 / float(subset_size))
+            log_base = math.log(base_rank)
+            log_lower = math.log(eps) if eps > 0.0 else -math.inf
+            log_upper = math.log1p(-eps)
+            if not log_lower < log_base < log_upper:
+                raise ValueError(
+                    f"target mass {mass} is infeasible for subset_size={subset_size} "
+                    f"and tail_eps={eps}; require "
+                    "tail_eps**subset_size < target_mass < "
+                    "(1-tail_eps)**subset_size"
+                )
             if subset_size > 1 and float(phase1_query_params["rank_spread"]) > 0.0:
                 offsets = rng.normal(size=int(subset_size))
                 offsets = offsets - float(offsets.mean())
                 max_abs = float(np.max(np.abs(offsets)))
                 if max_abs > 0.0:
-                    offsets = (
-                        offsets / max_abs * float(phase1_query_params["rank_spread"])
-                    )
-                ranks = np.exp(np.log(base_rank) + offsets)
+                    scale = float(phase1_query_params["rank_spread"]) / max_abs
+                    max_offset = float(offsets.max())
+                    min_offset = float(offsets.min())
+                    if max_offset > 0.0:
+                        scale = min(scale, (log_upper - log_base) / max_offset)
+                    if min_offset < 0.0 and math.isfinite(log_lower):
+                        scale = min(scale, (log_base - log_lower) / -min_offset)
+                    offsets = offsets * max(0.0, scale * (1.0 - 1e-8))
+                ranks = np.exp(log_base + offsets)
             else:
                 ranks = np.full(int(subset_size), base_rank, dtype=float)
-            ranks = np.clip(ranks, eps, 1.0 - eps)
+            if np.any(ranks <= eps) or np.any(ranks >= 1.0 - eps):
+                raise ValueError("generated ranks violate the requested tail bounds")
+            rank_product = float(np.prod(ranks))
+            if abs(rank_product - float(mass)) > 1e-9 * max(1.0, float(mass)):
+                raise ValueError(
+                    f"generated rank product {rank_product} does not match "
+                    f"target mass {mass}"
+                )
             active_dims[query_idx, : int(subset_size)] = dims
             active_sizes[query_idx] = int(subset_size)
             target_mass[query_idx] = float(mass)
@@ -1547,9 +1629,6 @@ def _generate_grid_free_queries(
         raise RuntimeError(
             "internal query allocation did not produce requested query count"
         )
-    weights = _sparse_query_weights(
-        active_sizes, target_mass, int(phase1_query_params["mass_bins"])
-    )
     spec = {
         "kind": "sparse_subset_lower_orthant",
         "ambient_dim": int(dim),
@@ -1557,7 +1636,6 @@ def _generate_grid_free_queries(
         "active_dims": active_dims,
         "active_sizes": active_sizes,
         "target_mass": target_mass,
-        "query_weights": weights,
         "ranks": ranks_used,
     }
     return spec
@@ -1604,35 +1682,19 @@ def _query_metadata(query_spec, labels: np.ndarray, *, mass_bins: int):
     labels = np.asarray(labels, dtype=bool)
     if labels.ndim != 2:
         raise ValueError("query labels must be a 2D array")
-    empirical_mass = labels.mean(axis=0).astype(float)
+    if labels.shape[0] < 1:
+        raise ValueError("query metadata requires at least one path")
+    num_queries = labels.shape[1]
     if not isinstance(query_spec, Mapping):
         raise ValueError("query metadata requires sparse subset query specs")
-    target_mass = np.asarray(query_spec["target_mass"], dtype=float)
     subset_size = np.asarray(query_spec["active_sizes"], dtype=np.int64)
-    weights = np.asarray(query_spec["query_weights"], dtype=float)
-    if (
-        target_mass.shape != empirical_mass.shape
-        or subset_size.shape != empirical_mass.shape
-    ):
+    if subset_size.shape != (num_queries,):
         raise ValueError("query metadata and labels disagree on query count")
-    weights = np.asarray(weights, dtype=float).reshape(-1)
-    if (
-        weights.shape != empirical_mass.shape
-        or not np.isfinite(weights).all()
-        or np.any(weights < 0.0)
-    ):
-        weights = _sparse_query_weights(subset_size, target_mass, int(mass_bins))
-    total_weight = float(weights.sum())
-    if total_weight <= 0.0:
-        weights = np.full(
-            empirical_mass.shape[0], 1.0 / empirical_mass.shape[0], dtype=float
-        )
-    else:
-        weights = weights / total_weight
+    empirical_mass = labels.mean(axis=0).astype(float)
+    weights = _empirical_query_weights(subset_size, empirical_mass, int(mass_bins))
     return {
         "weights": weights,
         "empirical_mass": empirical_mass,
-        "target_mass": target_mass,
         "n_paths": int(labels.shape[0]),
     }
 
@@ -1643,16 +1705,31 @@ def _simulate_crossfit_q_trajectories(
     chunk_size: int,
     paths_per_run: int,
     split_points: Sequence[Any],
+    max_sampling_batch_size=None,
     generator=None,
 ):
     total_paths = int(chunk_size) * int(paths_per_run)
-    x = runner.sample_prior(total_paths, generator=generator)
+    x, run_ids = _sample_prior_by_run_batches(
+        runner,
+        [int(paths_per_run)] * int(chunk_size),
+        max_sampling_batch_size=max_sampling_batch_size,
+        generator=generator,
+    )
     start_points = [runner.start_time] + list(split_points)
     end_points = list(split_points) + [runner.end_time]
     states_by_level = []
     for start_t, end_t in zip(start_points, end_points):
         states_by_level.append(x.detach().reshape(total_paths, -1).clone())
-        x = runner.sample_segment(x, start_t, end_t, generator=generator)
+        x = _sample_segment_by_run_batches(
+            runner,
+            x,
+            run_ids,
+            num_runs=chunk_size,
+            start_time=start_t,
+            end_time=end_t,
+            max_sampling_batch_size=max_sampling_batch_size,
+            generator=generator,
+        )
 
     x0 = runner.postprocess_samples(x)
     states = (
@@ -1720,6 +1797,7 @@ def _run_joint_phase1_sampling_batch(
     reuse_phase1_samples,
     chunk_size,
     debug=False,
+    max_sampling_batch_size=None,
     generator=None,
 ):
     grid_free_params = _normalize_grid_free_params(grid_free_params)
@@ -1745,6 +1823,7 @@ def _run_joint_phase1_sampling_batch(
         joint_roots,
         split_points,
         joint_m,
+        max_sampling_batch_size=max_sampling_batch_size,
         generator=generator,
     )
     leaf_x0 = runner.postprocess_samples(leaf_x)
@@ -1798,6 +1877,7 @@ def _run_independent_phase1_sampling_batch(
     reuse_phase1_samples,
     chunk_size,
     debug=False,
+    max_sampling_batch_size=None,
     generator=None,
 ):
     grid_free_params = _normalize_grid_free_params(grid_free_params)
@@ -1830,25 +1910,63 @@ def _run_independent_phase1_sampling_batch(
         inner = int(spec["inner_count"])
         leaf_per_run = outer * middle * inner
 
-        root = runner.sample_prior(chunk_size * outer, generator=generator)
-        x_curr = runner.sample_segment(
-            root, runner.start_time, t_curr, generator=generator
+        root, root_run_ids = _sample_prior_by_run_batches(
+            runner,
+            [int(outer)] * int(chunk_size),
+            max_sampling_batch_size=max_sampling_batch_size,
+            generator=generator,
+        )
+        x_curr = _sample_segment_by_run_batches(
+            runner,
+            root,
+            root_run_ids,
+            num_runs=chunk_size,
+            start_time=runner.start_time,
+            end_time=t_curr,
+            max_sampling_batch_size=max_sampling_batch_size,
+            generator=generator,
+        )
+        middle_counts = torch.full(
+            (x_curr.shape[0],), middle, device=runner.device, dtype=torch.long
         )
         x_curr_rep = repeat_by_counts(
             x_curr,
-            torch.full(
-                (x_curr.shape[0],), middle, device=runner.device, dtype=torch.long
-            ),
+            middle_counts,
         )
-        x_next = runner.sample_segment(x_curr_rep, t_curr, t_next, generator=generator)
+        x_curr_rep_run_ids = root_run_ids.repeat_interleave(
+            middle_counts,
+            dim=0,
+        )
+        x_next = _sample_segment_by_run_batches(
+            runner,
+            x_curr_rep,
+            x_curr_rep_run_ids,
+            num_runs=chunk_size,
+            start_time=t_curr,
+            end_time=t_next,
+            max_sampling_batch_size=max_sampling_batch_size,
+            generator=generator,
+        )
+        inner_counts = torch.full(
+            (x_next.shape[0],), inner, device=runner.device, dtype=torch.long
+        )
         x_next_rep = repeat_by_counts(
             x_next,
-            torch.full(
-                (x_next.shape[0],), inner, device=runner.device, dtype=torch.long
-            ),
+            inner_counts,
         )
-        x_0 = runner.sample_segment(
-            x_next_rep, t_next, runner.end_time, generator=generator
+        x_next_rep_run_ids = x_curr_rep_run_ids.repeat_interleave(
+            inner_counts,
+            dim=0,
+        )
+        x_0 = _sample_segment_by_run_batches(
+            runner,
+            x_next_rep,
+            x_next_rep_run_ids,
+            num_runs=chunk_size,
+            start_time=t_next,
+            end_time=runner.end_time,
+            max_sampling_batch_size=max_sampling_batch_size,
+            generator=generator,
         )
         x_0 = runner.postprocess_samples(x_0)
         x0_by_run = list(torch.split(x_0, leaf_per_run))
@@ -1938,6 +2056,7 @@ def _run_crossfit_q_phase1_sampling_batch(
     reuse_phase1_samples,
     chunk_size,
     debug=False,
+    max_sampling_batch_size=None,
     generator=None,
 ):
     grid_free_params = _normalize_grid_free_params(grid_free_params)
@@ -1980,6 +2099,7 @@ def _run_crossfit_q_phase1_sampling_batch(
         chunk_size=chunk_size,
         paths_per_run=paths_per_run,
         split_points=split_points,
+        max_sampling_batch_size=max_sampling_batch_size,
         generator=generator,
     )
     phase1_x0_by_run: List[Any] = [None] * chunk_size
@@ -2186,6 +2306,7 @@ def run_estimate_and_sample(
     comparison_state: Any,
     *,
     comparison_mode: str,
+    metrics: Sequence[str] = ("ks",),
     B: int,
     B1: int,
     split_percentages,
@@ -2206,6 +2327,7 @@ def run_estimate_and_sample(
     n_parallel: int = 1,
     run_offset: int = 0,
     return_trial_results: bool = False,
+    max_sampling_batch_size=None,
 ):
     if B1 < 0 or (not free_pilot and B1 >= B):
         raise ValueError("require 0 <= B1, and B1 < B unless free_pilot")
@@ -2287,6 +2409,7 @@ def run_estimate_and_sample(
                 reuse_phase1_samples=reuse_phase1_samples,
                 chunk_size=chunk_size,
                 debug=debug,
+                max_sampling_batch_size=max_sampling_batch_size,
                 generator=make_torch_generator(run_seed, runner.device),
                 **phase1_extra,
             )
@@ -2310,9 +2433,9 @@ def run_estimate_and_sample(
     if any(t is None for t in trial_results):
         raise RuntimeError("Phase 1 allocation did not produce all trial results")
 
-    ks_workers = max(1, min(int(n_parallel), n_runs))
-    ks_futures: List[Tuple[int, Any]] = []
-    with ThreadPoolExecutor(max_workers=ks_workers) as ks_executor:
+    metric_workers = max(1, min(int(n_parallel), n_runs))
+    metric_futures: List[Tuple[int, Any]] = []
+    with ThreadPoolExecutor(max_workers=metric_workers) as metric_executor:
         for start, end in tqdm(chunks, desc="Phase 2", leave=False):
             chunk = trial_results[start:end]
             run_seed = (
@@ -2323,25 +2446,27 @@ def run_estimate_and_sample(
                 split_points=chunk[0]["split_points"],
                 split_factors_by_run=[t["N_i"] for t in chunk],
                 generator=make_torch_generator(run_seed, runner.device),
+                max_sampling_batch_size=max_sampling_batch_size,
             )
             submit_sampling_trial_result_futures(
-                executor=ks_executor,
-                futures=ks_futures,
+                executor=metric_executor,
+                futures=metric_futures,
                 run_indices=range(start, end),
                 samples_by_run=samples_by_run,
                 runner=runner,
                 comparison_mode=comparison_mode,
-                comparison_state=comparison_state,
+                metric_states=comparison_state,
+                metrics=metrics,
                 phase1_x0_samples_by_run=[t.get("phase1_x0_samples") for t in chunk],
             )
-        for run_idx, future in tqdm(ks_futures, desc="KS", leave=False):
+        for run_idx, future in tqdm(metric_futures, desc="Metrics", leave=False):
             trial_results[run_idx].update(future.result())
 
     result = {
         "mode": "estimate_and_sample",
         "B": int(B),
         "B1": int(B1),
-        **summarize_sampling_trials(trial_results),
+        **summarize_sampling_trials(trial_results, metrics),
     }
     if return_trial_results:
         result["trial_results"] = trial_results

@@ -37,6 +37,45 @@ def floor_split_total_count(num_parents: int, branching_factor: float) -> int:
     return int(math.floor(target))
 
 
+def normalize_max_sampling_batch_size(value):
+    if value in (None, "", "none", "None", "null", "Null"):
+        return None
+    value = int(value)
+    if value < 1:
+        raise ValueError("max_sampling_batch_size must be positive or null")
+    return value
+
+
+def _split_count_for_batch(total: int, batch_idx: int, num_batches: int) -> int:
+    total = int(total)
+    num_batches = int(num_batches)
+    base = total // num_batches
+    remainder = total - base * num_batches
+    return int(base + (int(batch_idx) < remainder))
+
+
+def split_counts_by_run_batches(counts_by_run, max_count_per_run):
+    max_count_per_run = normalize_max_sampling_batch_size(max_count_per_run)
+    counts = [int(count) for count in counts_by_run]
+    if any(count < 0 for count in counts):
+        raise ValueError("counts_by_run must be nonnegative")
+    if not counts:
+        return []
+    if max_count_per_run is None:
+        return [counts]
+    max_count = max(counts)
+    if max_count == 0:
+        return [counts]
+    num_batches = int(math.ceil(max_count / float(max_count_per_run)))
+    return [
+        [
+            _split_count_for_batch(count, batch_idx, num_batches)
+            for count in counts
+        ]
+        for batch_idx in range(num_batches)
+    ]
+
+
 def balanced_branch_counts(
     num_parents: int,
     branching_factor: float,
@@ -93,7 +132,7 @@ def balanced_branch_counts_by_group(
     factors = torch.as_tensor(
         branching_factors_by_group,
         device=group_ids.device,
-        dtype=torch.float32,
+        dtype=torch.float64,
     ).reshape(-1)
     if factors.numel() != num_groups:
         raise ValueError("branching_factors_by_group must have length num_groups")
@@ -113,6 +152,164 @@ def balanced_branch_counts_by_group(
         )
         counts[positions] = group_counts
     return counts
+
+
+def iter_run_id_batches(
+    run_ids: torch.Tensor,
+    num_runs: int,
+    max_count_per_run,
+):
+    max_count_per_run = normalize_max_sampling_batch_size(max_count_per_run)
+    run_ids = run_ids.to(dtype=torch.long)
+    num_runs = int(num_runs)
+    if run_ids.ndim != 1:
+        raise ValueError("run_ids must be 1D")
+    if num_runs < 1:
+        raise ValueError("num_runs must be positive")
+    if run_ids.numel() == 0:
+        yield torch.empty((0,), device=run_ids.device, dtype=torch.long)
+        return
+    if torch.any(run_ids < 0) or torch.any(run_ids >= num_runs):
+        raise ValueError("run_ids outside [0, num_runs)")
+
+    all_indices = torch.arange(run_ids.numel(), device=run_ids.device, dtype=torch.long)
+    if max_count_per_run is None:
+        yield all_indices
+        return
+
+    counts = torch.bincount(run_ids, minlength=num_runs).detach().cpu().tolist()
+    max_count = max(int(count) for count in counts)
+    if max_count <= max_count_per_run:
+        yield all_indices
+        return
+
+    num_batches = int(math.ceil(max_count / float(max_count_per_run)))
+    positions_by_run = [
+        torch.nonzero(run_ids == run_idx, as_tuple=False).flatten()
+        for run_idx in range(num_runs)
+    ]
+    for batch_idx in range(num_batches):
+        pieces = []
+        for positions in positions_by_run:
+            count = int(positions.numel())
+            start = batch_idx * (count // num_batches) + min(
+                batch_idx, count % num_batches
+            )
+            size = _split_count_for_batch(count, batch_idx, num_batches)
+            if size > 0:
+                pieces.append(positions[start : start + size])
+        if pieces:
+            yield torch.cat(pieces, dim=0)
+
+
+def child_counts_by_run(
+    run_ids: torch.Tensor,
+    child_counts: torch.Tensor,
+    *,
+    num_runs: int,
+):
+    run_ids = run_ids.to(dtype=torch.long)
+    child_counts = child_counts.to(device=run_ids.device, dtype=torch.long)
+    if run_ids.ndim != 1 or child_counts.ndim != 1:
+        raise ValueError("run_ids and child_counts must be 1D")
+    if run_ids.numel() != child_counts.numel():
+        raise ValueError("run_ids and child_counts must have the same length")
+    num_runs = int(num_runs)
+    if num_runs < 1:
+        raise ValueError("num_runs must be positive")
+    totals = torch.zeros(num_runs, device=run_ids.device, dtype=torch.long)
+    if run_ids.numel() > 0:
+        totals.index_add_(0, run_ids, child_counts)
+    return totals
+
+
+def iter_child_parent_batches_by_run(
+    run_ids: torch.Tensor,
+    child_counts: torch.Tensor,
+    *,
+    num_runs: int,
+    max_count_per_run,
+):
+    max_count_per_run = normalize_max_sampling_batch_size(max_count_per_run)
+    run_ids = run_ids.to(dtype=torch.long)
+    child_counts = child_counts.to(device=run_ids.device, dtype=torch.long)
+    num_runs = int(num_runs)
+    terminal_counts = child_counts_by_run(
+        run_ids,
+        child_counts,
+        num_runs=num_runs,
+    )
+    batch_counts_by_run = split_counts_by_run_batches(
+        terminal_counts.detach().cpu().tolist(),
+        max_count_per_run,
+    )
+    if not batch_counts_by_run:
+        return
+
+    parent_positions_by_run = []
+    child_counts_by_parent_run = []
+    for run_idx in range(num_runs):
+        positions = torch.nonzero(run_ids == run_idx, as_tuple=False).flatten()
+        parent_positions_by_run.append(positions.detach().cpu().tolist())
+        child_counts_by_parent_run.append(
+            child_counts.index_select(0, positions).detach().cpu().tolist()
+        )
+
+    offsets_by_run = [0] * num_runs
+    for batch_counts in batch_counts_by_run:
+        parent_indices = []
+        for run_idx, take in enumerate(batch_counts):
+            take = int(take)
+            if take <= 0:
+                continue
+            start = offsets_by_run[run_idx]
+            end = start + take
+            offsets_by_run[run_idx] = end
+            cursor = 0
+            for parent_idx, count in zip(
+                parent_positions_by_run[run_idx],
+                child_counts_by_parent_run[run_idx],
+            ):
+                count = int(count)
+                next_cursor = cursor + count
+                if next_cursor <= start:
+                    cursor = next_cursor
+                    continue
+                if cursor >= end:
+                    break
+                overlap_start = max(start, cursor)
+                overlap_end = min(end, next_cursor)
+                repeats = overlap_end - overlap_start
+                if repeats > 0:
+                    parent_indices.extend([int(parent_idx)] * int(repeats))
+                cursor = next_cursor
+        yield (
+            torch.as_tensor(parent_indices, device=run_ids.device, dtype=torch.long),
+            batch_counts,
+        )
+
+
+def apply_to_run_batches(
+    x: torch.Tensor,
+    run_ids: torch.Tensor,
+    *,
+    num_runs: int,
+    max_count_per_run,
+    fn,
+):
+    max_count_per_run = normalize_max_sampling_batch_size(max_count_per_run)
+    if x.shape[0] == 0 or max_count_per_run is None:
+        return fn(x)
+    out = torch.empty_like(x)
+    for batch_indices in iter_run_id_batches(
+        run_ids,
+        int(num_runs),
+        max_count_per_run,
+    ):
+        if batch_indices.numel() == 0:
+            continue
+        out.index_copy_(0, batch_indices, fn(x.index_select(0, batch_indices)))
+    return out
 
 
 def repeat_by_counts(x: torch.Tensor, counts: torch.Tensor):

@@ -1,15 +1,17 @@
-"""Generic DDPM/DDIM runner family implementation."""
+"""Generic ancestral-DDPM runner family implementation."""
 
 from __future__ import annotations
 
 import time
+from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import numpy as np
 import torch
 
+from reference_cache import checkpoint_fingerprint
 from runners.ddpm.sampling import (
-    DDIM,
+    DDPM,
     expected_cost_per_root as _diffusion_expected_cost_per_root,
     resolve_split_percentages as _diffusion_resolve_split_percentages,
     run_probabilistic_inference_batch,
@@ -31,8 +33,10 @@ from runners.base import (
     SamplingConfig,
 )
 
+DDPM_TIMESTEP_SPACINGS = frozenset({"leading", "linspace", "trailing"})
 
-def _ddim_kwargs_from_scheduler_config(config: Mapping[str, Any] | None):
+
+def _ddpm_kwargs_from_scheduler_config(config: Mapping[str, Any] | None):
     if not config:
         return {}
     supported = {
@@ -45,13 +49,28 @@ def _ddim_kwargs_from_scheduler_config(config: Mapping[str, Any] | None):
         "clip_sample_range",
         "prediction_type",
         "thresholding",
+        "dynamic_thresholding_ratio",
+        "sample_max_value",
         "timestep_spacing",
         "steps_offset",
         "rescale_betas_zero_snr",
     }
     kwargs = {key: config[key] for key in supported if key in config and config[key] is not None}
-    kwargs.pop("variance_type", None)
     return kwargs
+
+
+def resolved_hf_revision(pipe) -> str | None:
+    """Resolve a cached Hugging Face snapshot revision without network access."""
+    direct = getattr(pipe, "_commit_hash", None)
+    if direct:
+        return str(direct)
+    unet_config = getattr(getattr(pipe, "unet", None), "config", None)
+    source = getattr(unet_config, "_name_or_path", None)
+    if source:
+        snapshot = Path(str(source))
+        if snapshot.parent.name == "snapshots" and snapshot.name:
+            return snapshot.name
+    return None
 
 
 class DDPMRunner(BaseRunner):
@@ -77,8 +96,8 @@ class DDPMRunner(BaseRunner):
         data_std: torch.Tensor,
         T: int,
         sampling_steps: int,
-        eta: float,
-        sampler: str = "ddim",
+        sampler: str = "ddpm",
+        timestep_spacing: str | None = None,
         device: str,
         checkpoint_path: str | None = None,
     ):
@@ -94,17 +113,25 @@ class DDPMRunner(BaseRunner):
         self._data_std = data_std
         self._T = int(T)
         self._sampling_steps = int(sampling_steps)
-        self._eta = float(eta)
         self._sampler = sampler
         self._device = str(device)
         self._checkpoint_path = checkpoint_path or type(self).default_checkpoint_path()
         scheduler_config = dict(self._target_spec.get("scheduler_config") or {})
-        self._ddim = DDIM(
+        configured_T = scheduler_config.get("num_train_timesteps")
+        if configured_T is not None and int(configured_T) != self._T:
+            raise ValueError(
+                "DDPM T must match the checkpoint scheduler: "
+                f"{self._T} != {int(configured_T)}"
+            )
+        ddpm_kwargs = _ddpm_kwargs_from_scheduler_config(scheduler_config)
+        if timestep_spacing is not None:
+            ddpm_kwargs["timestep_spacing"] = str(timestep_spacing)
+        self._timestep_spacing = str(ddpm_kwargs.get("timestep_spacing", "leading"))
+        self._ddpm = DDPM(
             T=self._T,
             device=self._device,
-            eta=self._eta,
             sampling_steps=self._sampling_steps,
-            **_ddim_kwargs_from_scheduler_config(scheduler_config),
+            **ddpm_kwargs,
         )
 
     # ------------------------------------------------------------------
@@ -138,10 +165,15 @@ class DDPMRunner(BaseRunner):
         no_compile: bool = False,
         T: int | None = None,
         sampling_steps: int | None = None,
-        eta: float = 1.0,
-        sampler: str = "ddim",
+        sampler: str = "ddpm",
+        timestep_spacing: str | None = None,
         **kwargs,
     ) -> "DDPMRunner":
+        if kwargs:
+            raise ValueError(
+                f"{cls.__name__}.load_from_checkpoint got unknown keys: "
+                f"{sorted(kwargs)}"
+            )
         path = checkpoint_path or cls.default_checkpoint_path()
         model, target_spec, data_mean, data_std = cls.load_model_and_stats(
             path, device, no_compile=no_compile
@@ -158,14 +190,14 @@ class DDPMRunner(BaseRunner):
             data_std=data_std,
             T=int(T),
             sampling_steps=int(sampling_steps),
-            eta=float(eta),
             sampler=sampler,
+            timestep_spacing=timestep_spacing,
             device=device,
             checkpoint_path=path,
         )
 
     def with_sampling_config(self, **kwargs) -> "DDPMRunner":
-        allowed = {"sampler", "T", "sampling_steps", "eta"}
+        allowed = {"sampler", "T", "sampling_steps", "timestep_spacing"}
         unknown = set(kwargs) - allowed
         if unknown:
             raise ValueError(
@@ -174,8 +206,8 @@ class DDPMRunner(BaseRunner):
             )
         T = int(kwargs.get("T", self._T))
         sampling_steps = int(kwargs.get("sampling_steps", self._sampling_steps))
-        eta = float(kwargs.get("eta", self._eta))
         sampler = str(kwargs.get("sampler", self._sampler))
+        timestep_spacing = str(kwargs.get("timestep_spacing", self._timestep_spacing))
         return type(self)(
             model=self._model,
             target_spec=self._target_spec,
@@ -183,8 +215,8 @@ class DDPMRunner(BaseRunner):
             data_std=self._data_std,
             T=T,
             sampling_steps=sampling_steps,
-            eta=eta,
             sampler=sampler,
+            timestep_spacing=timestep_spacing,
             device=self._device,
             checkpoint_path=self._checkpoint_path,
         )
@@ -212,7 +244,7 @@ class DDPMRunner(BaseRunner):
                 "sampler": str(self._sampler),
                 "T": int(self._T),
                 "sampling_steps": int(self._sampling_steps),
-                "eta": float(self._eta),
+                "timestep_spacing": str(self._timestep_spacing),
             }
         )
 
@@ -241,8 +273,8 @@ class DDPMRunner(BaseRunner):
         return self._data_std
 
     @property
-    def ddim(self) -> DDIM:
-        return self._ddim
+    def ddpm(self) -> DDPM:
+        return self._ddpm
 
     # ------------------------------------------------------------------
     # Modes and KS distance
@@ -280,7 +312,7 @@ class DDPMRunner(BaseRunner):
         generator=None,
     ) -> torch.Tensor:
         return _diffusion_sample_segment(
-            self._ddim, self._model, x, int(start_time), int(end_time), generator=generator
+            self._ddpm, self._model, x, int(start_time), int(end_time), generator=generator
         )
 
     def postprocess_samples(self, native_samples: torch.Tensor) -> torch.Tensor:
@@ -295,13 +327,13 @@ class DDPMRunner(BaseRunner):
     # ------------------------------------------------------------------
 
     def resolve_split_percentages(self, split_percentages: Sequence[float]):
-        return _diffusion_resolve_split_percentages(self._ddim, split_percentages)
+        return _diffusion_resolve_split_percentages(self._ddpm, split_percentages)
 
     def segment_cost(self, start_time: Any, end_time: Any) -> float:
-        return float(self._ddim.segment_cost(int(start_time), int(end_time)))
+        return float(self._ddpm.segment_cost(int(start_time), int(end_time)))
 
     def segment_costs(self, split_points: Sequence[Any]) -> list:
-        return _diffusion_segment_costs(self._ddim, [int(p) for p in split_points])
+        return _diffusion_segment_costs(self._ddpm, split_points)
 
     def expected_cost_per_root(
         self,
@@ -310,7 +342,7 @@ class DDPMRunner(BaseRunner):
     ) -> float:
         return float(
             _diffusion_expected_cost_per_root(
-                self._ddim, [int(p) for p in split_points], [float(f) for f in split_factors]
+                self._ddpm, split_points, [float(f) for f in split_factors]
             )
         )
 
@@ -321,15 +353,17 @@ class DDPMRunner(BaseRunner):
         split_points: Sequence[Any],
         split_factors_by_run: Sequence[Sequence[float]],
         generator=None,
+        max_sampling_batch_size=None,
     ):
         return run_probabilistic_inference_batch(
             model=self._model,
-            ddim=self._ddim,
+            sampler=self._ddpm,
             n0_by_run=n0_by_run,
-            split_points=[int(p) for p in split_points],
+            split_points=split_points,
             split_factors_by_run=split_factors_by_run,
             postprocess_fn=self.postprocess_samples,
             generator=generator,
+            max_sampling_batch_size=max_sampling_batch_size,
         )
 
     # ------------------------------------------------------------------
@@ -398,6 +432,7 @@ class DDPMRunner(BaseRunner):
         chunk_size: int,
         n0: int,
         generator=None,
+        max_sampling_batch_size=None,
         **solver_kwargs,
     ):
         T = int(solver_kwargs.get("T", self._T))
@@ -407,18 +442,79 @@ class DDPMRunner(BaseRunner):
             model=self._model,
             postprocess_fn=self.postprocess_samples,
             solver=solver,
-            chunk_size=int(chunk_size),
-            n0=int(n0),
+            chunk_size=chunk_size,
+            n0=n0,
             T=T,
             sampling_steps=sampling_steps,
             eta=eta,
             device=self._device,
             generator=generator,
+            max_sampling_batch_size=max_sampling_batch_size,
         )
 
     # ------------------------------------------------------------------
     # Reference cache & comparison state
     # ------------------------------------------------------------------
+
+    def _normalize_ddpm_sample_reference_config(
+        self,
+        reference_generation_config: Mapping[str, Any] | None,
+        *,
+        method: str,
+    ) -> Mapping[str, Any]:
+        if reference_generation_config is None:
+            raise ValueError("reference_generation_config is required")
+        cfg = dict(reference_generation_config)
+        required = {"method", "sampler", "T", "sampling_steps"}
+        missing = sorted(required - set(cfg))
+        if missing:
+            raise ValueError(
+                f"reference_generation_config missing required keys: {missing}"
+            )
+        allowed = required | {"timestep_spacing", "seed"}
+        unknown = set(cfg) - allowed
+        if unknown:
+            raise ValueError(
+                f"Unknown reference_generation_config keys: {sorted(unknown)}"
+            )
+        if str(cfg["method"]) != method:
+            raise ValueError(
+                "reference_generation_config must set "
+                f"method={method!r}, got {cfg['method']!r}"
+            )
+        sampler = str(cfg["sampler"])
+        if sampler not in type(self).supported_samplers:
+            raise ValueError(
+                f"Unknown DDPM reference sampler {sampler!r}. "
+                f"Available: {tuple(type(self).supported_samplers)}"
+            )
+        T = int(cfg["T"])
+        sampling_steps = int(cfg["sampling_steps"])
+        if T < 1:
+            raise ValueError("DDPM reference T must be at least 1")
+        if sampling_steps < 1:
+            raise ValueError("DDPM reference sampling_steps must be at least 1")
+        if sampling_steps > T:
+            raise ValueError("DDPM reference sampling_steps cannot exceed T")
+        timestep_spacing = str(
+            cfg.get("timestep_spacing", self._timestep_spacing)
+        )
+        if timestep_spacing not in DDPM_TIMESTEP_SPACINGS:
+            raise ValueError(
+                f"Unknown DDPM timestep_spacing {timestep_spacing!r}. "
+                f"Available: {tuple(sorted(DDPM_TIMESTEP_SPACINGS))}"
+            )
+        seed = int(cfg.get("seed", 0))
+        if seed < 0:
+            raise ValueError("reference seed must be nonnegative")
+        return {
+            "method": method,
+            "sampler": sampler,
+            "T": T,
+            "sampling_steps": sampling_steps,
+            "timestep_spacing": timestep_spacing,
+            "seed": seed,
+        }
 
     def normalize_reference_generation_config(
         self,
@@ -447,38 +543,10 @@ class DDPMRunner(BaseRunner):
                 )
             return {"method": "target_samples"}
 
-        if method != "ddpm_samples":
-            raise ValueError(
-                f"{comparison_mode} reference_generation_config must set method='ddpm_samples'"
-            )
-        required = {"method", "sampler", "T", "sampling_steps", "eta"}
-        missing = sorted(required - set(cfg))
-        if missing:
-            raise ValueError(
-                f"reference_generation_config missing required keys: {missing}"
-            )
-        unknown = set(cfg) - required
-        if unknown:
-            raise ValueError(
-                f"Unknown reference_generation_config keys: {sorted(unknown)}"
-            )
-        sampler = str(cfg["sampler"])
-        if sampler not in type(self).supported_samplers:
-            raise ValueError(
-                f"Unknown DDPM reference sampler {sampler!r}. "
-                f"Available: {tuple(type(self).supported_samplers)}"
-            )
-        T = int(cfg["T"])
-        sampling_steps = int(cfg["sampling_steps"])
-        if T < 1 or sampling_steps < 1:
-            raise ValueError("T and sampling_steps must be at least 1")
-        return {
-            "method": "ddpm_samples",
-            "sampler": sampler,
-            "T": T,
-            "sampling_steps": sampling_steps,
-            "eta": float(cfg["eta"]),
-        }
+        return self._normalize_ddpm_sample_reference_config(
+            cfg,
+            method="ddpm_samples",
+        )
 
     def reference_cache_key(
         self,
@@ -495,12 +563,17 @@ class DDPMRunner(BaseRunner):
                 "comparison_mode": comparison_mode,
                 "target_spec": self._target_spec,
             }
-        return {
+        key = {
             "runner": self.runner_name,
             "comparison_mode": comparison_mode,
             "target_spec": self._target_spec,
             "reference_generation_config": dict(ref_cfg),
         }
+        if ref_cfg.get("method") in {"ddpm_samples", "hf_ddpm_scheduler"}:
+            fingerprint = checkpoint_fingerprint(self._checkpoint_path)
+            if fingerprint is not None:
+                key["checkpoint_fingerprint"] = fingerprint
+        return key
 
     def generate_reference_samples(
         self,
@@ -539,12 +612,37 @@ class DDPMRunner(BaseRunner):
             return torch.cat(batches, dim=0)
 
         # ddpm_samples
+        return self._generate_ddpm_model_reference(
+            ref_cfg,
+            num_samples=num_samples,
+            batch_size=batch_size,
+            generator=generator,
+            progress=progress,
+        )
+
+    def _generate_ddpm_model_reference(
+        self,
+        ref_cfg: Mapping[str, Any],
+        *,
+        num_samples: int,
+        batch_size: int,
+        generator=None,
+        progress=None,
+    ) -> torch.Tensor:
+        """Generate a preallocated CPU reference through the splitting sampler."""
         ref_runner = self.with_sampling_config(
             sampler=ref_cfg["sampler"],
             T=ref_cfg["T"],
             sampling_steps=ref_cfg["sampling_steps"],
-            eta=ref_cfg["eta"],
+            timestep_spacing=ref_cfg["timestep_spacing"],
         )
+        output = torch.empty(
+            (int(num_samples), ref_runner.input_dim),
+            dtype=torch.float32,
+            device="cpu",
+        )
+        offset = 0
+        remaining = int(num_samples)
         with torch.inference_mode():
             while remaining > 0:
                 current = min(batch_size, remaining)
@@ -553,13 +651,13 @@ class DDPMRunner(BaseRunner):
                 )
                 if progress is not None:
                     progress["start_steps"](
-                        len(ref_runner._ddim._segment_timesteps(ref_runner._ddim.T, 0))
+                        len(ref_runner._ddpm._segment_timesteps(ref_runner._ddpm.T, 0))
                     )
                 try:
-                    generated = ref_runner._ddim.sample_loop(
+                    generated = ref_runner._ddpm.sample_loop(
                         ref_runner._model,
                         x_T,
-                        ref_runner._ddim.T,
+                        ref_runner._ddpm.T,
                         0,
                         generator=generator,
                         progress_callback=None if progress is None else progress["step"],
@@ -567,20 +665,32 @@ class DDPMRunner(BaseRunner):
                 finally:
                     if progress is not None:
                         progress["finish_steps"]()
-                generated = ref_runner.postprocess_samples(generated)
-                batches.append(generated.cpu())
+                generated = ref_runner.postprocess_samples(generated).to(
+                    device="cpu",
+                    dtype=torch.float32,
+                )
+                if generated.shape != (current, ref_runner.input_dim):
+                    raise ValueError(
+                        "DDPM reference generator returned unexpected shape "
+                        f"{tuple(generated.shape)}"
+                    )
+                output[offset : offset + current].copy_(generated)
+                offset += current
                 remaining -= current
                 if progress is not None:
                     progress["batch"](1)
-        return torch.cat(batches, dim=0)
+        return output
 
     def prepare_comparison_state(
         self,
         *,
         comparison_mode: str,
         reference_samples=None,
+        metric_params=None,
     ):
         self._validate_mode(comparison_mode)
+        if metric_params:
+            raise ValueError("ks no longer accepts metric parameters")
         if comparison_mode == "true_dist":
             warm_ks_kernel_for_mode(comparison_mode, self._target_spec)
             return None

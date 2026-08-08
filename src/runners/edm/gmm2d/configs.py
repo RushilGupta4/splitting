@@ -10,11 +10,11 @@ _SAMPLING_DEFAULTS = {
 
 _N40_SCALE = {
     100_000: 40,
-    200_000: 44,
-    500_000: 49,
-    1_000_000: 53,
-    2_000_000: 57,
-    5_000_000: 62,
+    200_000: 45,
+    500_000: 55,
+    1_000_000: 63,
+    2_000_000: 73,
+    5_000_000: 87,
 }
 
 _SAMPLING_BASE = {
@@ -47,40 +47,56 @@ _SAMPLING_BASE = {
         100_000,
         200_000,
         500_000,
-        # 1_000_000,
-        # 2_000_000,
+        1_000_000,
+        2_000_000,
         # 5_000_000,
     ],
     "B1_list": [
-        # 5_000,
-        10_000,
-        25_000,
-        50_000,
+        # 0.01,
+        # 0.02,
+        # 0.05,
+        "10,0.66",
+        # "500,0.20",
+        # "500,0.1",
+        # 10_000,
+        # 25_000,
+        # 50_000,
         # 75_000,
-        # 100_000,
     ],
     "baselines": [
         "fixed_N",
-        "edm_stochastic_churn0",
-        "dpmpp_2s_churn2.5",
+        # "edm_stochastic_churn0",
+        # "dpmpp_2s_churn2.5",
     ],
 }
 
+_DEFAULT_CONFIG = {
+    **_SAMPLING_BASE,
+    **crossfit_q_config(),
+    "description": "Adaptive splitting vs deterministic EDM baselines on EDM (2D GMM)",
+    "comparison_mode": "true_samples",
+    "reference_generation_config": {
+        "method": "target_samples",
+    },
+    "split_percentages_list": [
+        [0.8, 0.6, 0.4, 0.2],
+        [0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1],
+    ],
+    "optimization_modes": ["monotone_cvar95"],
+    "crossfit_q_mlp_losses": ["mse"],
+    "num_base_samples": 5_000_000,
+    "n_runs": 50,
+}
+
 CONFIGS = {
-    "default": {
-        **_SAMPLING_BASE,
-        **crossfit_q_config(),
-        "description": "Adaptive splitting vs deterministic EDM baselines on EDM (2D GMM)",
-        "comparison_mode": "true_samples",
-        "reference_generation_config": {
-            "method": "target_samples",
-        },
-        "split_percentages_list": [
-            [0.8, 0.6, 0.4, 0.2],
-        ],
-        "optimization_modes": ["monotone", "monotone_cvar95"],
-        "crossfit_q_mlp_losses": ["bce", "mse"],
-        "num_base_samples": 5_000_000,
-        "n_runs": 50,
+    "default": _DEFAULT_CONFIG,
+    "mmd": {
+        **_DEFAULT_CONFIG,
+        "metrics": ["mmd"],
+        "primary_metric": "mmd",
+        "description": (
+            "Adaptive splitting with target-space MMD against target samples on EDM "
+            "(2D GMM)"
+        ),
     },
 }

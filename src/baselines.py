@@ -21,7 +21,8 @@ def _run_phase2_loop(
     *,
     runner,
     comparison_mode: str,
-    comparison_state: Any,
+    metric_states: Any,
+    metrics: Sequence[str],
     n_runs: int,
     n_parallel: int,
     seed: int | None,
@@ -51,7 +52,8 @@ def _run_phase2_loop(
                 samples_by_run=samples_by_run,
                 runner=runner,
                 comparison_mode=comparison_mode,
-                comparison_state=comparison_state,
+                metric_states=metric_states,
+                metrics=metrics,
             )
         collect_sampling_trial_result_futures(trial_results, futures)
     return trial_results
@@ -62,6 +64,7 @@ def run_solver_baseline_sampling(
     comparison_state: Any,
     *,
     comparison_mode: str,
+    metrics: Sequence[str] = ("ks",),
     solver: str,
     B: int,
     solver_kwargs: Mapping[str, Any] | None = None,
@@ -71,6 +74,7 @@ def run_solver_baseline_sampling(
     n_parallel: int = 1,
     run_offset: int = 0,
     return_trial_results: bool = False,
+    max_sampling_batch_size=None,
 ):
     solver_kwargs = dict(solver_kwargs or {})
     cost = float(runner.solver_cost(solver, **solver_kwargs))
@@ -88,6 +92,7 @@ def run_solver_baseline_sampling(
             chunk_size=chunk_size,
             n0=n0,
             generator=generator,
+            max_sampling_batch_size=max_sampling_batch_size,
             **solver_kwargs,
         )
         return samples
@@ -96,7 +101,8 @@ def run_solver_baseline_sampling(
         sample_batch,
         runner=runner,
         comparison_mode=comparison_mode,
-        comparison_state=comparison_state,
+        metric_states=comparison_state,
+        metrics=metrics,
         n_runs=n_runs,
         n_parallel=n_parallel,
         seed=seed,
@@ -105,7 +111,7 @@ def run_solver_baseline_sampling(
     result = {
         "mode": "solver_baseline",
         "B": int(B),
-        **summarize_sampling_trials(trial_results),
+        **summarize_sampling_trials(trial_results, metrics),
     }
     if return_trial_results:
         result["trial_results"] = trial_results
@@ -117,6 +123,7 @@ def run_fixed_N_sampling(
     comparison_state: Any,
     *,
     comparison_mode: str,
+    metrics: Sequence[str] = ("ks",),
     B: int,
     split_percentages: Sequence[float],
     N_i_list: Sequence[float],
@@ -126,6 +133,7 @@ def run_fixed_N_sampling(
     n_parallel: int = 1,
     run_offset: int = 0,
     return_trial_results: bool = False,
+    max_sampling_batch_size=None,
 ):
     if split_percentages:
         _, split_points = runner.resolve_split_percentages(split_percentages)
@@ -149,6 +157,7 @@ def run_fixed_N_sampling(
             split_points=split_points,
             split_factors_by_run=[split_factors] * chunk_size,
             generator=generator,
+            max_sampling_batch_size=max_sampling_batch_size,
         )
         return samples
 
@@ -156,7 +165,8 @@ def run_fixed_N_sampling(
         sample_batch,
         runner=runner,
         comparison_mode=comparison_mode,
-        comparison_state=comparison_state,
+        metric_states=comparison_state,
+        metrics=metrics,
         n_runs=n_runs,
         n_parallel=n_parallel,
         seed=seed,
@@ -165,7 +175,7 @@ def run_fixed_N_sampling(
     result = {
         "mode": "fixed_N",
         "B": int(B),
-        **summarize_sampling_trials(trial_results),
+        **summarize_sampling_trials(trial_results, metrics),
     }
     if return_trial_results:
         result["trial_results"] = trial_results

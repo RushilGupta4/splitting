@@ -7,8 +7,7 @@
 # cd $PBS_O_WORKDIR
 
 TRAIN_CONFIGS=(
-    "ddpm_gmm2d|cuda:1|--T 1000 --num_samples 1000000 --batch_size 50000 --epochs 200 --lr 1e-4 --hidden_dim 128 --num_blocks 4"
-    # "edm_gmm2d|cuda:1|--num_samples 1000000 --batch_size 50000 --epochs 200 --lr 1e-4 --hidden_dim 128 --num_blocks 4 --sampling_steps 50 --sigma_min 0.002 --sigma_max 80.0 --rho 7.0 --sigma_data 1.0 --P_mean -1.2 --P_std 1.2"
+    "edm_gmm2d|cuda:1|--num_samples 1000000 --batch_size 50000 --epochs 200 --lr 1e-4 --hidden_dim 128 --num_blocks 4 --sampling_steps 50 --sigma_min 0.002 --sigma_max 80.0 --rho 7.0 --sigma_data 1.0 --P_mean -1.2 --P_std 1.2"
 )
 
 for config in "${TRAIN_CONFIGS[@]}"

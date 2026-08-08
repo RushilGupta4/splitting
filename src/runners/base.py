@@ -317,6 +317,7 @@ def iter_budget_resolved_sampling_configs(cfg: Mapping[str, Any]):
 class BaseRunner(ABC):
     runner_name: str
     config_module: str | None = None
+    supported_metrics: Sequence[str] = ("ks", "mmd")
 
     @classmethod
     def runner_dir(cls) -> str:
@@ -513,6 +514,7 @@ class BaseRunner(ABC):
         split_points: Sequence[Any],
         split_factors_by_run: Sequence[Sequence[float]],
         generator=None,
+        max_sampling_batch_size=None,
     ):
         """Return (samples_by_run, realized_costs, sampling_time). Samples must be postprocessed."""
 
@@ -540,6 +542,7 @@ class BaseRunner(ABC):
         chunk_size: int,
         n0: int,
         generator=None,
+        max_sampling_batch_size=None,
         **solver_kwargs,
     ):
         """Return (samples_by_run, sampling_time). Samples must be postprocessed."""
@@ -579,6 +582,7 @@ class BaseRunner(ABC):
         *,
         comparison_mode: str,
         reference_samples=None,
+        metric_params: Mapping[str, Any] | None = None,
     ) -> Any:
         """Build KS comparison state. For true_dist this may return None."""
 

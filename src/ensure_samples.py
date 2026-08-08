@@ -1,13 +1,21 @@
 import argparse
 import logging
 import math
+import os
 
 import torch
 from tqdm import tqdm
 
+from metrics import (
+    normalize_metrics,
+    uses_reference_samples,
+    validate_metric_dimensions,
+)
 from reference_cache import (
-    reference_is_sufficient,
+    load_reference_samples_if_sufficient,
+    reference_preview_path,
     reference_samples_path_for_key,
+    save_reference_preview,
     save_reference_samples_with_key,
 )
 from runners.registry import get_runner_class, names
@@ -24,7 +32,7 @@ def parse_args():
     parser.add_argument(
         "--batch_size",
         type=int,
-        default=50000,
+        default=256,
         help="Sampling batch size used while building the reference cache",
     )
     parser.add_argument(
@@ -46,8 +54,26 @@ def _ensure_for_runner(
         raise ValueError("batch_size must be at least 1")
     cache_key = runner.reference_cache_key(comparison_mode, reference_generation_config)
     path = reference_samples_path_for_key(runner.checkpoint_path, cache_key)
-    if reference_is_sufficient(path, num_base_samples):
+    cached = load_reference_samples_if_sufficient(path, num_base_samples)
+    if cached is not None:
+        try:
+            _validate_cifar_model_reference(
+                runner,
+                reference_generation_config,
+                cached,
+                expected_count=num_base_samples,
+            )
+        except ValueError as exc:
+            log.warning("Ignoring invalid reference cache at %s: %s", path, exc)
+            cached = None
+    if cached is not None:
         log.info("Using existing reference samples at %s", path)
+        _ensure_cifar_preview(
+            runner,
+            reference_generation_config,
+            path,
+            cached,
+        )
         return
     log.info(
         "Building reference samples for runner=%s mode=%s -> %s",
@@ -95,17 +121,93 @@ def _ensure_for_runner(
             "finish_steps": finish_step_progress,
         }
         try:
+            seed = reference_generation_config.get("seed")
+            generator = None
+            if seed is not None:
+                generator = torch.Generator(device=torch.device(runner.device))
+                generator.manual_seed(int(seed))
             samples = runner.generate_reference_samples(
                 comparison_mode=comparison_mode,
                 reference_generation_config=reference_generation_config,
                 num_samples=num_base_samples,
                 batch_size=batch_size,
+                generator=generator,
                 progress=progress,
             )
         finally:
             finish_step_progress()
+    _validate_cifar_model_reference(
+        runner,
+        reference_generation_config,
+        samples,
+        expected_count=num_base_samples,
+    )
     save_reference_samples_with_key(path, samples, cache_key=cache_key)
     log.info("Saved %d reference samples to %s", samples.shape[0], path)
+    _ensure_cifar_preview(
+        runner,
+        reference_generation_config,
+        path,
+        samples,
+        force=True,
+    )
+
+
+def _ensure_cifar_preview(
+    runner,
+    reference_generation_config,
+    reference_path,
+    samples,
+    *,
+    force=False,
+):
+    method = str(reference_generation_config.get("method", ""))
+    if method not in {"hf_ddpm_scheduler", "edm_samples"}:
+        return
+    image_shape = runner.target_spec.get("image_shape")
+    if image_shape is None:
+        return
+    preview_path = reference_preview_path(reference_path)
+    if os.path.exists(preview_path) and not force:
+        return
+    saved = save_reference_preview(
+        reference_path,
+        samples,
+        image_shape=image_shape,
+    )
+    log.info("Saved 5x5 reference preview to %s", saved)
+
+
+def _validate_cifar_model_reference(
+    runner,
+    reference_generation_config,
+    samples,
+    *,
+    expected_count,
+):
+    method = str(reference_generation_config.get("method", ""))
+    if method not in {"hf_ddpm_scheduler", "edm_samples"}:
+        return
+    if tuple(int(v) for v in runner.target_spec.get("image_shape", ())) != (
+        3,
+        32,
+        32,
+    ):
+        return
+    values = torch.as_tensor(samples)
+    expected_shape = (int(expected_count), 3 * 32 * 32)
+    if tuple(values.shape) != expected_shape:
+        raise ValueError(
+            f"expected CIFAR reference shape {expected_shape}, got {tuple(values.shape)}"
+        )
+    if not bool(torch.isfinite(values).all()):
+        raise ValueError("CIFAR reference contains non-finite values")
+    minimum, maximum = torch.aminmax(values)
+    if float(minimum) < 0.0 or float(maximum) > 1.0:
+        raise ValueError(
+            "CIFAR reference must lie in [0, 1], got range "
+            f"[{float(minimum)}, {float(maximum)}]"
+        )
 
 
 def main():
@@ -119,11 +221,21 @@ def main():
 
     runner_cls = get_runner_class(args.runner)
     cfg = runner_cls.get_config(args.config)
+    metrics = normalize_metrics(
+        cfg.get("metrics"), supported=getattr(runner_cls, "supported_metrics", ("ks",))
+    )
+    if not uses_reference_samples(metrics):
+        log.info(
+            "config metrics=%s do not require cached reference samples; nothing to do",
+            metrics,
+        )
+        return
     base_runner = runner_cls.load_from_checkpoint(
         device=args.device,
         no_compile=args.no_compile,
         **dict(cfg.get("runner_defaults") or {}),
     )
+    validate_metric_dimensions(base_runner, metrics)
     comparison_mode = cfg["comparison_mode"]
 
     mode_spec = next(

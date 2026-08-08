@@ -9,6 +9,8 @@ import torch
 
 TensorFn = Callable[[float, torch.Tensor], torch.Tensor]
 TargetSpecFactory = Callable[[float, int, float], dict[str, Any]]
+InitialSampler = Callable[..., torch.Tensor]
+TensorTransform = Callable[[torch.Tensor], torch.Tensor]
 
 
 @dataclass(frozen=True)
@@ -22,6 +24,10 @@ class SDECase:
     diffusion: TensorFn
     diffusion_derivative: TensorFn
     target_spec_factory: TargetSpecFactory
+    diffusion_structure: str = "diagonal"
+    initial_sampler: InitialSampler | None = None
+    terminal_transform: TensorTransform | None = None
+    mean_field_coupling_default: float | None = 0.25
 
 
 def normal_initial_spec(mean: float, variance: float) -> dict[str, Any]:
