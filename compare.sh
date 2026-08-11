@@ -8,7 +8,7 @@ BASE_DIRS=(outputs_paper)
 
 CONFIGS=(
 
-    "edm_default|edm_gmm2d|default|cuda:1|50000"
+    "edm_default|edm_gmm2d|default|cuda:0|50000"
     "simple_ou|simple_ou|default|cuda:0|1000000"
     "coupled_double_well_langevin|coupled_double_well_langevin|default|cuda:1|1000000"
 
@@ -17,7 +17,7 @@ CONFIGS=(
     # "ddpm_cifar10_hf_mmd|ddpm_cifar10_hf|mmd|cuda:1|5000"
 )
 N_PARALLEL=25
-N_RUNS=50
+N_RUNS=1000
 CI_LEVEL=0.95
 DEBUG=0
 
