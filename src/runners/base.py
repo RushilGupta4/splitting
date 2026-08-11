@@ -8,7 +8,17 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
+import numpy as np
 import torch
+
+from metrics.ks import (
+    compute_reference_ks_distance,
+    compute_target_ks_distance,
+    prepare_reference_cdf_state,
+    warm_ks_kernel_for_mode,
+    warm_reference_ks_kernel,
+)
+from metrics.utils import coerce_samples_np
 
 
 @dataclass(frozen=True)
@@ -467,6 +477,17 @@ class BaseRunner(ABC):
     def comparison_modes(self) -> Sequence[ComparisonModeSpec]:
         """Return modes supported by this runner."""
 
+    def comparison_mode_spec(self, comparison_mode: str) -> ComparisonModeSpec:
+        """Resolve one supported comparison mode or raise a stable error."""
+        specs = {spec.name: spec for spec in self.comparison_modes()}
+        try:
+            return specs[comparison_mode]
+        except KeyError as exc:
+            raise ValueError(
+                f"Unknown comparison_mode {comparison_mode!r}. "
+                f"Available: {sorted(specs)}"
+            ) from exc
+
     @abstractmethod
     def sample_prior(self, num_samples: int, *, generator=None) -> torch.Tensor:
         """Sample native initial noise/state at start_time."""
@@ -576,7 +597,6 @@ class BaseRunner(ABC):
     ) -> torch.Tensor:
         """Generate or load raw reference samples for modes that need cached samples."""
 
-    @abstractmethod
     def prepare_comparison_state(
         self,
         *,
@@ -584,9 +604,21 @@ class BaseRunner(ABC):
         reference_samples=None,
         metric_params: Mapping[str, Any] | None = None,
     ) -> Any:
-        """Build KS comparison state. For true_dist this may return None."""
+        """Build the default analytic or reference-backed KS state."""
+        mode_spec = self.comparison_mode_spec(comparison_mode)
+        if metric_params:
+            raise ValueError("ks no longer accepts metric parameters")
+        if not mode_spec.requires_reference_cache:
+            warm_ks_kernel_for_mode(comparison_mode, dict(self.target_spec))
+            return None
+        if reference_samples is None:
+            raise ValueError(
+                f"comparison_mode={comparison_mode!r} requires reference_samples"
+            )
+        state = prepare_reference_cdf_state(reference_samples)
+        warm_reference_ks_kernel(state)
+        return state
 
-    @abstractmethod
     def compute_ks_distance(
         self,
         samples,
@@ -595,4 +627,26 @@ class BaseRunner(ABC):
         comparison_state=None,
         extra_samples=None,
     ) -> float:
-        """Compute KS distance. extra_samples is used for reused phase-1 samples."""
+        """Compute default analytic or reference-backed KS distance."""
+        mode_spec = self.comparison_mode_spec(comparison_mode)
+        samples_np = coerce_samples_np(samples)
+        if extra_samples is not None:
+            extra_np = coerce_samples_np(extra_samples)
+            if extra_np.shape[0] > 0:
+                samples_np = np.concatenate([extra_np, samples_np], axis=0)
+        if samples_np.shape[0] == 0:
+            return float("nan")
+        if mode_spec.requires_reference_cache:
+            if comparison_state is None:
+                raise ValueError(
+                    "comparison_state is required for "
+                    f"comparison_mode={comparison_mode!r}"
+                )
+            value, _, _ = compute_reference_ks_distance(
+                samples_np, comparison_state
+            )
+        else:
+            value, _, _ = compute_target_ks_distance(
+                samples_np, dict(self.target_spec)
+            )
+        return float(value)

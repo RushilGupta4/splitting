@@ -772,10 +772,6 @@ def _with_top_legend_height(figsize, label_count: int, ncol: int):
     return width, height + 0.45 * _legend_rows(label_count, ncol)
 
 
-def _main_legend_count(rows, b1_markers) -> int:
-    return len(_main_legend_labels(rows, b1_markers))
-
-
 def _main_legend_labels(rows, b1_markers):
     baseline_labels = [
         _baseline_series_label(series_key)

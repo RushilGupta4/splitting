@@ -6,7 +6,6 @@ import time
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-import numpy as np
 import torch
 
 from reference_cache import checkpoint_fingerprint
@@ -19,14 +18,6 @@ from runners.ddpm.sampling import (
     sample_segment as _diffusion_sample_segment,
     segment_costs as _diffusion_segment_costs,
 )
-from metrics.ks import (
-    compute_reference_ks_distance,
-    compute_target_ks_distance,
-    prepare_reference_cdf_state,
-    warm_ks_kernel_for_mode,
-    warm_reference_ks_kernel,
-)
-from metrics.utils import coerce_samples_np
 from runners.base import (
     BaseRunner,
     ComparisonModeSpec,
@@ -284,12 +275,7 @@ class DDPMRunner(BaseRunner):
         return tuple(type(self).comparison_mode_specs)
 
     def _validate_mode(self, comparison_mode: str) -> None:
-        names = {spec.name for spec in self.comparison_modes()}
-        if comparison_mode not in names:
-            raise ValueError(
-                f"Unknown comparison_mode '{comparison_mode}'. "
-                f"Available: {sorted(names)}"
-            )
+        self.comparison_mode_spec(comparison_mode)
 
     # ------------------------------------------------------------------
     # Sampling primitives
@@ -688,19 +674,11 @@ class DDPMRunner(BaseRunner):
         reference_samples=None,
         metric_params=None,
     ):
-        self._validate_mode(comparison_mode)
-        if metric_params:
-            raise ValueError("ks no longer accepts metric parameters")
-        if comparison_mode == "true_dist":
-            warm_ks_kernel_for_mode(comparison_mode, self._target_spec)
-            return None
-        if reference_samples is None:
-            raise ValueError(
-                f"comparison_mode='{comparison_mode}' requires reference_samples"
-            )
-        state = prepare_reference_cdf_state(reference_samples)
-        warm_reference_ks_kernel(state)
-        return state
+        return super().prepare_comparison_state(
+            comparison_mode=comparison_mode,
+            reference_samples=reference_samples,
+            metric_params=metric_params,
+        )
 
     def compute_ks_distance(
         self,
@@ -710,22 +688,9 @@ class DDPMRunner(BaseRunner):
         comparison_state=None,
         extra_samples=None,
     ) -> float:
-        self._validate_mode(comparison_mode)
-        samples_np = coerce_samples_np(samples)
-        if extra_samples is not None:
-            extra_np = coerce_samples_np(extra_samples)
-            if extra_np.shape[0] > 0:
-                samples_np = np.concatenate([extra_np, samples_np], axis=0)
-
-        if samples_np.shape[0] == 0:
-            return float("nan")
-
-        if comparison_mode == "true_dist":
-            value, _, _ = compute_target_ks_distance(samples_np, self._target_spec)
-        else:
-            if comparison_state is None:
-                raise ValueError(
-                    f"comparison_state is required for comparison_mode='{comparison_mode}'"
-                )
-            value, _, _ = compute_reference_ks_distance(samples_np, comparison_state)
-        return float(value)
+        return super().compute_ks_distance(
+            samples,
+            comparison_mode=comparison_mode,
+            comparison_state=comparison_state,
+            extra_samples=extra_samples,
+        )

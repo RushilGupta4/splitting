@@ -1,49 +1,24 @@
 from __future__ import annotations
 
 import math
-import time
 from typing import Any, Mapping, Sequence
 
-import numpy as np
 import torch
 
-from metrics.ks import (
-    compute_reference_ks_distance,
-    prepare_reference_cdf_state,
-    warm_reference_ks_kernel,
-)
-from metrics.utils import coerce_samples_np
 from runners.base import BaseRunner, ComparisonModeSpec, SamplingConfig
 from runners.sde.cases import SDE_CASES
 from runners.sde.sampling import SDE_SAMPLERS, sample_sde_segment
 from runners.splitting import (
-    apply_to_run_batches,
-    balanced_branch_counts_by_group,
-    balanced_split_with_run_ids,
-    child_counts_by_run,
-    iter_child_parent_batches_by_run,
-    normalize_max_sampling_batch_size,
-    split_counts_by_run_batches,
+    append_by_counts as _append_by_counts,
+    cat_parts_by_run as _cat_parts_by_run,
+    run_full_trajectory_batch,
+    run_split_trajectory_batch,
+    trajectory_expected_cost_per_root,
+    trajectory_segment_costs,
 )
 from utils import validate_split_percentages
 
 SUPPORTED_SAMPLERS = SDE_SAMPLERS
-
-
-def _append_by_counts(parts_by_run, values: torch.Tensor, counts_by_run):
-    offset = 0
-    for run_idx, count in enumerate(counts_by_run):
-        count = int(count)
-        if count > 0:
-            parts_by_run[run_idx].append(values[offset : offset + count])
-        offset += count
-
-
-def _cat_parts_by_run(parts_by_run, empty_template: torch.Tensor):
-    return [
-        torch.cat(parts, dim=0) if parts else empty_template[:0]
-        for parts in parts_by_run
-    ]
 
 
 class SDERunner(BaseRunner):
@@ -213,11 +188,7 @@ class SDERunner(BaseRunner):
         )
 
     def _validate_mode(self, comparison_mode: str) -> None:
-        names = {spec.name for spec in self.comparison_modes()}
-        if comparison_mode not in names:
-            raise ValueError(
-                f"Unknown comparison_mode {comparison_mode!r}. Available: {sorted(names)}"
-            )
+        self.comparison_mode_spec(comparison_mode)
 
     def sample_prior(self, num_samples: int, *, generator=None) -> torch.Tensor:
         if self._case.initial_sampler is not None:
@@ -333,26 +304,15 @@ class SDERunner(BaseRunner):
 
     def segment_costs(self, split_points: Sequence[Any]) -> list:
         points = [self._coerce_index(p, name="split_point") for p in split_points]
-        starts = [self.start_time] + points
-        ends = points + [self.end_time]
-        return [self.segment_cost(start, end) for start, end in zip(starts, ends)]
+        return trajectory_segment_costs(self, points)
 
     def expected_cost_per_root(
         self,
         split_points: Sequence[Any],
         split_factors: Sequence[float],
     ) -> float:
-        if not split_points:
-            return self.segment_cost(self.start_time, self.end_time)
-        points = list(split_points)
-        starts = [self.start_time] + points
-        ends = points + [self.end_time]
-        cost = self.segment_cost(starts[0], ends[0])
-        cumulative_split = 1.0
-        for idx, split_factor in enumerate(split_factors):
-            cumulative_split *= float(split_factor)
-            cost += cumulative_split * self.segment_cost(starts[idx + 1], ends[idx + 1])
-        return float(cost)
+        points = [self._coerce_index(p, name="split_point") for p in split_points]
+        return trajectory_expected_cost_per_root(self, points, split_factors)
 
     def run_split_batch(
         self,
@@ -363,162 +323,15 @@ class SDERunner(BaseRunner):
         generator=None,
         max_sampling_batch_size=None,
     ):
-        if len(n0_by_run) == 0:
-            return [], [], 0.0
-        if len(n0_by_run) != len(split_factors_by_run):
-            raise ValueError(
-                "n0_by_run and split_factors_by_run must have the same length"
-            )
-        n0_tensor = torch.as_tensor(n0_by_run, device=self._device, dtype=torch.long)
-        if torch.any(n0_tensor < 1):
-            raise ValueError("all n0 values must be at least 1")
-        max_sampling_batch_size = normalize_max_sampling_batch_size(
-            max_sampling_batch_size
-        )
-
         split_points = [self._coerce_index(p, name="split_point") for p in split_points]
-        num_runs = int(n0_tensor.numel())
-        realized_costs = torch.zeros(num_runs, device=self._device, dtype=torch.long)
-        sampling_start = time.perf_counter()
-
-        if max_sampling_batch_size is not None and not split_points:
-            parts_by_run = [[] for _ in range(num_runs)]
-            empty_template = self.postprocess_samples(self.sample_prior(0))
-            segment_cost = int(self.segment_cost(self.start_time, self.end_time))
-            for counts in split_counts_by_run_batches(
-                n0_by_run,
-                max_sampling_batch_size,
-            ):
-                total = int(sum(counts))
-                if total <= 0:
-                    continue
-                counts_tensor = torch.as_tensor(
-                    counts, device=self._device, dtype=torch.long
-                )
-                x = self.sample_prior(total, generator=generator)
-                realized_costs += counts_tensor * segment_cost
-                x = self.sample_segment(
-                    x, self.start_time, self.end_time, generator=generator
-                )
-                x = self.postprocess_samples(x)
-                empty_template = x
-                _append_by_counts(parts_by_run, x, counts)
-            sampling_time = time.perf_counter() - sampling_start
-            return (
-                _cat_parts_by_run(parts_by_run, empty_template),
-                realized_costs.detach().cpu().tolist(),
-                sampling_time,
-            )
-
-        run_ids = torch.repeat_interleave(
-            torch.arange(num_runs, device=self._device, dtype=torch.long), n0_tensor
+        return run_split_trajectory_batch(
+            self,
+            n0_by_run=n0_by_run,
+            split_points=split_points,
+            split_factors_by_run=split_factors_by_run,
+            generator=generator,
+            max_sampling_batch_size=max_sampling_batch_size,
         )
-        if max_sampling_batch_size is None:
-            x = self.sample_prior(int(n0_tensor.sum().item()), generator=generator)
-        else:
-            initial_parts_by_run = [[] for _ in range(num_runs)]
-            for counts in split_counts_by_run_batches(
-                n0_by_run,
-                max_sampling_batch_size,
-            ):
-                total = int(sum(counts))
-                if total <= 0:
-                    continue
-                batch = self.sample_prior(total, generator=generator)
-                batch = self.sample_segment(
-                    batch, self.start_time, split_points[0], generator=generator
-                )
-                _append_by_counts(initial_parts_by_run, batch, counts)
-            x = torch.cat([torch.cat(parts, dim=0) for parts in initial_parts_by_run], dim=0)
-
-        if not split_points:
-            realized_costs += n0_tensor * int(
-                self.segment_cost(self.start_time, self.end_time)
-            )
-            x = self.sample_segment(
-                x, self.start_time, self.end_time, generator=generator
-            )
-        else:
-            realized_costs += n0_tensor * int(
-                self.segment_cost(self.start_time, split_points[0])
-            )
-            if max_sampling_batch_size is None:
-                x = self.sample_segment(
-                    x, self.start_time, split_points[0], generator=generator
-                )
-            split_factors_array = np.asarray(split_factors_by_run, dtype=float)
-            if not np.isfinite(split_factors_array).all() or np.any(
-                split_factors_array < 0.0
-            ):
-                raise ValueError("split_factors_by_run must contain finite nonnegative values")
-            if split_factors_array.shape != (num_runs, len(split_points)):
-                raise ValueError("split_factors_by_run has incompatible shape")
-            split_factors_tensor = torch.as_tensor(
-                split_factors_array,
-                device=self._device,
-                dtype=torch.float64,
-            )
-            for idx, split_point in enumerate(split_points):
-                end_t = (
-                    split_points[idx + 1]
-                    if idx + 1 < len(split_points)
-                    else self.end_time
-                )
-                if max_sampling_batch_size is not None and idx + 1 == len(split_points):
-                    child_counts = balanced_branch_counts_by_group(
-                        run_ids,
-                        split_factors_tensor[:, idx],
-                        num_groups=num_runs,
-                        generator=generator,
-                    )
-                    counts = child_counts_by_run(
-                        run_ids,
-                        child_counts,
-                        num_runs=num_runs,
-                    )
-                    realized_costs += counts * int(self.segment_cost(split_point, end_t))
-                    parts_by_run = [[] for _ in range(num_runs)]
-                    empty_template = self.postprocess_samples(x[:0])
-                    for batch_parent_indices, batch_counts in iter_child_parent_batches_by_run(
-                        run_ids,
-                        child_counts,
-                        num_runs=num_runs,
-                        max_count_per_run=max_sampling_batch_size,
-                    ):
-                        if batch_parent_indices.numel() == 0:
-                            continue
-                        batch = x.index_select(0, batch_parent_indices)
-                        batch = self.sample_segment(
-                            batch, split_point, end_t, generator=generator
-                        )
-                        batch = self.postprocess_samples(batch)
-                        empty_template = batch
-                        _append_by_counts(parts_by_run, batch, batch_counts)
-                    sampling_time = time.perf_counter() - sampling_start
-                    return (
-                        _cat_parts_by_run(parts_by_run, empty_template),
-                        realized_costs.detach().cpu().tolist(),
-                        sampling_time,
-                    )
-                x, run_ids = balanced_split_with_run_ids(
-                    x, run_ids, split_factors_tensor[:, idx], generator=generator
-                )
-                counts = torch.bincount(run_ids, minlength=num_runs)
-                realized_costs += counts * int(self.segment_cost(split_point, end_t))
-                x = apply_to_run_batches(
-                    x,
-                    run_ids,
-                    num_runs=num_runs,
-                    max_count_per_run=max_sampling_batch_size,
-                    fn=lambda batch, split_point=split_point, end_t=end_t: self.sample_segment(
-                        batch, split_point, end_t, generator=generator
-                    ),
-                )
-
-        x = self.postprocess_samples(x)
-        sampling_time = time.perf_counter() - sampling_start
-        samples_by_run = [x[run_ids == run_idx] for run_idx in range(num_runs)]
-        return samples_by_run, realized_costs.detach().cpu().tolist(), sampling_time
 
     def solver_names(self) -> Sequence[str]:
         return SUPPORTED_SAMPLERS
@@ -562,43 +375,13 @@ class SDERunner(BaseRunner):
                 solver_kwargs.get("terminal_time", self._terminal_time)
             ),
         )
-        max_sampling_batch_size = normalize_max_sampling_batch_size(
-            max_sampling_batch_size
+        return run_full_trajectory_batch(
+            runner,
+            chunk_size=chunk_size,
+            n0=n0,
+            generator=generator,
+            max_sampling_batch_size=max_sampling_batch_size,
         )
-        sampling_start = time.perf_counter()
-        if max_sampling_batch_size is not None:
-            counts_by_run = [int(n0)] * int(chunk_size)
-            parts_by_run = [[] for _ in range(int(chunk_size))]
-            empty_template = runner.postprocess_samples(runner.sample_prior(0))
-            for counts in split_counts_by_run_batches(
-                counts_by_run,
-                max_sampling_batch_size,
-            ):
-                total = int(sum(counts))
-                if total <= 0:
-                    continue
-                x = runner.sample_prior(total, generator=generator)
-                x = runner.sample_segment(
-                    x, runner.start_time, runner.end_time, generator=generator
-                )
-                x = runner.postprocess_samples(x).to(dtype=torch.float32)
-                empty_template = x
-                _append_by_counts(parts_by_run, x, counts)
-            sampling_time = time.perf_counter() - sampling_start
-            return _cat_parts_by_run(parts_by_run, empty_template), sampling_time
-
-        x = runner.sample_prior(int(chunk_size) * int(n0), generator=generator)
-        x = runner.sample_segment(
-            x, runner.start_time, runner.end_time, generator=generator
-        )
-        x = runner.postprocess_samples(x)
-        sampling_time = time.perf_counter() - sampling_start
-        x = (
-            x.to(dtype=torch.float32)
-            .reshape(int(chunk_size), int(n0), self._dimension)
-            .contiguous()
-        )
-        return [x[idx] for idx in range(int(chunk_size))], sampling_time
 
     def normalize_reference_generation_config(
         self,
@@ -729,16 +512,11 @@ class SDERunner(BaseRunner):
         reference_samples=None,
         metric_params=None,
     ):
-        self._validate_mode(comparison_mode)
-        if metric_params:
-            raise ValueError("ks no longer accepts metric parameters")
-        if reference_samples is None:
-            raise ValueError(
-                f"comparison_mode={comparison_mode!r} requires reference_samples"
-            )
-        state = prepare_reference_cdf_state(reference_samples)
-        warm_reference_ks_kernel(state)
-        return state
+        return super().prepare_comparison_state(
+            comparison_mode=comparison_mode,
+            reference_samples=reference_samples,
+            metric_params=metric_params,
+        )
 
     def compute_ks_distance(
         self,
@@ -748,20 +526,12 @@ class SDERunner(BaseRunner):
         comparison_state=None,
         extra_samples=None,
     ) -> float:
-        self._validate_mode(comparison_mode)
-        samples_np = coerce_samples_np(samples)
-        if extra_samples is not None:
-            extra_np = coerce_samples_np(extra_samples)
-            if extra_np.shape[0] > 0:
-                samples_np = np.concatenate([extra_np, samples_np], axis=0)
-        if samples_np.shape[0] == 0:
-            return float("nan")
-        if comparison_state is None:
-            raise ValueError(
-                f"comparison_state is required for comparison_mode={comparison_mode!r}"
-            )
-        value, _, _ = compute_reference_ks_distance(samples_np, comparison_state)
-        return float(value)
+        return super().compute_ks_distance(
+            samples,
+            comparison_mode=comparison_mode,
+            comparison_state=comparison_state,
+            extra_samples=extra_samples,
+        )
 
 
 class SimpleOURunner(SDERunner):

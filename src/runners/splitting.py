@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import math
+import time
 
+import numpy as np
 import torch
 
 
@@ -74,6 +76,45 @@ def split_counts_by_run_batches(counts_by_run, max_count_per_run):
         ]
         for batch_idx in range(num_batches)
     ]
+
+
+def append_by_counts(parts_by_run, values: torch.Tensor, counts_by_run):
+    """Append contiguous slices of ``values`` to their corresponding runs."""
+    offset = 0
+    for run_idx, count in enumerate(counts_by_run):
+        count = int(count)
+        if count > 0:
+            parts_by_run[run_idx].append(values[offset : offset + count])
+        offset += count
+
+
+def cat_parts_by_run(parts_by_run, empty_template: torch.Tensor):
+    """Concatenate accumulated run parts while preserving empty tensor metadata."""
+    return [
+        torch.cat(parts, dim=0) if parts else empty_template[:0]
+        for parts in parts_by_run
+    ]
+
+
+def collect_run_batches(
+    counts_by_run,
+    max_count_per_run,
+    *,
+    sample_batch,
+    empty_template: torch.Tensor,
+):
+    """Sample bounded batches and reconstruct per-run tensors in stable order."""
+    counts_by_run = [int(count) for count in counts_by_run]
+    parts_by_run = [[] for _ in counts_by_run]
+    latest_template = empty_template
+    for counts in split_counts_by_run_batches(counts_by_run, max_count_per_run):
+        total = int(sum(counts))
+        if total <= 0:
+            continue
+        values = sample_batch(total)
+        latest_template = values
+        append_by_counts(parts_by_run, values, counts)
+    return cat_parts_by_run(parts_by_run, latest_template)
 
 
 def balanced_branch_counts(
@@ -333,6 +374,251 @@ def balanced_split_with_run_ids(
     )
 
     return x.repeat_interleave(counts, dim=0), run_ids.repeat_interleave(counts, dim=0)
+
+
+def trajectory_segment_costs(runner, split_points):
+    """Return segment costs for canonical runner-native split points."""
+    points = list(split_points)
+    starts = [runner.start_time, *points]
+    ends = [*points, runner.end_time]
+    return [runner.segment_cost(start, end) for start, end in zip(starts, ends)]
+
+
+def trajectory_expected_cost_per_root(runner, split_points, split_factors) -> float:
+    """Compute expected trajectory cost from cumulative split factors."""
+    costs = trajectory_segment_costs(runner, split_points)
+    if len(costs) == 1:
+        return float(costs[0])
+    cumulative_split = 1.0
+    cost = float(costs[0])
+    for idx, split_factor in enumerate(split_factors):
+        cumulative_split *= float(split_factor)
+        cost += cumulative_split * float(costs[idx + 1])
+    return float(cost)
+
+
+def run_full_trajectory_batch(
+    runner,
+    *,
+    chunk_size: int,
+    n0: int,
+    generator=None,
+    max_sampling_batch_size=None,
+):
+    """Sample complete trajectories and return stable per-run float32 tensors."""
+    chunk_size = int(chunk_size)
+    n0 = int(n0)
+    max_sampling_batch_size = normalize_max_sampling_batch_size(
+        max_sampling_batch_size
+    )
+    sampling_start = time.perf_counter()
+
+    def sample_batch(total):
+        x = runner.sample_prior(total, generator=generator)
+        x = runner.sample_segment(
+            x,
+            runner.start_time,
+            runner.end_time,
+            generator=generator,
+        )
+        return runner.postprocess_samples(x)
+
+    if max_sampling_batch_size is not None:
+        samples_by_run = collect_run_batches(
+            [n0] * chunk_size,
+            max_sampling_batch_size,
+            sample_batch=lambda total: sample_batch(total).to(dtype=torch.float32),
+            empty_template=runner.postprocess_samples(
+                runner.sample_prior(0)
+            ).to(dtype=torch.float32),
+        )
+        return samples_by_run, time.perf_counter() - sampling_start
+
+    samples = sample_batch(chunk_size * n0)
+    sampling_time = time.perf_counter() - sampling_start
+    samples = samples.to(dtype=torch.float32).reshape(chunk_size, n0, -1).contiguous()
+    return [samples[idx] for idx in range(chunk_size)], sampling_time
+
+
+def run_split_trajectory_batch(
+    runner,
+    *,
+    n0_by_run,
+    split_points,
+    split_factors_by_run,
+    generator=None,
+    max_sampling_batch_size=None,
+):
+    """Run generic trajectory splitting using runner-owned sampling primitives.
+
+    ``split_points`` must already be canonicalized by the runner family. The
+    ordering of random draws and sampling calls intentionally matches the
+    former EDM/SDE implementations.
+    """
+    if len(n0_by_run) == 0:
+        return [], [], 0.0
+    if len(n0_by_run) != len(split_factors_by_run):
+        raise ValueError(
+            "n0_by_run and split_factors_by_run must have the same length"
+        )
+
+    device = runner.device
+    n0_tensor = torch.as_tensor(n0_by_run, device=device, dtype=torch.long)
+    if torch.any(n0_tensor < 1):
+        raise ValueError("all n0 values must be at least 1")
+    max_sampling_batch_size = normalize_max_sampling_batch_size(
+        max_sampling_batch_size
+    )
+    split_points = list(split_points)
+    num_runs = int(n0_tensor.numel())
+    realized_costs = torch.zeros(num_runs, device=device, dtype=torch.long)
+    sampling_start = time.perf_counter()
+
+    if max_sampling_batch_size is not None and not split_points:
+        segment_cost = int(runner.segment_cost(runner.start_time, runner.end_time))
+
+        def sample_full_batch(total):
+            x = runner.sample_prior(total, generator=generator)
+            x = runner.sample_segment(
+                x, runner.start_time, runner.end_time, generator=generator
+            )
+            return runner.postprocess_samples(x)
+
+        realized_costs += n0_tensor * segment_cost
+        samples_by_run = collect_run_batches(
+            n0_by_run,
+            max_sampling_batch_size,
+            sample_batch=sample_full_batch,
+            empty_template=runner.postprocess_samples(runner.sample_prior(0)),
+        )
+        sampling_time = time.perf_counter() - sampling_start
+        return samples_by_run, realized_costs.detach().cpu().tolist(), sampling_time
+
+    run_ids = torch.repeat_interleave(
+        torch.arange(num_runs, device=device, dtype=torch.long), n0_tensor
+    )
+    if max_sampling_batch_size is None:
+        x = runner.sample_prior(int(n0_tensor.sum().item()), generator=generator)
+    else:
+
+        def sample_initial_batch(total):
+            batch = runner.sample_prior(total, generator=generator)
+            return runner.sample_segment(
+                batch,
+                runner.start_time,
+                split_points[0],
+                generator=generator,
+            )
+
+        initial_by_run = collect_run_batches(
+            n0_by_run,
+            max_sampling_batch_size,
+            sample_batch=sample_initial_batch,
+            empty_template=torch.empty(0, device=device),
+        )
+        x = torch.cat(initial_by_run, dim=0)
+
+    if not split_points:
+        realized_costs += n0_tensor * int(
+            runner.segment_cost(runner.start_time, runner.end_time)
+        )
+        x = runner.sample_segment(
+            x, runner.start_time, runner.end_time, generator=generator
+        )
+    else:
+        realized_costs += n0_tensor * int(
+            runner.segment_cost(runner.start_time, split_points[0])
+        )
+        if max_sampling_batch_size is None:
+            x = runner.sample_segment(
+                x, runner.start_time, split_points[0], generator=generator
+            )
+
+        split_factors_array = np.asarray(split_factors_by_run, dtype=float)
+        if not np.isfinite(split_factors_array).all() or np.any(
+            split_factors_array < 0.0
+        ):
+            raise ValueError(
+                "split_factors_by_run must contain finite nonnegative values"
+            )
+        if split_factors_array.shape != (num_runs, len(split_points)):
+            raise ValueError("split_factors_by_run has incompatible shape")
+        split_factors_tensor = torch.as_tensor(
+            split_factors_array,
+            device=device,
+            dtype=torch.float64,
+        )
+
+        for idx, split_point in enumerate(split_points):
+            end_t = (
+                split_points[idx + 1]
+                if idx + 1 < len(split_points)
+                else runner.end_time
+            )
+            if max_sampling_batch_size is not None and idx + 1 == len(split_points):
+                child_counts = balanced_branch_counts_by_group(
+                    run_ids,
+                    split_factors_tensor[:, idx],
+                    num_groups=num_runs,
+                    generator=generator,
+                )
+                counts = child_counts_by_run(
+                    run_ids,
+                    child_counts,
+                    num_runs=num_runs,
+                )
+                realized_costs += counts * int(
+                    runner.segment_cost(split_point, end_t)
+                )
+                parts_by_run = [[] for _ in range(num_runs)]
+                empty_template = runner.postprocess_samples(x[:0])
+                for batch_parent_indices, batch_counts in iter_child_parent_batches_by_run(
+                    run_ids,
+                    child_counts,
+                    num_runs=num_runs,
+                    max_count_per_run=max_sampling_batch_size,
+                ):
+                    if batch_parent_indices.numel() == 0:
+                        continue
+                    batch = x.index_select(0, batch_parent_indices)
+                    batch = runner.sample_segment(
+                        batch, split_point, end_t, generator=generator
+                    )
+                    batch = runner.postprocess_samples(batch)
+                    empty_template = batch
+                    append_by_counts(parts_by_run, batch, batch_counts)
+                sampling_time = time.perf_counter() - sampling_start
+                return (
+                    cat_parts_by_run(parts_by_run, empty_template),
+                    realized_costs.detach().cpu().tolist(),
+                    sampling_time,
+                )
+
+            x, run_ids = balanced_split_with_run_ids(
+                x,
+                run_ids,
+                split_factors_tensor[:, idx],
+                generator=generator,
+            )
+            counts = torch.bincount(run_ids, minlength=num_runs)
+            realized_costs += counts * int(runner.segment_cost(split_point, end_t))
+            x = apply_to_run_batches(
+                x,
+                run_ids,
+                num_runs=num_runs,
+                max_count_per_run=max_sampling_batch_size,
+                fn=lambda batch, split_point=split_point, end_t=end_t: runner.sample_segment(
+                    batch,
+                    split_point,
+                    end_t,
+                    generator=generator,
+                ),
+            )
+
+    x = runner.postprocess_samples(x)
+    sampling_time = time.perf_counter() - sampling_start
+    samples_by_run = [x[run_ids == run_idx] for run_idx in range(num_runs)]
+    return samples_by_run, realized_costs.detach().cpu().tolist(), sampling_time
 
 
 probabilistic_split_with_run_ids = balanced_split_with_run_ids

@@ -11,6 +11,7 @@ from numba import njit
 
 from runners.splitting import (
     apply_to_run_batches,
+    append_by_counts as _append_by_counts,
     floor_split_total_count,
     normalize_max_sampling_batch_size,
     split_counts_by_run_batches,
@@ -71,15 +72,6 @@ SUPPORTED_OPTIMIZATION_MODES = {"monotone", "monotone_cvar95"}
 def _debug(enabled: bool, message: str):
     if enabled:
         log.debug(message)
-
-
-def _append_by_counts(parts_by_run, values: torch.Tensor, counts_by_run):
-    offset = 0
-    for run_idx, count in enumerate(counts_by_run):
-        count = int(count)
-        if count > 0:
-            parts_by_run[run_idx].append(values[offset : offset + count])
-        offset += count
 
 
 def _sample_prior_by_run_batches(

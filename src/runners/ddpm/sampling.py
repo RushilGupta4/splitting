@@ -7,9 +7,12 @@ import torch
 
 from runners.splitting import (
     apply_to_run_batches,
+    append_by_counts as _append_by_counts,
     balanced_branch_counts_by_group,
     balanced_split_with_run_ids,
+    cat_parts_by_run as _cat_parts_by_run,
     child_counts_by_run,
+    collect_run_batches,
     iter_child_parent_batches_by_run,
     normalize_max_sampling_batch_size,
     split_counts_by_run_batches,
@@ -432,22 +435,6 @@ def expected_cost_per_root(
     return cost
 
 
-def _append_by_counts(parts_by_run, values: torch.Tensor, counts_by_run):
-    offset = 0
-    for run_idx, count in enumerate(counts_by_run):
-        count = int(count)
-        if count > 0:
-            parts_by_run[run_idx].append(values[offset : offset + count])
-        offset += count
-
-
-def _cat_parts_by_run(parts_by_run, empty_template: torch.Tensor):
-    return [
-        torch.cat(parts, dim=0) if parts else empty_template[:0]
-        for parts in parts_by_run
-    ]
-
-
 def _run_unsplit_probabilistic_batches(
     model,
     sampler: DDPM | DDIM,
@@ -817,15 +804,8 @@ def run_solver_baseline_batch(
     sampling_start = time.perf_counter()
     if max_sampling_batch_size is not None:
         counts_by_run = [int(n0)] * int(chunk_size)
-        parts_by_run = [[] for _ in range(int(chunk_size))]
-        empty_template = None
-        for counts in split_counts_by_run_batches(
-            counts_by_run,
-            max_sampling_batch_size,
-        ):
-            total = int(sum(counts))
-            if total <= 0:
-                continue
+
+        def sample_batch(total):
             x = torch.randn(total, input_dim, device=device, generator=generator)
             samples = sample_full_solver(
                 model,
@@ -837,16 +817,23 @@ def run_solver_baseline_batch(
                 device=device,
                 generator=generator,
             )
-            samples = postprocess_fn(samples).to(dtype=torch.float32)
-            if empty_template is None:
-                empty_template = samples
-            _append_by_counts(parts_by_run, samples, counts)
-        sampling_time = time.perf_counter() - sampling_start
-        if empty_template is None:
+            return postprocess_fn(samples).to(dtype=torch.float32)
+
+        if int(chunk_size) < 1 or int(n0) < 1:
+            sampling_time = time.perf_counter() - sampling_start
             empty_template = postprocess_fn(
                 torch.empty((0, input_dim), device=device)
             ).to(dtype=torch.float32)
-        return _cat_parts_by_run(parts_by_run, empty_template), sampling_time
+            return [empty_template[:0] for _ in counts_by_run], sampling_time
+
+        samples_by_run = collect_run_batches(
+            counts_by_run,
+            max_sampling_batch_size,
+            sample_batch=sample_batch,
+            empty_template=torch.empty(0, device=device),
+        )
+        sampling_time = time.perf_counter() - sampling_start
+        return samples_by_run, sampling_time
 
     x = torch.randn(chunk_size * n0, input_dim, device=device, generator=generator)
     samples = sample_full_solver(
