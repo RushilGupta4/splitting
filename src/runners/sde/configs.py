@@ -1,15 +1,24 @@
-import numpy as np
+"""Shared SDE sweep configuration.
 
-from runners.common_configs import crossfit_q_config
-from runners.sde.sampling import SDE_SAMPLERS
+Per-case modules choose exactly one thing: the terminal time (plus a human
+description). Dimension, sampler, step schedules, budget grid and
+reference-generation settings are standard across every SDE case and live here.
+"""
+
+from copy import deepcopy
+
+import numpy as np
 
 SPLIT_LISTS = [4, 9]
 SDE_SPLITS = [np.round(np.arange(j, 0, -1) / (j + 1), 2).tolist() for j in SPLIT_LISTS]
 
-
-def _sampling_configs() -> list[dict[str, str]]:
-    return [{"sampler": sampler} for sampler in SDE_SAMPLERS]
-
+SDE_DIMENSION = 2
+SDE_SAMPLER = "euler"
+SDE_COMPARISON_MODE = "true_samples"
+SDE_REFERENCE_METHOD = "sde_terminal_samples"
+SDE_REFERENCE_SAMPLER = "euler"
+SDE_REFERENCE_SAMPLING_STEPS = 20_000
+SDE_MAX_SAMPLING_BATCH_SIZE = 50_000
 
 _EULER_CALIBRATED = {
     10_000: 60,
@@ -24,74 +33,32 @@ _EULER_CALIBRATED = {
     10_000_000: 600,
 }
 
-_MILSTEIN_CALIBRATED = {
-    10_000: 35,
-    20_000: 40,
-    50_000: 50,
-    100_000: 55,
-    200_000: 65,
-    500_000: 75,
-    1_000_000: 90,
-    2_000_000: 100,
-    5_000_000: 120,
-    10_000_000: 140,
-}
-
-SDE_SAMPLING_BASE = {
-    "runner_defaults": {
-        "dimension": 2,
-    },
-    "sampling_defaults": {
-        "terminal_time": 1.0,
-    },
-    "reference_generation_config": {
-        "method": "sde_terminal_samples",
-        "sampler": "euler",
-        "sampling_steps": 20_000,
-        "terminal_time": 1.0,
-    },
+# Everything here is independent of terminal_time.
+_SAMPLING_BASE = {
     "sampling_configs": [
-        {"sampler": "euler"},
-        # {"sampler": "milstein"},
+        {"sampler": SDE_SAMPLER},
+        # Re-enabling milstein needs dimension=1 (SDERunner rejects it above 1)
+        # AND a "milstein" entry in step_schedules below.
     ],
     "step_schedules": {
-        "calibrated": {
-            "euler": _EULER_CALIBRATED,
-            "milstein": _MILSTEIN_CALIBRATED,
-        },
+        "calibrated": {SDE_SAMPLER: _EULER_CALIBRATED},
     },
     "B_list": [
-        100_000,
-        200_000,
-        500_000,
+        # 100_000,
+        # 200_000,
+        # 500_000,
         1_000_000,
         2_000_000,
-        5_000_000,
-        # 10_000_000,
+        # 5_000_000,
     ],
     "B1_list": [
-        # 0.01,
-        # 0.02,
-        # 0.05,
         "5,0.66",
-        # "10,0.66",
-        # "500,0.20",
-        # "500,0.1",
-        # 5_000,
-        # 10_000,
-        # 25_000,
-        # 50_000,
-        # 75_000,
-        # 100_000,
-        # 150_000,
-        # 200_000,
-        # 250_000,
     ],
     "baselines": ["fixed_N"],
+    "max_sampling_batch_size": SDE_MAX_SAMPLING_BATCH_SIZE,
 }
 
-SDE_METADATA_BASE = {
-    **crossfit_q_config(),
+_METADATA_BASE = {
     "split_percentages_list": [list(split) for split in SDE_SPLITS],
     "optimization_modes": ["monotone_cvar95"],
     "crossfit_q_mlp_losses": ["mse"],
@@ -100,9 +67,56 @@ SDE_METADATA_BASE = {
     "n_parallel": 25,
 }
 
-SDE_MMD_SELECTION = {
+_MMD_SELECTION = {
     "metrics": ["mmd"],
     "primary_metric": "mmd",
 }
 
-__all__ = ["SDE_MMD_SELECTION", "SDE_METADATA_BASE", "SDE_SAMPLING_BASE"]
+
+def sde_case_configs(*, terminal_time: float, description: str) -> dict[str, dict]:
+    """Build the {"default", "mmd"} CONFIGS dict for one SDE case.
+
+    ``terminal_time`` is written into all three slots that consume it, so they
+    cannot drift apart:
+
+    * ``runner_defaults`` -> ``SDERunner(terminal_time=...)``
+    * ``reference_generation_config`` -> hard-checked against the runner in
+      ``SDERunner.normalize_reference_generation_config``
+    * ``sampling_defaults`` -> merged into every ``sampling_configs`` entry by
+      ``BaseRunner.get_config``, and never cross-checked against the other two
+    """
+    terminal_time = float(terminal_time)
+    if not terminal_time > 0.0:
+        raise ValueError(f"terminal_time must be positive, got {terminal_time!r}")
+
+    default_config = {
+        **_SAMPLING_BASE,
+        **_METADATA_BASE,
+        "comparison_mode": SDE_COMPARISON_MODE,
+        "runner_defaults": {
+            "dimension": SDE_DIMENSION,
+            "terminal_time": terminal_time,
+        },
+        "sampling_defaults": {"terminal_time": terminal_time},
+        "reference_generation_config": {
+            "method": SDE_REFERENCE_METHOD,
+            "sampler": SDE_REFERENCE_SAMPLER,
+            "sampling_steps": SDE_REFERENCE_SAMPLING_STEPS,
+            "terminal_time": terminal_time,
+        },
+        "description": str(description),
+    }
+
+    return {
+        "default": deepcopy(default_config),
+        "mmd": deepcopy(
+            {
+                **default_config,
+                **_MMD_SELECTION,
+                "description": f"{description} with target-space MMD",
+            }
+        ),
+    }
+
+
+__all__ = ["sde_case_configs"]

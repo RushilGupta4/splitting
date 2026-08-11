@@ -28,10 +28,8 @@ STRUCTURAL_CSV_FIELDS = {
     "step_schedule",
     "B",
     "B1",
-    "sigma_mode",
     "crossfit_q_mlp_loss",
     "reuse",
-    "free_B1",
     "optimizer",
     "solver",
     "solver_steps",
@@ -72,10 +70,8 @@ class Row:
     B: int
     B1: int | None
     B1_spec: str
-    sigma_mode: str
     crossfit_q_mlp_loss: str
     reuse: bool | None
-    free_B1: bool
     optimizer: str
     solver: str
     solver_steps: int | None
@@ -84,7 +80,7 @@ class Row:
     metrics: dict[str, dict[str, float | int | None]]
     mean_ks: float
     std_ks: float | None
-    n_valid_runs: int | None
+    n_valid_ks: int | None
     N_i: list[float]
     N_i_std: list[float]
 
@@ -271,8 +267,6 @@ def _parse_metric_values(raw_row: dict[str, str], metrics: list[str]):
         if mean_value is None:
             continue
         n_valid = _parse_int(raw_row.get(f"n_valid_{metric}", ""))
-        if metric == "ks" and n_valid is None:
-            n_valid = _parse_int(raw_row.get("n_valid_runs", ""))
         values[metric] = {
             "mean": mean_value,
             "std": _parse_float(raw_row.get(f"std_{metric}", "")),
@@ -351,9 +345,7 @@ def _load_rows(csv_path: str):
                 continue
 
             reuse = _parse_bool(raw_row.get("reuse", ""))
-            free_b1 = _parse_bool(raw_row.get("free_B1", ""))
             optimizer = (raw_row.get("optimizer") or "").strip()
-            sigma_mode = (raw_row.get("sigma_mode") or "").strip()
             crossfit_q_mlp_loss = (raw_row.get("crossfit_q_mlp_loss") or "").strip()
             B1 = _parse_int(raw_row.get("B1", ""))
             B1_spec = _normalize_b1_spec(
@@ -373,10 +365,8 @@ def _load_rows(csv_path: str):
                     B=B,
                     B1=B1,
                     B1_spec=B1_spec,
-                    sigma_mode=sigma_mode,
                     crossfit_q_mlp_loss=crossfit_q_mlp_loss,
                     reuse=reuse,
-                    free_B1=bool(free_b1),
                     optimizer=optimizer,
                     solver=(raw_row.get("solver") or "").strip(),
                     solver_steps=_parse_int(raw_row.get("solver_steps", "")),
@@ -385,7 +375,7 @@ def _load_rows(csv_path: str):
                     metrics=metric_values,
                     mean_ks=float(mean_ks) if mean_ks is not None else float("nan"),
                     std_ks=metric_values.get("ks", {}).get("std"),
-                    n_valid_runs=metric_values.get("ks", {}).get("n_valid"),
+                    n_valid_ks=metric_values.get("ks", {}).get("n_valid"),
                     N_i=_parse_float_list(raw_row.get("N_i", "")),
                     N_i_std=_parse_float_list(raw_row.get("N_i_std", "")),
                 )
@@ -454,16 +444,6 @@ def _compact_params_label(params: dict[str, Any]) -> str:
 
 def _pretty_name(name: str) -> str:
     return name.upper() if name == "ddim" else str(name).replace("_", " ")
-
-
-def _short_sigma_mode(name: str) -> str:
-    if name == "joint":
-        return "joint"
-    if name == "independent":
-        return "ind"
-    if name == "crossfit_q":
-        return "cf-Q MLP"
-    return str(name).replace("_", " ")
 
 
 def _sampling_key(row: Row):
@@ -549,10 +529,8 @@ def _method_key(row: Row):
         return ("solver", *_solver_family_key(row))
     return (
         "adaptive",
-        row.sigma_mode,
-        row.crossfit_q_mlp_loss if row.sigma_mode == "crossfit_q" else "",
+        row.crossfit_q_mlp_loss,
         bool(row.reuse),
-        bool(row.free_B1),
         row.optimizer,
     )
 
@@ -609,13 +587,7 @@ def _solver_rows(rows):
 
 
 def _mode_key(row: Row):
-    return (
-        row.sigma_mode,
-        row.crossfit_q_mlp_loss if row.sigma_mode == "crossfit_q" else "",
-        bool(row.reuse),
-        bool(row.free_B1),
-        row.optimizer,
-    )
+    return (row.crossfit_q_mlp_loss, bool(row.reuse), row.optimizer)
 
 
 def _mode_keys(rows):
@@ -623,12 +595,10 @@ def _mode_keys(rows):
 
 
 def _mode_title(mode_key):
-    sigma_mode, crossfit_q_mlp_loss, reuse, free_b1, optimizer = mode_key
-    label = f"{_short_sigma_mode(sigma_mode)} {'reuse' if reuse else 'fresh'}"
-    if sigma_mode == "crossfit_q" and crossfit_q_mlp_loss:
+    crossfit_q_mlp_loss, reuse, optimizer = mode_key
+    label = "reuse" if reuse else "fresh"
+    if crossfit_q_mlp_loss:
         label += f" {crossfit_q_mlp_loss}"
-    if free_b1:
-        label += " free"
     if optimizer:
         label += f" {optimizer}"
     return label
@@ -771,10 +741,10 @@ def _ci_multiplier(confidence_level: float, degrees_of_freedom: int):
     return float(t.ppf(quantile, degrees_of_freedom))
 
 
-def _ci_half_width(std_ks, n_valid_runs, ci_level):
-    if std_ks is None or n_valid_runs is None or n_valid_runs <= 1:
+def _ci_half_width(std_ks, n_valid_ks, ci_level):
+    if std_ks is None or n_valid_ks is None or n_valid_ks <= 1:
         return None
-    return _ci_multiplier(ci_level, n_valid_runs - 1) * std_ks / math.sqrt(n_valid_runs)
+    return _ci_multiplier(ci_level, n_valid_ks - 1) * std_ks / math.sqrt(n_valid_ks)
 
 
 def _fill_interval(ax, x_values, y_values, half_widths, color, zorder):
@@ -1134,9 +1104,9 @@ def _plot_main(rows, args):
     return fig
 
 
-def _best_adaptive_rows(rows, *, include_free=False, metric: str = "ks"):
+def _best_adaptive_rows(rows, *, metric: str = "ks"):
     candidates = [
-        row for row in _adaptive_rows(rows) if include_free or not row.free_B1
+        row for row in _adaptive_rows(rows)
     ]
     selected = _best_by_group(
         candidates, key_fn=lambda row: (_schedule_key(row), row.B), metric=metric
@@ -1178,7 +1148,7 @@ def _format_best_config_label(series_key):
 
 def _best_adaptive_improvement_points(rows, metric: str = "ks"):
     best_adaptive = _best_by_group(
-        (row for row in _adaptive_rows(rows) if not row.free_B1),
+        _adaptive_rows(rows),
         key_fn=lambda row: row.B,
         metric=metric,
     )

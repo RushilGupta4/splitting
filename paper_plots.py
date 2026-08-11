@@ -47,9 +47,14 @@ EXPECTED_MLP_PARAMS = {
     "loss": "mse",
     "device": "runner",
     "num_threads": 2,
-    "compile": False,
 }
-EXPECTED_GRID_PARAMS = {"num_queries": 1_024, "tail_eps": 0.0001}
+EXPECTED_QUERY_PARAMS = {
+    "num_queries": 1_024,
+    "k_max": 64,
+    "mass_min": 0.05,
+    "mass_max": 0.95,
+    "mass_bins": 16,
+}
 
 OU_TARGET = {
     "name": "simple_ou",
@@ -86,8 +91,8 @@ LANGEVIN_TARGET = {
     "initial_distribution": {
         "kind": "diagonal_normal",
         "dimension": 2,
-        "mean": [-1.0, -1.0],
-        "variance": [0.01, 0.01],
+        "mean": [0.0, 0.0],
+        "variance": [0.5, 0.5],
     },
     "params": {
         "barrier_coefficient": 4.0,
@@ -122,7 +127,6 @@ MODELS = (
         "budgets": (100_000, 200_000, 500_000, 1_000_000, 2_000_000, 5_000_000),
         "steps": (130, 160, 220, 280, 350, 475),
         "sampler": "euler",
-        "subset_sizes": [8, 16, 32, 64],
         "reference_size": 2_500_000,
         "target": OU_TARGET,
         "reference_generation": {
@@ -145,13 +149,12 @@ MODELS = (
         "budgets": (100_000, 200_000, 500_000, 1_000_000, 2_000_000, 5_000_000),
         "steps": (130, 160, 220, 280, 350, 475),
         "sampler": "euler",
-        "subset_sizes": [1, 2],
         "reference_size": 2_500_000,
         "target": LANGEVIN_TARGET,
         "reference_generation": {
             "method": "sde_terminal_samples",
             "sampler": "euler",
-            "sampling_steps": 10_000,
+            "sampling_steps": 20_000,
             "terminal_time": 2.0,
         },
     },
@@ -168,7 +171,6 @@ MODELS = (
         "budgets": (100_000, 200_000, 500_000, 1_000_000, 2_000_000),
         "steps": (40, 45, 55, 63, 73),
         "sampler": "edm_stochastic",
-        "subset_sizes": [8, 16, 32, 64],
         "reference_size": 5_000_000,
         "target": EDM_TARGET,
         "reference_generation": {"method": "target_samples"},
@@ -186,7 +188,6 @@ MODELS = (
         "budgets": (50_000, 100_000, 250_000, 500_000, 1_000_000),
         "steps": (200, 252, 340, 430, 542),
         "sampler": "ddpm",
-        "subset_sizes": [8, 16, 32, 64],
         "reference_size": 20_000,
         "target": None,
         "reference_generation": {
@@ -319,7 +320,7 @@ def _load_manifest_rows(
                 for raw in csv.DictReader(handle):
                     metric = model["metric"]
                     metric_n = raw.get(f"n_valid_{metric}", "")
-                    n = int(metric_n or raw["n_valid_runs"])
+                    n = int(metric_n or raw["n_valid_ks"])
                     if n != model["n_runs"]:
                         raise RuntimeError(
                             f"{csv_path}: expected {model['n_runs']} runs, found {n}"
@@ -484,14 +485,6 @@ def _config_matches(row: ResultRow, config: dict[str, Any]) -> bool:
     if not row.is_adaptive:
         return spec.get("mode") == "fixed_N"
 
-    expected_query = {
-        "subset_sizes": row.model["subset_sizes"],
-        "mass_min": 0.05,
-        "mass_max": 0.95,
-        "rank_spread": 0.4,
-        "subset_seed": 0,
-        "mass_bins": 16,
-    }
     return (
         spec.get("mode") == "estimate_and_sample"
         and tuple(float(value) for value in spec.get("split_percentages", []))
@@ -499,10 +492,7 @@ def _config_matches(row: ResultRow, config: dict[str, Any]) -> bool:
         and spec.get("B1") == row.pilot_budget
         and spec.get("optimization_mode") == row.optimizer
         and spec.get("reuse_phase1_samples") == row.reuse
-        and spec.get("sigma_estimation_mode") == "crossfit_q"
-        and key.get("crossfit_q_folds") == 1
-        and key.get("grid_free_params") == EXPECTED_GRID_PARAMS
-        and key.get("phase1_query_params") == expected_query
+        and key.get("query_params") == EXPECTED_QUERY_PARAMS
         and key.get("crossfit_q_mlp_params") == EXPECTED_MLP_PARAMS
     )
 
@@ -516,8 +506,6 @@ def _read_valid_records(
     with path.open() as handle:
         for line in handle:
             record = json.loads(line)
-            if record.get("extinct", False):
-                continue
             value = record.get("metrics", {}).get(metric)
             if value is None and metric == "ks":
                 value = record.get("ks_distance")

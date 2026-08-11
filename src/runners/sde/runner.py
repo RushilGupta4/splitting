@@ -7,12 +7,12 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 import torch
 
-from ks import (
-    coerce_samples_np,
+from metrics.ks import (
     compute_reference_ks_distance,
     prepare_reference_cdf_state,
     warm_reference_ks_kernel,
 )
+from metrics.utils import coerce_samples_np
 from runners.base import BaseRunner, ComparisonModeSpec, SamplingConfig
 from runners.sde.cases import SDE_CASES
 from runners.sde.sampling import SDE_SAMPLERS, sample_sde_segment
@@ -60,7 +60,6 @@ class SDERunner(BaseRunner):
         reference_sampler: str = "euler",
         reference_steps: int = 5000,
         dimension: int = 1,
-        coupling_strength: float | None = None,
         device: str = "cpu",
         checkpoint_path: str | None = None,
     ):
@@ -92,31 +91,6 @@ class SDERunner(BaseRunner):
             sampler == "milstein" or reference_sampler == "milstein"
         ):
             raise ValueError("Milstein sampler requires diagonal diffusion")
-        if coupling_strength is not None and not math.isfinite(
-            float(coupling_strength)
-        ):
-            raise ValueError("coupling_strength must be finite")
-        if dimension == 1:
-            effective_coupling = 0.0
-        elif case.mean_field_coupling_default is None:
-            effective_coupling = (
-                0.0 if coupling_strength is None else float(coupling_strength)
-            )
-            if effective_coupling != 0.0:
-                raise ValueError(
-                    f"{case.name} has native multivariate dynamics and does not "
-                    "support generic mean-field coupling"
-                )
-        else:
-            effective_coupling = (
-                float(case.mean_field_coupling_default)
-                if coupling_strength is None
-                else float(coupling_strength)
-            )
-            if effective_coupling <= 0.0:
-                raise ValueError(
-                    "coupling_strength must be positive when dimension > 1"
-                )
 
         self._case = case
         self._sampler = str(sampler)
@@ -125,14 +99,12 @@ class SDERunner(BaseRunner):
         self._reference_sampler = str(reference_sampler)
         self._reference_steps = int(reference_steps)
         self._dimension = int(dimension)
-        self._coupling_strength = float(effective_coupling)
         self._device = str(device)
         self._dtype = torch.float32
         self._checkpoint_path = checkpoint_path or self.default_checkpoint_path()
         self._target_spec = self._case.target_spec_factory(
             self._terminal_time,
             self._dimension,
-            self._coupling_strength,
         )
 
     @classmethod
@@ -143,7 +115,6 @@ class SDERunner(BaseRunner):
             "--sampler", choices=SUPPORTED_SAMPLERS, default=cls.DEFAULT_SAMPLER
         )
         parser.add_argument("--dimension", type=int, default=1)
-        parser.add_argument("--coupling_strength", type=float, default=None)
         parser.add_argument("--device", type=str, default="cpu")
 
     @classmethod
@@ -173,7 +144,7 @@ class SDERunner(BaseRunner):
             "reference_sampler",
             "reference_steps",
         }
-        runner_defaults = {"dimension", "coupling_strength"} & set(kwargs)
+        runner_defaults = {"dimension"} & set(kwargs)
         if runner_defaults:
             raise ValueError(
                 f"{type(self).__name__}.with_sampling_config cannot change runner "
@@ -193,7 +164,6 @@ class SDERunner(BaseRunner):
             ),
             reference_steps=int(kwargs.get("reference_steps", self._reference_steps)),
             dimension=self._dimension,
-            coupling_strength=self._coupling_strength,
             device=self._device,
             checkpoint_path=self._checkpoint_path,
         )
@@ -205,10 +175,6 @@ class SDERunner(BaseRunner):
     @property
     def input_dim(self) -> int:
         return int(self._dimension)
-
-    @property
-    def coupling_strength(self) -> float:
-        return float(self._coupling_strength)
 
     @property
     def target_spec(self) -> Mapping[str, Any]:
@@ -306,7 +272,6 @@ class SDERunner(BaseRunner):
             sampling_steps=self._sampling_steps,
             terminal_time=self._terminal_time,
             dimension=self._dimension,
-            coupling_strength=self._coupling_strength,
             device=self._device,
             dtype=self._dtype,
             generator=generator,
@@ -807,22 +772,6 @@ class SimpleOURunner(SDERunner):
     config_module = "runners.sde.simple_ou.configs"
 
 
-class CEVSecurityPriceRunner(SDERunner):
-    """SDE runner for the Duffie-Glynn CEV security-price model."""
-
-    runner_name = "cev_security_price"
-    case_name = "cev_security_price"
-    config_module = "runners.sde.cev_security_price.configs"
-
-
-class SmoothThresholdAutoregressionRunner(SDERunner):
-    """SDE runner for a smooth threshold autoregression model."""
-
-    runner_name = "smooth_threshold_autoregression"
-    case_name = "smooth_threshold_autoregression"
-    config_module = "runners.sde.smooth_threshold_autoregression.configs"
-
-
 class CoupledDoubleWellLangevinRunner(SDERunner):
     """SDE runner for coupled double-well overdamped Langevin dynamics."""
 
@@ -833,7 +782,5 @@ class CoupledDoubleWellLangevinRunner(SDERunner):
 
 SDE_RUNNER_CLASSES = {
     SimpleOURunner.runner_name: SimpleOURunner,
-    CEVSecurityPriceRunner.runner_name: CEVSecurityPriceRunner,
-    SmoothThresholdAutoregressionRunner.runner_name: SmoothThresholdAutoregressionRunner,
     CoupledDoubleWellLangevinRunner.runner_name: CoupledDoubleWellLangevinRunner,
 }

@@ -36,7 +36,6 @@ def build_sampling_trial_result(
     samples_tensor = (
         samples if isinstance(samples, torch.Tensor) else torch.as_tensor(samples)
     )
-    leaf_count = int(samples_tensor.reshape(-1, samples_tensor.shape[-1]).shape[0])
 
     metric_values, metric_payloads = compute_trial_metrics(
         samples_tensor,
@@ -47,10 +46,7 @@ def build_sampling_trial_result(
         phase1_x0_samples=phase1_x0_samples,
     )
 
-    result: Dict[str, Any] = {
-        "metrics": metric_values,
-        "leaf_count": int(leaf_count),
-    }
+    result: Dict[str, Any] = {"metrics": metric_values}
     if metric_payloads:
         result["metric_payloads"] = metric_payloads
     if "ks" in metric_values:
@@ -103,25 +99,16 @@ def summarize_sampling_trials(
     metrics: Sequence[str] = ("ks",),
 ):
     if not trial_results:
-        result = {
-            "n_valid_runs": 0,
-            "extinction_rate": 0.0,
-        }
+        result: Dict[str, Any] = {}
         for metric in metrics:
             result[f"mean_{metric}"] = float("nan")
             result[f"std_{metric}"] = float("nan")
             result[f"n_valid_{metric}"] = 0
         return result
 
-    leaf_counts = np.array(
-        [trial.get("leaf_count", 0) for trial in trial_results], dtype=float
-    )
-    return {
-        "extinction_rate": (
-            float((leaf_counts == 0).mean()) if leaf_counts.size else 0.0
-        ),
-        **summarize_metric_trials(trial_results, metrics),
-    }
+    # A split never shrinks the path count -- the allocation is monotone so every
+    # N_i >= 1, and n0 >= 1 -- so a run can never end with zero samples.
+    return summarize_metric_trials(trial_results, metrics)
 
 
 def mean_scalar(values: Sequence[float | int]):

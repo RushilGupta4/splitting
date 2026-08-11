@@ -1,3 +1,5 @@
+"""Exact Kolmogorov-Smirnov distances (1-D, and 2-D lower-orthant)."""
+
 import math
 from typing import Any, Dict
 
@@ -5,56 +7,12 @@ import numpy as np
 import torch
 from numba import njit
 
+from metrics.utils import coerce_samples_np
+
 KS_QUADRATURE_POINTS = 96
 KS_QUAD_NODES, KS_QUAD_WEIGHTS = np.polynomial.legendre.leggauss(KS_QUADRATURE_POINTS)
 KS_QUAD_NODES = np.ascontiguousarray(KS_QUAD_NODES, dtype=np.float32)
 KS_QUAD_WEIGHTS = np.ascontiguousarray(KS_QUAD_WEIGHTS, dtype=np.float32)
-
-
-def coerce_samples_np(samples, expected_dim: int | None = None) -> np.ndarray:
-    samples_np = (
-        samples.detach().cpu().numpy() if isinstance(samples, torch.Tensor) else samples
-    )
-    samples_np = np.asarray(samples_np, dtype=float)
-    if samples_np.ndim == 0:
-        samples_np = samples_np.reshape(1, 1)
-    elif samples_np.ndim == 1:
-        samples_np = samples_np.reshape(-1, 1)
-    elif samples_np.ndim > 2:
-        samples_np = samples_np.reshape(-1, samples_np.shape[-1])
-    if samples_np.ndim != 2:
-        raise ValueError(f"Expected samples of shape [N, D], got {samples_np.shape}")
-    if expected_dim is not None and samples_np.shape[1] != int(expected_dim):
-        raise ValueError(
-            f"Expected samples of shape [N, {int(expected_dim)}], got {samples_np.shape}"
-        )
-    return samples_np
-
-
-def coerce_samples_tensor(
-    samples, device=None, expected_dim: int | None = None
-) -> torch.Tensor:
-    if isinstance(samples, torch.Tensor):
-        tensor = samples.detach()
-        if device is not None:
-            tensor = tensor.to(device=device)
-    else:
-        tensor = torch.as_tensor(samples, device=device)
-    tensor = tensor.to(dtype=torch.float32)
-    if tensor.ndim == 0:
-        tensor = tensor.reshape(1, 1)
-    elif tensor.ndim == 1:
-        tensor = tensor.reshape(-1, 1)
-    elif tensor.ndim > 2:
-        tensor = tensor.reshape(-1, tensor.shape[-1])
-    tensor = tensor.contiguous()
-    if tensor.ndim != 2:
-        raise ValueError(f"Expected samples of shape [N, D], got {tuple(tensor.shape)}")
-    if expected_dim is not None and tensor.shape[1] != int(expected_dim):
-        raise ValueError(
-            f"Expected samples of shape [N, {int(expected_dim)}], got {tuple(tensor.shape)}"
-        )
-    return tensor
 
 
 def _require_sample_dim(samples_np: np.ndarray, dim: int) -> np.ndarray:

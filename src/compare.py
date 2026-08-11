@@ -14,13 +14,11 @@ import torch
 from tqdm import tqdm
 
 from adaptive import (
-    CROSSFIT_Q_DEFAULT_FOLDS,
     CROSSFIT_Q_DEFAULT_MLP_RUN_PARALLELISM,
     SUPPORTED_OPTIMIZATION_MODES,
     _crossfit_q_normalize_mlp_params,
     _crossfit_q_normalize_mlp_run_parallelism,
-    _normalize_grid_free_params,
-    _normalize_phase1_query_params,
+    _normalize_query_params,
     run_estimate_and_sample,
 )
 from baselines import run_fixed_N_sampling, run_solver_baseline_sampling
@@ -52,11 +50,6 @@ from utils import validate_split_percentages
 
 log = logging.getLogger("compare")
 
-SUPPORTED_SIGMA_ESTIMATION_MODES = {
-    "joint",
-    "independent",
-    "crossfit_q",
-}
 _FILE_IDENTITY_CACHE: Dict[str, Dict[str, Any]] = {}
 
 CSV_FIELDS = [
@@ -68,10 +61,8 @@ CSV_FIELDS = [
     "B",
     "B1",
     "B1_spec",
-    "sigma_mode",
     "crossfit_q_mlp_loss",
     "reuse",
-    "free_B1",
     "optimizer",
     "solver",
     "solver_steps",
@@ -82,7 +73,7 @@ CSV_FIELDS = [
     "n_valid_mmd",
     "mean_ks",
     "std_ks",
-    "n_valid_runs",
+    "n_valid_ks",
     "N_i",
     "N_i_std",
 ]
@@ -97,7 +88,6 @@ def parse_args():
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--n_runs", type=int, default=None)
     parser.add_argument("--n_parallel", type=int, default=None)
-    parser.add_argument("--crossfit_q_folds", type=int, default=None)
     parser.add_argument("--crossfit_q_mlp_run_parallelism", type=int, default=None)
     parser.add_argument(
         "--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu"
@@ -208,7 +198,7 @@ def _resolve_b1_for_budget(value, budget: int, *, config_key: str = "B1") -> int
 
 def _validate_b1_lists(cfg: Mapping[str, Any]) -> None:
     for budget in cfg["B_list"]:
-        for config_key in ("B1_list", "free_B1_list"):
+        for config_key in ("B1_list",):
             for value in cfg.get(config_key, []):
                 _resolve_b1_for_budget(value, int(budget), config_key=config_key)
 
@@ -237,7 +227,6 @@ def _validate_config(cfg: dict, *, runner, config_name: str):
         "sampling_configs",
         "B_list",
         "B1_list",
-        "sigma_modes",
         "baselines",
         "split_percentages_list",
         "n_runs",
@@ -305,49 +294,23 @@ def _validate_config(cfg: dict, *, runner, config_name: str):
                 "CIFAR reference-sample metrics require the torchvision "
                 "CIFAR-10 training set"
             )
-    sigma_modes = set(cfg["sigma_modes"])
-    if not sigma_modes <= SUPPORTED_SIGMA_ESTIMATION_MODES:
-        raise ValueError(
-            f"Unknown sigma_modes: {sorted(sigma_modes - SUPPORTED_SIGMA_ESTIMATION_MODES)}"
-        )
-    if not sigma_modes:
-        raise ValueError("sigma_modes must be non-empty")
-    cfg["grid_free_params"] = _normalize_grid_free_params(cfg.get("grid_free_params"))
-    cfg["phase1_query_params"] = _normalize_phase1_query_params(
-        cfg.get("phase1_query_params")
+    cfg["query_params"] = _normalize_query_params(cfg.get("query_params"))
+    cfg["crossfit_q_mlp_params"] = _crossfit_q_normalize_mlp_params(
+        cfg.get("crossfit_q_mlp_params")
     )
-    if "joint" in sigma_modes:
-        if "joint_m" not in cfg:
-            raise ValueError("joint_m is required when sigma_modes includes joint")
-        joint_m = float(cfg["joint_m"])
-        if not np.isfinite(joint_m) or joint_m <= 1.0:
-            raise ValueError("joint_m must be finite and > 1")
-    if "crossfit_q" in sigma_modes:
-        if int(cfg.get("crossfit_q_folds", CROSSFIT_Q_DEFAULT_FOLDS)) < 1:
-            raise ValueError("crossfit_q_folds must be at least 1")
-        cfg["crossfit_q_mlp_params"] = _crossfit_q_normalize_mlp_params(
-            cfg.get("crossfit_q_mlp_params")
-        )
-        cfg["crossfit_q_mlp_losses"] = _normalize_crossfit_q_mlp_losses(
-            cfg.get("crossfit_q_mlp_losses"), cfg["crossfit_q_mlp_params"]
-        )
-        cfg["crossfit_q_mlp_run_parallelism"] = (
-            _crossfit_q_normalize_mlp_run_parallelism(
-                cfg.get("crossfit_q_mlp_run_parallelism")
-            )
-        )
+    cfg["crossfit_q_mlp_losses"] = _normalize_crossfit_q_mlp_losses(
+        cfg.get("crossfit_q_mlp_losses"), cfg["crossfit_q_mlp_params"]
+    )
+    cfg["crossfit_q_mlp_run_parallelism"] = _crossfit_q_normalize_mlp_run_parallelism(
+        cfg.get("crossfit_q_mlp_run_parallelism")
+    )
     optimization_modes = _normalize_optimization_modes(
         cfg.get("optimization_modes", ["monotone"])
     )
-    unknown_optimization_modes = set(optimization_modes) - SUPPORTED_OPTIMIZATION_MODES
-    if unknown_optimization_modes:
-        raise ValueError(
-            "Unknown optimization_modes: "
-            f"{sorted(unknown_optimization_modes)}"
-        )
+    unknown = set(optimization_modes) - SUPPORTED_OPTIMIZATION_MODES
+    if unknown:
+        raise ValueError(f"Unknown optimization_modes: {sorted(unknown)}")
     cfg["optimization_modes"] = optimization_modes
-    if "independent" in sigma_modes and int(cfg.get("independent_n2", 3)) < 2:
-        raise ValueError("independent_n2 must be at least 2")
     if int(cfg["n_runs"]) < 1 or int(cfg.get("n_parallel", 1)) < 1:
         raise ValueError("n_runs and n_parallel must be at least 1")
     cfg["max_sampling_batch_size"] = normalize_max_sampling_batch_size(
@@ -380,7 +343,7 @@ def _validate_config(cfg: dict, *, runner, config_name: str):
 
 def _normalize_crossfit_q_mlp_losses(raw_losses, mlp_params):
     if raw_losses is None:
-        raise ValueError("crossfit_q_mlp_losses is required when sigma_modes includes crossfit_q")
+        raise ValueError("crossfit_q_mlp_losses is required")
     if isinstance(raw_losses, str):
         raw_losses = [raw_losses]
     losses = []
@@ -420,8 +383,6 @@ def _apply_overrides(cfg: dict, args):
         cfg["n_parallel"] = int(args.n_parallel)
     else:
         cfg["n_parallel"] = int(cfg.get("n_parallel", 1))
-    if args.crossfit_q_folds is not None:
-        cfg["crossfit_q_folds"] = int(args.crossfit_q_folds)
     if args.crossfit_q_mlp_run_parallelism is not None:
         cfg["crossfit_q_mlp_run_parallelism"] = int(
             args.crossfit_q_mlp_run_parallelism
@@ -463,87 +424,52 @@ def _resolve_solver_baseline_for_budget(cfg, baseline_spec, B: int, step_schedul
     return spec
 
 
-def _crossfit_q_loss_options_for_mode(cfg, sigma_mode):
-    if str(sigma_mode) != "crossfit_q":
-        return [None]
-    mlp_params = _crossfit_q_normalize_mlp_params(cfg.get("crossfit_q_mlp_params"))
+def _crossfit_q_loss_options(cfg):
     return _normalize_crossfit_q_mlp_losses(
-        cfg.get("crossfit_q_mlp_losses"), mlp_params
+        cfg.get("crossfit_q_mlp_losses"),
+        _crossfit_q_normalize_mlp_params(cfg.get("crossfit_q_mlp_params")),
     )
 
 
 def _build_trial_specs(cfg, baselines):
     specs: List[Dict[str, Any]] = []
-    B1_list = cfg["B1_list"]
-    free_B1_list = cfg.get("free_B1_list", [])
-    sigma_modes = cfg["sigma_modes"]
     optimization_modes = cfg.get("optimization_modes", ["monotone"])
     reuse_flags = cfg.get("reuse_flags", [True])
     schedule_baselines = [b for b in baselines if b["mode"] != "solver_baseline"]
     solver_baselines = [b for b in baselines if b["mode"] == "solver_baseline"]
 
+    def make(B, B1, B1_spec, resolved, *, reuse, optimizer, mlp_loss):
+        return {
+            "mode": "estimate_and_sample",
+            "B": int(B),
+            "B1": int(B1),
+            "B1_spec": B1_spec,
+            "sampling_config": dict(resolved.sampling_config),
+            "step_schedule": str(resolved.step_schedule),
+            "optimization_mode": str(optimizer),
+            "reuse_phase1_samples": bool(reuse),
+            "crossfit_q_mlp_loss": str(mlp_loss),
+        }
+
     for resolved in iter_budget_resolved_sampling_config_specs(cfg):
-        resolved_B1_list = _resolve_unique_b1_entries(
-            B1_list, resolved.budget, config_key="B1_list"
-        )
-        resolved_free_B1_list = _resolve_unique_b1_entries(
-            free_B1_list, resolved.budget, config_key="free_B1_list"
-        )
-        for sigma_mode in sigma_modes:
-            for B1_entry, reuse, optimizer, mlp_loss in itertools.product(
-                resolved_B1_list,
-                reuse_flags,
-                optimization_modes,
-                _crossfit_q_loss_options_for_mode(cfg, sigma_mode),
-            ):
-                B1, B1_spec = B1_entry
-                if B1 >= int(resolved.budget):
-                    log.info(
-                        "Skipping config with resolved B1=%s >= B=%s",
-                        B1,
-                        resolved.budget,
-                    )
-                    continue
-                spec = {
-                    "mode": "estimate_and_sample",
-                    "B": int(resolved.budget),
-                    "B1": B1,
-                    "sampling_config": dict(resolved.sampling_config),
-                    "step_schedule": str(resolved.step_schedule),
-                    "sigma_estimation_mode": str(sigma_mode),
-                    "optimization_mode": str(optimizer),
-                    "reuse_phase1_samples": bool(reuse),
-                    "free_B1": False,
-                    "B1_spec": B1_spec,
-                }
-                if mlp_loss is not None:
-                    spec["crossfit_q_mlp_loss"] = str(mlp_loss)
-                specs.append(spec)
-        # Free pilot: phase 1 cost is not charged against B, so B1 >= B is
-        # allowed. Pilot samples are never reused for KS — they only inform
-        # the N_i estimate.
-        for sigma_mode in sigma_modes:
-            for B1_entry, optimizer, mlp_loss in itertools.product(
-                resolved_free_B1_list,
-                optimization_modes,
-                _crossfit_q_loss_options_for_mode(cfg, sigma_mode),
-            ):
-                B1, B1_spec = B1_entry
-                spec = {
-                    "mode": "estimate_and_sample",
-                    "B": int(resolved.budget),
-                    "B1": B1,
-                    "sampling_config": dict(resolved.sampling_config),
-                    "step_schedule": str(resolved.step_schedule),
-                    "sigma_estimation_mode": str(sigma_mode),
-                    "optimization_mode": str(optimizer),
-                    "reuse_phase1_samples": False,
-                    "free_B1": True,
-                    "B1_spec": B1_spec,
-                }
-                if mlp_loss is not None:
-                    spec["crossfit_q_mlp_loss"] = str(mlp_loss)
-                specs.append(spec)
+        for B1_entry, reuse, optimizer, mlp_loss in itertools.product(
+            _resolve_unique_b1_entries(
+                cfg["B1_list"], resolved.budget, config_key="B1_list"
+            ),
+            reuse_flags,
+            optimization_modes,
+            _crossfit_q_loss_options(cfg),
+        ):
+            B1, B1_spec = B1_entry
+            if B1 >= int(resolved.budget):
+                log.info(
+                    "Skipping config with resolved B1=%s >= B=%s", B1, resolved.budget
+                )
+                continue
+            specs.append(
+                make(resolved.budget, B1, B1_spec, resolved, reuse=reuse,
+                     optimizer=optimizer, mlp_loss=mlp_loss)
+            )
         for baseline_spec in schedule_baselines:
             specs.append(
                 {
@@ -611,17 +537,11 @@ def _run_trial(
             N_i_list=[],
         )
     crossfit_q_mlp_params = dict(cfg.get("crossfit_q_mlp_params") or {})
-    if spec["sigma_estimation_mode"] == "crossfit_q":
-        crossfit_q_mlp_params["loss"] = str(spec["crossfit_q_mlp_loss"])
+    crossfit_q_mlp_params["loss"] = str(spec["crossfit_q_mlp_loss"])
     return run_estimate_and_sample(
         **common,
         B1=int(spec["B1"]),
         split_percentages=split_percentages,
-        independent_n2=int(cfg.get("independent_n2", 3)),
-        joint_m=float(cfg.get("joint_m", 2.0)),
-        crossfit_q_folds=int(
-            cfg.get("crossfit_q_folds", CROSSFIT_Q_DEFAULT_FOLDS)
-        ),
         crossfit_q_mlp_run_parallelism=int(
             cfg.get(
                 "crossfit_q_mlp_run_parallelism",
@@ -629,12 +549,9 @@ def _run_trial(
             )
         ),
         crossfit_q_mlp_params=crossfit_q_mlp_params,
-        grid_free_params=dict(cfg.get("grid_free_params") or {}),
-        phase1_query_params=dict(cfg.get("phase1_query_params") or {}),
-        variance_estimation_mode=spec["sigma_estimation_mode"],
-        optimization_mode=spec.get("optimization_mode", "monotone"),
+        optimization_mode=str(spec["optimization_mode"]),
         reuse_phase1_samples=bool(spec["reuse_phase1_samples"]),
-        free_pilot=bool(spec.get("free_B1", False)),
+        query_params=dict(cfg.get("query_params") or {}),
     )
 
 
@@ -730,11 +647,9 @@ def _method_display(row: Mapping[str, Any]) -> str:
         if params != "{}":
             label += f" {params}"
         return label
-    label = f"{row.get('sigma_mode', '')} {'reuse' if row.get('reuse') else 'fresh'}"
+    label = f"{'reuse' if row.get('reuse') else 'fresh'}"
     if row.get("crossfit_q_mlp_loss"):
         label += f" loss={row['crossfit_q_mlp_loss']}"
-    if row.get("free_B1"):
-        label += " free-B1"
     optimizer = str(row.get("optimizer") or "")
     if optimizer:
         label += f" {optimizer}"
@@ -775,29 +690,10 @@ def _canonical_spec_for_cache(spec: Mapping[str, Any], *, runner, split_percenta
     key["split_percentages"] = [float(x) for x in split_percentages]
 
     if mode == "estimate_and_sample":
-        key.update(
-            {
-                "B1": int(spec["B1"]),
-                "sigma_estimation_mode": str(spec["sigma_estimation_mode"]),
-                "reuse_phase1_samples": bool(spec["reuse_phase1_samples"]),
-            }
-        )
-        B1_mode, B1_payload = str(spec["B1_spec"]).split(":", 1)
-        if B1_mode == "ratio":
-            # Retain the existing ratio cache shape for cache compatibility.
-            key["B1_ratio"] = float(B1_payload)
-        elif B1_mode == "power":
-            coefficient, exponent = B1_payload.split(",", 1)
-            key["B1_power"] = {
-                "C": coefficient,
-                "alpha": exponent,
-            }
-        elif B1_mode != "absolute":
-            raise ValueError(f"Unknown B1 spec mode {B1_mode!r}")
-        optimization_mode = str(spec.get("optimization_mode", "monotone"))
-        key["optimization_mode"] = optimization_mode
-        if spec.get("free_B1"):
-            key["free_B1"] = True
+        key["B1"] = int(spec["B1"])
+        key["B1_spec"] = str(spec["B1_spec"])
+        key["optimization_mode"] = str(spec["optimization_mode"])
+        key["reuse_phase1_samples"] = bool(spec["reuse_phase1_samples"])
         return key
 
     raise ValueError(f"Unknown trial mode {mode!r}")
@@ -813,9 +709,13 @@ def _config_cache_key(
     reference_generation_config,
     split_percentages,
 ):
+    """Everything a cached run depends on.
+
+    `_validate_config` has already checked `comparison_mode` against the runner,
+    so the mode spec is guaranteed to resolve.
+    """
     mode_spec = next(
-        (s for s in runner.comparison_modes() if s.name == cfg["comparison_mode"]),
-        None,
+        s for s in runner.comparison_modes() if s.name == cfg["comparison_mode"]
     )
     key = {
         "runner": args.runner,
@@ -830,49 +730,21 @@ def _config_cache_key(
         ),
     }
     if mode_spec.requires_reference_cache and uses_reference_samples(cfg["metrics"]):
-        key["reference_cache_key"] = _json_safe(
-            dict(
-                reference_runner.reference_cache_key(
-                    cfg["comparison_mode"], reference_generation_config
-                )
-            )
+        ref_key = reference_runner.reference_cache_key(
+            cfg["comparison_mode"], reference_generation_config
         )
+        key["reference_cache_key"] = _json_safe(dict(ref_key))
         key["num_base_samples"] = int(cfg["num_base_samples"])
+        key["reference_samples_path"] = _file_identity(
+            reference_samples_path_for_key(reference_runner.checkpoint_path, ref_key)
+        )
     if spec["mode"] == "estimate_and_sample":
-        sigma_mode = str(spec.get("sigma_estimation_mode"))
-        key["grid_free_params"] = _json_safe(
-            _normalize_grid_free_params(cfg.get("grid_free_params"))
+        key["query_params"] = _json_safe(_normalize_query_params(cfg["query_params"]))
+        mlp_params = dict(cfg["crossfit_q_mlp_params"])
+        mlp_params["loss"] = str(spec["crossfit_q_mlp_loss"])
+        key["crossfit_q_mlp_params"] = _json_safe(
+            _crossfit_q_normalize_mlp_params(mlp_params)
         )
-        key["phase1_query_params"] = _json_safe(
-            _normalize_phase1_query_params(cfg.get("phase1_query_params"))
-        )
-        if spec.get("sigma_estimation_mode") == "independent":
-            key["independent_n2"] = int(cfg.get("independent_n2", 3))
-        if spec.get("sigma_estimation_mode") == "joint":
-            key["joint_m"] = float(cfg["joint_m"])
-        if sigma_mode == "crossfit_q":
-            raw_mlp_params = dict(cfg.get("crossfit_q_mlp_params") or {})
-            raw_mlp_params["loss"] = str(spec["crossfit_q_mlp_loss"])
-            mlp_params = _crossfit_q_normalize_mlp_params(raw_mlp_params)
-            key["crossfit_q_folds"] = int(
-                cfg.get("crossfit_q_folds", CROSSFIT_Q_DEFAULT_FOLDS)
-            )
-            key["crossfit_q_mlp_params"] = _json_safe(
-                mlp_params
-            )
-
-    if mode_spec is None:
-        raise ValueError(
-            f"Runner {runner.runner_name!r} does not support comparison_mode {cfg['comparison_mode']!r}"
-        )
-    if mode_spec.requires_reference_cache and uses_reference_samples(cfg["metrics"]):
-        cache_path = reference_samples_path_for_key(
-            reference_runner.checkpoint_path,
-            reference_runner.reference_cache_key(
-                cfg["comparison_mode"], reference_generation_config
-            ),
-        )
-        key["reference_samples_path"] = _file_identity(cache_path)
     return key
 
 
@@ -904,14 +776,11 @@ def _trial_to_cache_record(spec, trial):
         metrics["ks"] = float(trial["ks_distance"])
     record = {
         "metrics": metrics,
-        "extinct": bool(int(trial.get("leaf_count", 0)) == 0),
     }
     if "ks" in metrics:
         record["ks_distance"] = float(metrics["ks"])
     if trial.get("metric_payloads"):
         record["metric_payloads"] = trial["metric_payloads"]
-    if "leaf_count" in trial:
-        record["leaf_count"] = int(trial["leaf_count"])
     if spec["mode"] == "estimate_and_sample":
         record["N_i"] = [float(x) for x in trial["N_i"]]
         record["n0"] = int(trial["n0"])
@@ -1024,10 +893,8 @@ def _aggregate_cached_runs(spec, trials, *, base_runner, split_percentages, cfg)
         "B": int(spec["B"]),
         "B1": "",
         "B1_spec": "",
-        "sigma_mode": "",
         "crossfit_q_mlp_loss": "",
         "reuse": "",
-        "free_B1": "",
         "optimizer": "",
         "solver": solver,
         "solver_steps": int(solver_steps) if solver_steps != "" else "",
@@ -1046,10 +913,8 @@ def _aggregate_cached_runs(spec, trials, *, base_runner, split_percentages, cfg)
         **base,
         "B1": int(spec["B1"]),
         "B1_spec": str(spec["B1_spec"]),
-        "sigma_mode": str(spec["sigma_estimation_mode"]),
         "crossfit_q_mlp_loss": str(spec.get("crossfit_q_mlp_loss") or ""),
         "reuse": bool(spec["reuse_phase1_samples"]),
-        "free_B1": bool(spec.get("free_B1", False)),
         "optimizer": str(spec.get("optimization_mode", "monotone")),
         "N_i": mean_vector([t["N_i"] for t in trials]),
         "N_i_std": std_vector([t["N_i"] for t in trials]),
@@ -1075,10 +940,8 @@ def _sort_key(row):
         value if valid else 0.0,
         str(row.get("B1_spec", "")),
         int(row["B1"] or 0),
-        str(row.get("sigma_mode", "")),
         str(row.get("crossfit_q_mlp_loss", "")),
         str(row.get("reuse", "")),
-        str(row.get("free_B1", "")),
         str(row.get("optimizer", "")),
     )
 

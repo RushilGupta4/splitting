@@ -19,14 +19,14 @@ from runners.ddpm.sampling import (
     sample_segment as _diffusion_sample_segment,
     segment_costs as _diffusion_segment_costs,
 )
-from ks import (
-    coerce_samples_np,
+from metrics.ks import (
     compute_reference_ks_distance,
     compute_target_ks_distance,
     prepare_reference_cdf_state,
     warm_ks_kernel_for_mode,
     warm_reference_ks_kernel,
 )
+from metrics.utils import coerce_samples_np
 from runners.base import (
     BaseRunner,
     ComparisonModeSpec,

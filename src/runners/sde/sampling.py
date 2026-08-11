@@ -117,7 +117,6 @@ def sample_sde_segment(
     sampling_steps: int,
     terminal_time: float,
     dimension: int,
-    coupling_strength: float,
     device: str,
     dtype: torch.dtype,
     generator=None,
@@ -131,7 +130,6 @@ def sample_sde_segment(
 
     dt = float(terminal_time) / float(sampling_steps)
     sqdt = math.sqrt(dt)
-    coupling = float(coupling_strength)
     diffusion_structure = str(getattr(case, "diffusion_structure", "diagonal"))
     if diffusion_structure not in {"diagonal", "matrix"}:
         raise ValueError(
@@ -144,8 +142,6 @@ def sample_sde_segment(
         case_t = t / float(terminal_time)
         x_prev = out
         drift = case.drift(case_t, x_prev)
-        if coupling != 0.0:
-            drift = drift + coupling * (x_prev.mean(dim=1, keepdim=True) - x_prev)
         diffusion = case.diffusion(case_t, x_prev)
         if diffusion_structure == "diagonal":
             noise_increment, d_w = _diagonal_noise_increment(
