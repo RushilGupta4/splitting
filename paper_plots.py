@@ -53,7 +53,6 @@ EXPECTED_QUERY_PARAMS = {
     "k_max": 64,
     "mass_min": 0.05,
     "mass_max": 0.95,
-    "mass_bins": 16,
 }
 
 OU_TARGET = {

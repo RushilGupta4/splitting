@@ -41,7 +41,6 @@ CROSSFIT_Q_DEFAULT_NUM_QUERIES = 1024
 CROSSFIT_Q_DEFAULT_K_MAX = 64
 CROSSFIT_Q_DEFAULT_MASS_MIN = 0.05
 CROSSFIT_Q_DEFAULT_MASS_MAX = 0.95
-CROSSFIT_Q_DEFAULT_MASS_BINS = 16
 
 _DEFAULT_CROSSFIT_Q_MLP_PARAMS: Dict[str, Any] = {
     "hidden_dims": list(CROSSFIT_Q_DEFAULT_MLP_HIDDEN_DIMS),
@@ -60,7 +59,6 @@ _DEFAULT_QUERY_PARAMS: Dict[str, Any] = {
     "k_max": CROSSFIT_Q_DEFAULT_K_MAX,
     "mass_min": CROSSFIT_Q_DEFAULT_MASS_MIN,
     "mass_max": CROSSFIT_Q_DEFAULT_MASS_MAX,
-    "mass_bins": CROSSFIT_Q_DEFAULT_MASS_BINS,
 }
 
 _CROSSFIT_Q_MLP_INIT_LOCK = Lock()
@@ -372,53 +370,38 @@ def _solve_frank_wolfe_monotone_allocation(
     return best_y
 
 
-def _weighted_cvar_profile(
-    M: np.ndarray,
-    losses: np.ndarray,
-    row_weights: np.ndarray,
-    *,
-    alpha: float,
-):
+def _cvar_profile(M: np.ndarray, losses: np.ndarray, *, alpha: float):
+    """Average of ``M`` over the worst ``1 - alpha`` fraction of queries.
+
+    Queries carry equal weight, so the CVaR adversary just fills the highest
+    losses first, each capped at ``1 / (n * (1 - alpha))``.
+    """
     alpha = float(alpha)
     if not 0.0 <= alpha < 1.0:
         raise ValueError("CVaR alpha must be in [0, 1)")
     losses = np.asarray(losses, dtype=float).reshape(-1)
-    row_weights = _normalize_query_weights(row_weights, losses.shape[0])
-    if M.shape[0] != losses.shape[0]:
+    count = losses.shape[0]
+    if M.shape[0] != count:
         raise ValueError("CVaR losses must match allocation matrix rows")
     if not np.isfinite(losses).all():
         raise ValueError("CVaR losses must be finite")
 
-    tail_mass = 1.0 - alpha
-    caps = row_weights / tail_mass
-    adversary = np.zeros_like(row_weights, dtype=float)
+    cap = 1.0 / (count * (1.0 - alpha))
+    adversary = np.zeros(count, dtype=float)
     remaining = 1.0
     for idx in np.argsort(losses)[::-1]:
-        take = min(float(caps[idx]), remaining)
-        if take > 0.0:
-            adversary[idx] = take
-            remaining -= take
+        adversary[idx] = min(cap, remaining)
+        remaining -= adversary[idx]
         if remaining <= 1e-12:
             break
-    total = float(adversary.sum())
-    if total <= 0.0:
-        raise ValueError("CVaR adversary weights have zero total")
-    adversary /= total
+    adversary /= float(adversary.sum())
     return adversary @ M, float(adversary @ losses)
-
-
-def _query_weights_for_allocation(query_metadata, count: int):
-    return _normalize_query_weights(
-        None if query_metadata is None else query_metadata.get("weights"),
-        int(count),
-    )
 
 
 def _solve_cvar_monotone_allocation(
     M: np.ndarray,
     *,
     cost_w: np.ndarray,
-    row_weights: np.ndarray,
     alpha: float = _MONOTONE_CVAR95_ALPHA,
     relative_tol: float = 1e-5,
     max_iters: int = 1000,
@@ -427,27 +410,16 @@ def _solve_cvar_monotone_allocation(
     num_points, num_levels = M.shape
     if num_points == 0 or num_levels == 0:
         raise ValueError("M must be non-empty")
-    row_weights = _normalize_query_weights(row_weights, num_points)
     weighted_M = M * cost_w[None, :]
     row_scores = np.sqrt(np.maximum(weighted_M, 0.0)).sum(axis=1)
-    profile, _ = _weighted_cvar_profile(
-        M,
-        row_scores,
-        row_weights,
-        alpha=alpha,
-    )
+    profile, _ = _cvar_profile(M, row_scores, alpha=alpha)
 
     best_y = np.asarray(cost_w, dtype=float).copy()
     best_upper = math.inf
     for iter_idx in range(max_iters):
         dual_lower, y = _monotone_dual_value_and_simplex(profile, cost_w)
         full_values = _objective_values(weighted_M, y)
-        target_profile, full_upper = _weighted_cvar_profile(
-            M,
-            full_values,
-            row_weights,
-            alpha=alpha,
-        )
+        target_profile, full_upper = _cvar_profile(M, full_values, alpha=alpha)
         if full_upper < best_upper:
             best_upper = full_upper
             best_y = y.copy()
@@ -465,11 +437,8 @@ def _solve_cvar_monotone_allocation(
             profile = (1.0 - gamma) * profile + gamma * target_profile
             if candidate_lower > dual_lower:
                 candidate_values = _objective_values(weighted_M, candidate_y)
-                _, candidate_upper = _weighted_cvar_profile(
-                    M,
-                    candidate_values,
-                    row_weights,
-                    alpha=alpha,
+                _, candidate_upper = _cvar_profile(
+                    M, candidate_values, alpha=alpha
                 )
                 if candidate_upper < best_upper:
                     best_upper = candidate_upper
@@ -478,27 +447,11 @@ def _solve_cvar_monotone_allocation(
     return best_y
 
 
-def _normalize_query_weights(weights, count: int):
-    if weights is None:
-        return np.full(int(count), 1.0 / float(count), dtype=float)
-    weights = np.asarray(weights, dtype=float).reshape(-1)
-    if weights.shape != (int(count),):
-        raise ValueError(f"query weights shape {weights.shape} != ({int(count)},)")
-    if not np.isfinite(weights).all() or np.any(weights < 0.0):
-        raise ValueError("query weights must be finite and nonnegative")
-    total = float(weights.sum())
-    if total <= 0.0:
-        raise ValueError("query weights must have positive total")
-    return weights / total
-
-
 def _solve_optimal_split_factors(
     variance2_per_level: np.ndarray,
     tau2: np.ndarray,
     cost_weights: Sequence[float],
     optimization_mode: str = "monotone",
-    *,
-    query_metadata: Mapping[str, Any] | None = None,
 ) -> List[float]:
     """Cost-optimal monotone split factors from the per-level variance grids.
 
@@ -531,10 +484,7 @@ def _solve_optimal_split_factors(
         simplex = _solve_frank_wolfe_monotone_allocation(M, cost_w=cost_w)
     else:
         simplex = _solve_cvar_monotone_allocation(
-            M,
-            cost_w=cost_w,
-            row_weights=_query_weights_for_allocation(query_metadata, M.shape[0]),
-            alpha=_MONOTONE_CVAR95_ALPHA,
+            M, cost_w=cost_w, alpha=_MONOTONE_CVAR95_ALPHA
         )
     simplex = np.asarray(simplex, dtype=float).reshape(-1)
     if simplex.shape != (num_levels,):
@@ -1112,10 +1062,6 @@ def _normalize_query_params(params: Mapping[str, Any] | None):
     ):
         raise ValueError("query_params requires 0 < mass_min < mass_max < 1")
 
-    merged["mass_bins"] = int(merged["mass_bins"])
-    if merged["mass_bins"] < 1:
-        raise ValueError("query_params.mass_bins must be >= 1")
-
     return merged
 
 
@@ -1127,47 +1073,17 @@ def _mass_grid(count: int, mass_min: float, mass_max: float):
     )
 
 
-def _empirical_query_weights(
-    subset_sizes: np.ndarray, empirical_mass: np.ndarray, mass_bins: int
-):
-    """Balance subset sizes, then occupied empirical-CDF bins within each size."""
-    subset_sizes = np.asarray(subset_sizes, dtype=np.int64)
-    empirical_mass = np.asarray(empirical_mass, dtype=float)
-    if subset_sizes.ndim != 1 or empirical_mass.shape != subset_sizes.shape:
-        raise ValueError("query weight metadata must be 1D with matching shapes")
-    if not np.isfinite(empirical_mass).all():
-        raise ValueError("empirical query CDF masses must be finite")
-    mass_bins = int(mass_bins)
-    if mass_bins < 1:
-        raise ValueError("query weights require at least one mass bin")
-    bins = np.floor(
-        np.clip(empirical_mass, 0.0, 1.0 - 1e-15) * mass_bins
-    ).astype(int)
-    bins = np.clip(bins, 0, int(mass_bins) - 1)
-    weights = np.zeros(subset_sizes.shape[0], dtype=float)
-    unique_sizes = np.unique(subset_sizes)
-    if unique_sizes.size == 0:
-        raise ValueError("query weights require at least one query")
-    for subset_size in unique_sizes:
-        size_mask = subset_sizes == subset_size
-        occupied_bins = np.unique(bins[size_mask])
-        for mass_bin in occupied_bins:
-            mask = size_mask & (bins == mass_bin)
-            weights[mask] = 1.0 / (
-                int(unique_sizes.size) * int(occupied_bins.size) * int(mask.sum())
-            )
-    weights /= float(weights.sum())
-    return weights
-
-
-def _generate_grid_free_queries(samples, query_params, *, design_seed):
+def _generate_grid_free_queries(samples, query_params, *, seed, run_index):
     """Sparse lower-orthant queries: a random coordinate subset per query, with
     the corner at per-coordinate empirical quantiles of the pilot samples.
 
-    For each query draw a size ``k`` log-uniform on {1..min(D, k_max)}, a random
+    For each query draw a size ``k`` uniform on {1..min(D, k_max)}, a random
     subset ``S`` of ``k`` coordinates, a mass ``m`` from an even grid over
     [mass_min, mass_max], and simplex weights ``w ~ Dirichlet(1_k)``. The corner
     sits at the ``m ** w_j`` quantile of coordinate ``S[j]``.
+
+    Uniform ``k`` makes the design its own reference measure, so the allocator
+    weights every query equally and nothing has to be reweighted afterwards.
 
     ``prod_j m**w_j == m`` exactly because ``sum_j w_j == 1``, and every rank
     lands in ``(m, 1)`` on its own -- so there is nothing to clip, rescale or
@@ -1175,8 +1091,9 @@ def _generate_grid_free_queries(samples, query_params, *, design_seed):
     is a spreading device that keeps queries non-degenerate at every ``k``, not
     a claim about the true mass.
 
-    ``design_seed`` is the run's global index, so every run draws its own design
-    and the estimator is never conditioned on one arbitrary query design.
+    The design is drawn from the sweep ``seed`` and the run's global index, so
+    runs never share a design and re-running with a new seed draws new ones --
+    the estimator is never conditioned on one arbitrary query design.
     """
     query_params = _normalize_query_params(query_params)
     samples_np = coerce_samples_np(samples)
@@ -1185,11 +1102,11 @@ def _generate_grid_free_queries(samples, query_params, *, design_seed):
     dim = int(samples_np.shape[1])
     total = int(query_params["num_queries"])
     k_max = min(dim, int(query_params["k_max"]))
-    rng = np.random.default_rng(int(design_seed) + 104729 * dim)
+    rng = np.random.default_rng(
+        np.random.SeedSequence([int(seed or 0), int(run_index), dim])
+    )
 
-    sizes = np.clip(
-        np.round(np.exp(rng.uniform(0.0, math.log(k_max), size=total))), 1, k_max
-    ).astype(np.int64)
+    sizes = rng.integers(1, k_max + 1, size=total).astype(np.int64)
     masses = _mass_grid(
         total, float(query_params["mass_min"]), float(query_params["mass_max"])
     )
@@ -1257,27 +1174,6 @@ def _lower_orthant_labels(samples, query_points):
     return result
 
 
-def _query_metadata(query_spec, labels: np.ndarray, *, mass_bins: int):
-    labels = np.asarray(labels, dtype=bool)
-    if labels.ndim != 2:
-        raise ValueError("query labels must be a 2D array")
-    if labels.shape[0] < 1:
-        raise ValueError("query metadata requires at least one path")
-    num_queries = labels.shape[1]
-    if not isinstance(query_spec, Mapping):
-        raise ValueError("query metadata requires sparse subset query specs")
-    subset_size = np.asarray(query_spec["active_sizes"], dtype=np.int64)
-    if subset_size.shape != (num_queries,):
-        raise ValueError("query metadata and labels disagree on query count")
-    empirical_mass = labels.mean(axis=0).astype(float)
-    weights = _empirical_query_weights(subset_size, empirical_mass, int(mass_bins))
-    return {
-        "weights": weights,
-        "empirical_mass": empirical_mass,
-        "n_paths": int(labels.shape[0]),
-    }
-
-
 def _simulate_crossfit_q_trajectories(
     runner,
     *,
@@ -1321,18 +1217,12 @@ def _simulate_crossfit_q_trajectories(
     return states, x0
 
 
-def _grid_free_query_payload(samples, query_params, *, design_seed):
+def _grid_free_query_payload(samples, query_params, *, seed, run_index):
     query_spec = _generate_grid_free_queries(
-        samples, query_params, design_seed=design_seed
+        samples, query_params, seed=seed, run_index=run_index
     )
     labels = _lower_orthant_labels(samples, query_spec)
-    labels_np = labels.detach().cpu().numpy().astype(np.bool_, copy=False)
-    query_metadata = _query_metadata(
-        query_spec,
-        labels_np,
-        mass_bins=int(_normalize_query_params(query_params)["mass_bins"]),
-    )
-    return query_spec, labels, query_metadata
+    return query_spec, labels
 
 
 def _estimate_crossfit_q_variance_for_run(
@@ -1369,6 +1259,7 @@ def _run_crossfit_q_phase1_sampling_batch(
     crossfit_q_mlp_run_parallelism=1,
     crossfit_q_mlp_params=None,
     query_params=None,
+    seed=None,
     run_index_offset=0,
     reuse_phase1_samples,
     chunk_size,
@@ -1419,19 +1310,14 @@ def _run_crossfit_q_phase1_sampling_batch(
 
     run_specs = []
     for run_idx in range(chunk_size):
-        query_spec, labels_tensor, query_metadata = _grid_free_query_payload(
+        query_spec, labels_tensor = _grid_free_query_payload(
             x0_by_run[run_idx],
             query_params,
-            design_seed=int(run_index_offset) + int(run_idx),
+            seed=seed,
+            run_index=int(run_index_offset) + int(run_idx),
         )
         labels = labels_tensor.detach().cpu().numpy().astype(np.bool_, copy=False)
-        run_specs.append(
-            {
-                "query_spec": query_spec,
-                "labels": labels,
-                "query_metadata": query_metadata,
-            }
-        )
+        run_specs.append({"query_spec": query_spec, "labels": labels})
 
     estimates_by_run: List[Any] = [None] * int(chunk_size)
     effective_mlp_workers = min(int(mlp_run_parallelism), int(chunk_size))
@@ -1488,7 +1374,6 @@ def _run_crossfit_q_phase1_sampling_batch(
                 "tau2": tau2,
                 "used_B1": int(used_B1),
                 "phase1_x0_samples": phase1_x0_by_run[run_idx],
-                "query_metadata": spec.get("query_metadata"),
             }
         )
     return payloads
@@ -1587,7 +1472,6 @@ def _solve_phase1_allocation(
         payload["tau2"],
         cost_weights,
         optimization_mode=optimization_mode,
-        query_metadata=payload.get("query_metadata"),
     )
     cost_per_root = runner.expected_cost_per_root(split_points, split_factors)
     B2 = B - int(payload["used_B1"])
@@ -1662,6 +1546,7 @@ def run_estimate_and_sample(
             payloads = _run_crossfit_q_phase1_sampling_batch(
                 runner,
                 B1=B1,
+                seed=seed,
                 run_index_offset=run_offset + start,
                 split_percentages=split_percentages,
                 reuse_phase1_samples=reuse_phase1_samples,

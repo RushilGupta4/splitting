@@ -12,15 +12,8 @@ SUPPORTED_B = [
     5_000_000,
     10_000_000,
 ]
-_N100_FIXED = {b: 100 for b in SUPPORTED_B}
-_N500_FIXED = {b: 500 for b in SUPPORTED_B}
-_N1000_FIXED = {b: 1000 for b in SUPPORTED_B}
-_N100_SCALE = {50_000: 100, 100_000: 126, 250_000: 170, 500_000: 215}
 _N200_SCALE = {50_000: 200, 100_000: 252, 250_000: 340, 500_000: 430, 1_000_000: 542}
-
 _SPLITS = [
-    # [0.75, 0.5, 0.25],
-    # [0.05],
     [0.8, 0.6, 0.4, 0.2],
     [0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1],
 ]
@@ -34,21 +27,9 @@ _SAMPLING_BASE = {
         {"sampler": "ddpm", "timestep_spacing": "trailing"},
     ],
     "step_schedules": {
-        # "n100_scale": {
-        #     "ddpm": _N100_SCALE,
-        # },
         "n200_scale": {
             "ddpm": _N200_SCALE,
         },
-        # "n100_fixed": {
-        #     "ddpm": _N100_FIXED,
-        # },
-        # "n500_fixed": {
-        #     "ddpm": _N500_FIXED,
-        # },
-        # "n1000_fixed": {
-        #     "ddpm": _N1000_FIXED,
-        # },
     },
     "baseline_step_schedules": {},
     "B_list": [
@@ -57,19 +38,10 @@ _SAMPLING_BASE = {
         250_000,
         500_000,
         1_000_000,
-        # 2_000_000,
-        # 5_000_000,
-        # 10_000_000,
+        2_000_000,
     ],
     "B1_list": [
-        # 0.01,
-        # 0.02,
-        # 0.05,
-        # "5,0.66",
         "10,0.66",
-        # 10_000,
-        # 25_000,
-        # 50_000,
     ],
     "baselines": [
         "fixed_N",
