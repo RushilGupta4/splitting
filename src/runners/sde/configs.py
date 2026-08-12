@@ -7,10 +7,9 @@ reference-generation settings are standard across every SDE case and live here.
 
 from copy import deepcopy
 
-import numpy as np
+from runners.common_configs import OPTIMIZATION_MODES, split_schedules
 
-SPLIT_LISTS = [4, 9]
-SDE_SPLITS = [np.round(np.arange(j, 0, -1) / (j + 1), 2).tolist() for j in SPLIT_LISTS]
+SDE_SPLITS = split_schedules()
 
 SDE_DIMENSION = 2
 SDE_SAMPLER = "euler"
@@ -37,8 +36,6 @@ _EULER_CALIBRATED = {
 _SAMPLING_BASE = {
     "sampling_configs": [
         {"sampler": SDE_SAMPLER},
-        # Re-enabling milstein needs dimension=1 (SDERunner rejects it above 1)
-        # AND a "milstein" entry in step_schedules below.
     ],
     "step_schedules": {
         "calibrated": {SDE_SAMPLER: _EULER_CALIBRATED},
@@ -60,7 +57,7 @@ _SAMPLING_BASE = {
 
 _METADATA_BASE = {
     "split_percentages_list": [list(split) for split in SDE_SPLITS],
-    "optimization_modes": ["monotone_cvar95"],
+    "optimization_modes": OPTIMIZATION_MODES,
     "crossfit_q_mlp_losses": ["mse"],
     "num_base_samples": 2_500_000,
     "n_runs": 25,

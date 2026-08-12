@@ -9,8 +9,8 @@ from runners.sde.spec import SDECase, diagonal_normal_initial_spec
 BARRIER_COEFFICIENT = 4.0
 RING_COUPLING = 0.5
 INVERSE_TEMPERATURE = 1.0
-INITIAL_MEAN = 0
-INITIAL_VARIANCE = 0.5
+INITIAL_MEAN = -1
+INITIAL_VARIANCE = 0.05
 
 
 def drift(t: float, x: torch.Tensor) -> torch.Tensor:

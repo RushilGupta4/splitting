@@ -1,3 +1,22 @@
+import numpy as np
+
+_BASE_SPLIT_SCHDULES = []
+SPLIT_COUNTS = [4, 9, 19]
+OPTIMIZATION_MODES = ["monotone", "monotone_cvar95"]
+OPTIMIZATION_MODES = ["monotone"]
+
+
+def split_schedules(counts=SPLIT_COUNTS) -> list[list[float]]:
+    """Evenly spaced split percentages for each requested number of split points.
+
+    ``j`` splits give ``[j/(j+1), ..., 1/(j+1)]`` -- fractions of the remaining
+    steps, strictly decreasing as ``validate_split_percentages`` requires.
+    """
+    return _BASE_SPLIT_SCHDULES + [
+        np.round(np.arange(j, 0, -1) / (j + 1), 2).tolist() for j in counts
+    ]
+
+
 def crossfit_q_config(num_queries: int | None = None, losses=None) -> dict:
     """Return a config fragment for the phase-1 CrossFit-Q estimator.
 
@@ -14,4 +33,9 @@ def crossfit_q_config(num_queries: int | None = None, losses=None) -> dict:
     return cfg
 
 
-__all__ = ["crossfit_q_config"]
+__all__ = [
+    "OPTIMIZATION_MODES",
+    "SPLIT_COUNTS",
+    "crossfit_q_config",
+    "split_schedules",
+]

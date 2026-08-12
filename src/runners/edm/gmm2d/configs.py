@@ -1,4 +1,8 @@
-from runners.common_configs import crossfit_q_config
+from runners.common_configs import (
+    OPTIMIZATION_MODES,
+    crossfit_q_config,
+    split_schedules,
+)
 from runners.edm.configs import _DPMPP_2S_PARAMS, _EDM_PARAMS
 
 _SAMPLING_DEFAULTS = {
@@ -69,11 +73,8 @@ _DEFAULT_CONFIG = {
     "reference_generation_config": {
         "method": "target_samples",
     },
-    "split_percentages_list": [
-        [0.8, 0.6, 0.4, 0.2],
-        [0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1],
-    ],
-    "optimization_modes": ["monotone_cvar95"],
+    "split_percentages_list": split_schedules(),
+    "optimization_modes": OPTIMIZATION_MODES,
     "crossfit_q_mlp_losses": ["mse"],
     "num_base_samples": 5_000_000,
     "n_runs": 50,

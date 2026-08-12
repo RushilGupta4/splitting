@@ -36,7 +36,7 @@ CROSSFIT_Q_DEFAULT_MLP_WEIGHT_DECAY = 3e-4
 CROSSFIT_Q_DEFAULT_MLP_LOSS = "mse"
 CROSSFIT_Q_DEFAULT_MLP_DEVICE = "runner"
 CROSSFIT_Q_DEFAULT_MLP_NUM_THREADS = 2
-CROSSFIT_Q_DEFAULT_MLP_RUN_PARALLELISM = 10
+CROSSFIT_Q_DEFAULT_MLP_RUN_PARALLELISM = 25
 CROSSFIT_Q_DEFAULT_NUM_QUERIES = 1024
 CROSSFIT_Q_DEFAULT_K_MAX = 64
 CROSSFIT_Q_DEFAULT_MASS_MIN = 0.05
@@ -437,9 +437,7 @@ def _solve_cvar_monotone_allocation(
             profile = (1.0 - gamma) * profile + gamma * target_profile
             if candidate_lower > dual_lower:
                 candidate_values = _objective_values(weighted_M, candidate_y)
-                _, candidate_upper = _cvar_profile(
-                    M, candidate_values, alpha=alpha
-                )
+                _, candidate_upper = _cvar_profile(M, candidate_values, alpha=alpha)
                 if candidate_upper < best_upper:
                     best_upper = candidate_upper
                     best_y = candidate_y.copy()
@@ -541,7 +539,6 @@ def _crossfit_q_normalize_mlp_params(params: Mapping[str, Any] | None):
         raise ValueError(
             "crossfit_q_mlp_params.weight_decay must be finite and nonnegative"
         )
-
 
     merged["loss"] = str(merged.get("loss", "mse")).lower()
     if merged["loss"] not in {"bce", "mse"}:
@@ -1030,6 +1027,7 @@ def _estimate_crossfit_q_variance_payload(
     variance2 = np.maximum(Q_proj[1:] - Q_proj[:-1], 0.0)
     tau2 = np.maximum(Q_proj[0] - F_hat * F_hat, 0.0)
     return variance2, tau2
+
 
 def _normalize_query_params(params: Mapping[str, Any] | None):
     """Validate the phase-1 query configuration.

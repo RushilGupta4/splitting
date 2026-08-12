@@ -8,11 +8,12 @@ import csv
 import json
 import math
 import os
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parent
 
 os.environ.setdefault(
     "MPLCONFIGDIR", str(Path(__file__).resolve().parent / ".mplconfig")
@@ -26,16 +27,35 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.ticker import FuncFormatter
 
-
 Z_975 = 1.96
 ALLOCATION_BUDGET = 1_000_000
+OUTPUT_SCALE = 1.5
 
 FOUR = (0.8, 0.6, 0.4, 0.2)
 NINE = (0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1)
+SINGLE_01 = (0.1,)
+SINGLE_02 = (0.2,)
+NINETEEN = tuple(round(value / 20, 2) for value in range(19, 0, -1))
 SCHEDULES = (
-    (FOUR, "Four split points"),
-    (NINE, "Nine split points"),
+    (FOUR, "4 splits"),
+    (NINE, "9 splits"),
+    (NINETEEN, "19 splits"),
 )
+
+SCHEDULE_COLORS = {
+    SINGLE_01: "#009E73",
+    SINGLE_02: "#CC79A7",
+    FOUR: "#0072B2",
+    NINE: "#D55E00",
+    NINETEEN: "#228833",
+}
+SCHEDULE_LINESTYLES = {
+    SINGLE_01: "-.",
+    SINGLE_02: ":",
+    FOUR: "-",
+    NINE: "--",
+    NINETEEN: (0, (3, 1, 1, 1)),
+}
 
 EXPECTED_MLP_PARAMS = {
     "hidden_dims": [128, 64],
@@ -120,7 +140,7 @@ MODELS = (
         "title": "OU Process",
         "plot_title": "OU Process (KS)",
         "metric": "ks",
-        "n_runs": 1_000,
+        "n_runs": 2_500,
         "pilot_coefficient": 5.0,
         "pilot_exponent": 0.66,
         "budgets": (100_000, 200_000, 500_000, 1_000_000, 2_000_000, 5_000_000),
@@ -142,7 +162,7 @@ MODELS = (
         "title": "Overdamped Langevin",
         "plot_title": "Overdamped Langevin (KS)",
         "metric": "ks",
-        "n_runs": 1_000,
+        "n_runs": 2_500,
         "pilot_coefficient": 5.0,
         "pilot_exponent": 0.66,
         "budgets": (100_000, 200_000, 500_000, 1_000_000, 2_000_000, 5_000_000),
@@ -164,11 +184,18 @@ MODELS = (
         "title": "EDM Gaussian mixture",
         "plot_title": "EDM Gaussian mixture (KS)",
         "metric": "ks",
-        "n_runs": 1_000,
+        "n_runs": 2_500,
         "pilot_coefficient": 10.0,
         "pilot_exponent": 0.66,
-        "budgets": (100_000, 200_000, 500_000, 1_000_000, 2_000_000),
-        "steps": (40, 45, 55, 63, 73),
+        "budgets": (
+            100_000,
+            200_000,
+            500_000,
+            1_000_000,
+            2_000_000,
+            5_000_000,
+        ),
+        "steps": (40, 45, 55, 63, 73, 87),
         "sampler": "edm_stochastic",
         "reference_size": 5_000_000,
         "target": EDM_TARGET,
@@ -184,8 +211,8 @@ MODELS = (
         "n_runs": 25,
         "pilot_coefficient": 10.0,
         "pilot_exponent": 0.66,
-        "budgets": (50_000, 100_000, 250_000, 500_000, 1_000_000),
-        "steps": (200, 252, 340, 430, 542),
+        "budgets": (50_000, 100_000, 200_000, 500_000, 1_000_000),
+        "steps": (200, 252, 317, 430, 542),
         "sampler": "ddpm",
         "reference_size": 20_000,
         "target": None,
@@ -238,7 +265,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--outputs-root",
         type=Path,
-        default=ROOT / "outputs_final",
+        default=ROOT / "outputs_paper_final",
         help="Root containing the completed experiment directories.",
     )
     parser.add_argument(
@@ -246,6 +273,11 @@ def _parse_args() -> argparse.Namespace:
         type=Path,
         default=ROOT / "plots",
         help="Destination for generated PNG figures.",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Plot available partial runs and schedules instead of failing.",
     )
     return parser.parse_args()
 
@@ -273,8 +305,8 @@ def _schedule_from_filename(path: Path) -> tuple[float, ...]:
         return expected[path.stem]
     except KeyError as exc:
         raise ValueError(
-            f"Unexpected split schedule in {path.name}; exactly four or nine "
-            "split points are required"
+            f"Unexpected split schedule in {path.name}; expected one of the "
+            "configured one-, four-, nine-, or nineteen-split schedules"
         ) from exc
 
 
@@ -288,27 +320,47 @@ def _resolved_pilot_budget(model: dict[str, Any], budget: int) -> int:
 
 def _load_manifest_rows(
     outputs_root: Path,
+    models: tuple[dict[str, Any], ...] = MODELS,
+    *,
+    allow_partial_runs: bool = False,
+    allow_partial_schedules: bool = False,
 ) -> dict[str, dict[tuple[float, ...], list[ResultRow]]]:
     all_rows: dict[str, dict[tuple[float, ...], list[ResultRow]]] = {}
     expected_csv_names = {
         f"compare_results_{_schedule_name(schedule)}.csv" for schedule, _ in SCHEDULES
     }
 
-    for model in MODELS:
+    for model in models:
+        partial_run_counts: set[int] = set()
         experiment_dir = outputs_root / model["directory"]
         manifest_path = experiment_dir / "compare_outputs.json"
-        with manifest_path.open() as handle:
-            manifest = json.load(handle)
-        if manifest.get("runner_name") != model["runner"]:
-            raise RuntimeError(f"Unexpected runner in {manifest_path}")
-        if manifest.get("config_name") != model["config_name"]:
-            raise RuntimeError(f"Unexpected config in {manifest_path}")
+        if allow_partial_schedules:
+            listed = [
+                str(experiment_dir / name)
+                for name in sorted(expected_csv_names)
+                if (experiment_dir / name).is_file()
+            ]
+            if not listed:
+                raise RuntimeError(
+                    f"No recognized split-schedule CSVs in {experiment_dir}"
+                )
+        else:
+            with manifest_path.open() as handle:
+                manifest = json.load(handle)
+            if manifest.get("runner_name") != model["runner"]:
+                raise RuntimeError(f"Unexpected runner in {manifest_path}")
+            if manifest.get("config_name") != model["config_name"]:
+                raise RuntimeError(f"Unexpected config in {manifest_path}")
 
-        listed = manifest.get("csv_files", [])
-        if len(listed) != 2 or {Path(value).name for value in listed} != expected_csv_names:
-            raise RuntimeError(
-                f"{manifest_path} must list the completed four- and nine-split CSVs"
-            )
+            listed = manifest.get("csv_files", [])
+            if (
+                len(listed) != len(SCHEDULES)
+                or {Path(value).name for value in listed} != expected_csv_names
+            ):
+                raise RuntimeError(
+                    f"{manifest_path} must list all {len(SCHEDULES)} completed "
+                    "split-schedule CSVs"
+                )
 
         schedule_rows: dict[tuple[float, ...], list[ResultRow]] = {}
         for listed_path_text in listed:
@@ -321,9 +373,12 @@ def _load_manifest_rows(
                     metric_n = raw.get(f"n_valid_{metric}", "")
                     n = int(metric_n or raw["n_valid_ks"])
                     if n != model["n_runs"]:
-                        raise RuntimeError(
-                            f"{csv_path}: expected {model['n_runs']} runs, found {n}"
-                        )
+                        if not allow_partial_runs or not 1 <= n < model["n_runs"]:
+                            raise RuntimeError(
+                                f"{csv_path}: expected {model['n_runs']} runs, "
+                                f"found {n}"
+                            )
+                        partial_run_counts.add(n)
                     row = ResultRow(
                         model=model,
                         schedule=schedule,
@@ -343,7 +398,9 @@ def _load_manifest_rows(
                         raw=raw,
                     )
                     if row.mode not in {"adaptive", "fixed_N"}:
-                        raise RuntimeError(f"Unexpected mode {row.mode!r} in {csv_path}")
+                        raise RuntimeError(
+                            f"Unexpected mode {row.mode!r} in {csv_path}"
+                        )
                     rows.append(row)
 
             budgets = sorted({row.budget for row in rows})
@@ -355,9 +412,10 @@ def _load_manifest_rows(
             expected_steps = dict(zip(model["budgets"], model["steps"]))
             for budget in model["budgets"]:
                 group = [row for row in rows if row.budget == budget]
-                if sum(row.is_adaptive for row in group) != 1 or sum(
-                    not row.is_adaptive for row in group
-                ) != 1:
+                if (
+                    sum(row.is_adaptive for row in group) != 1
+                    or sum(not row.is_adaptive for row in group) != 1
+                ):
                     raise RuntimeError(
                         f"Expected one adaptive and one independent row at B={budget}"
                     )
@@ -376,17 +434,42 @@ def _load_manifest_rows(
                 if (
                     splitting.pilot_rule != expected_rule
                     or splitting.pilot_budget != expected_pilot
-                    or splitting.optimizer != "monotone_cvar95"
+                    or splitting.optimizer != "monotone"
                     or splitting.loss != "mse"
                     or splitting.reuse is not True
                 ):
                     raise RuntimeError(f"Unexpected splitting rule at B={budget}")
-                if independent.pilot_budget is not None or independent.pilot_rule is not None:
+                if (
+                    independent.pilot_budget is not None
+                    or independent.pilot_rule is not None
+                ):
                     raise RuntimeError(f"Independent row has a pilot at B={budget}")
             schedule_rows[schedule] = rows
 
-        if set(schedule_rows) != {FOUR, NINE}:
-            raise RuntimeError(f"Missing four- or nine-split data in {manifest_path}")
+        expected_schedules = {schedule for schedule, _ in SCHEDULES}
+        if not allow_partial_schedules and set(schedule_rows) != expected_schedules:
+            raise RuntimeError(f"Missing split-schedule data in {manifest_path}")
+        missing_schedules = expected_schedules - set(schedule_rows)
+        if missing_schedules:
+            missing_labels = ", ".join(
+                label for schedule, label in SCHEDULES if schedule in missing_schedules
+            )
+            warnings.warn(
+                f"Plotting partial {model['title']} results in debug mode; "
+                f"missing schedules: {missing_labels}.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        if partial_run_counts:
+            low = min(partial_run_counts)
+            high = max(partial_run_counts)
+            observed = str(low) if low == high else f"between {low} and {high}"
+            warnings.warn(
+                f"Plotting partial {model['title']} results in debug mode: "
+                f"expected {model['n_runs']} runs, found {observed}.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         all_rows[model["directory"]] = schedule_rows
     return all_rows
 
@@ -459,7 +542,8 @@ def _static_config_is_expected(model: dict[str, Any], key: dict[str, Any]) -> bo
         )
     else:
         targets_match = (
-            target == model["target"] and reference.get("target_spec") == model["target"]
+            target == model["target"]
+            and reference.get("target_spec") == model["target"]
         )
     return (
         key.get("runner") == model["runner"]
@@ -529,11 +613,10 @@ def _read_valid_records(
 def _attach_and_verify_caches(
     outputs_root: Path,
     all_rows: dict[str, dict[tuple[float, ...], list[ResultRow]]],
+    models: tuple[dict[str, Any], ...] = MODELS,
 ) -> None:
-    record_cache: dict[
-        tuple[Path, str, int], tuple[np.ndarray, np.ndarray | None]
-    ] = {}
-    for model in MODELS:
+    record_cache: dict[tuple[Path, str, int], tuple[np.ndarray, np.ndarray | None]] = {}
+    for model in models:
         run_root = outputs_root / model["directory"] / "runs"
         configs: list[tuple[Path, dict[str, Any]]] = []
         for config_path in sorted(run_root.glob("*/config.json")):
@@ -557,7 +640,10 @@ def _attach_and_verify_caches(
                         float(samples.mean()), row.mean, rel_tol=1e-11, abs_tol=1e-13
                     )
                     std_matches = row.n == 1 or math.isclose(
-                        float(samples.std(ddof=1)), row.std, rel_tol=1e-11, abs_tol=1e-13
+                        float(samples.std(ddof=1)),
+                        row.std,
+                        rel_tol=1e-11,
+                        abs_tol=1e-13,
                     )
                     if mean_matches and std_matches:
                         matches.append((samples, factors))
@@ -591,6 +677,35 @@ def _attach_and_verify_caches(
                         )
 
 
+def _load_and_verify_rows(
+    outputs_root: Path, debug: bool
+) -> dict[str, dict[tuple[float, ...], list[ResultRow]]]:
+    if not debug:
+        all_rows = _load_manifest_rows(outputs_root)
+        _attach_and_verify_caches(outputs_root, all_rows)
+        return all_rows
+
+    all_rows: dict[str, dict[tuple[float, ...], list[ResultRow]]] = {}
+    for model in MODELS:
+        try:
+            model_rows = _load_manifest_rows(
+                outputs_root,
+                models=(model,),
+                allow_partial_runs=True,
+                allow_partial_schedules=True,
+            )
+            _attach_and_verify_caches(outputs_root, model_rows, models=(model,))
+        except (OSError, KeyError, RuntimeError, ValueError) as exc:
+            warnings.warn(
+                f"Skipping {model['title']} in debug mode: {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            continue
+        all_rows.update(model_rows)
+    return all_rows
+
+
 def _group_at_budget(rows: list[ResultRow], budget: int) -> tuple[ResultRow, ResultRow]:
     group = [row for row in rows if row.budget == budget]
     independent = next(row for row in group if not row.is_adaptive)
@@ -607,9 +722,7 @@ def _normal_reduction(
     if independent.n < 2 or splitting.n < 2:
         return observed, math.nan, math.nan
     variance = 100.0**2 * (
-        splitting.mean**2
-        * independent.std**2
-        / (independent.mean**4 * independent.n)
+        splitting.mean**2 * independent.std**2 / (independent.mean**4 * independent.n)
         + splitting.std**2 / (independent.mean**2 * splitting.n)
     )
     if not math.isfinite(variance) or variance < 0.0:
@@ -621,11 +734,15 @@ def _normal_reduction(
 def _compute_reductions(
     all_rows: dict[str, dict[tuple[float, ...], list[ResultRow]]],
 ) -> dict[tuple[str, tuple[float, ...], int], tuple[float, float, float]]:
-    reductions: dict[
-        tuple[str, tuple[float, ...], int], tuple[float, float, float]
-    ] = {}
+    reductions: dict[tuple[str, tuple[float, ...], int], tuple[float, float, float]] = (
+        {}
+    )
     for model in MODELS:
+        if model["directory"] not in all_rows:
+            continue
         for schedule, _ in SCHEDULES:
+            if schedule not in all_rows[model["directory"]]:
+                continue
             rows = all_rows[model["directory"]][schedule]
             for budget in sorted({row.budget for row in rows}):
                 independent, splitting = _group_at_budget(rows, budget)
@@ -664,7 +781,7 @@ def _style() -> None:
 def _save_figure(fig: plt.Figure, output_dir: Path, stem: str) -> None:
     fig.savefig(
         output_dir / f"{stem}.png",
-        dpi=240,
+        dpi=round(240 * OUTPUT_SCALE),
         bbox_inches="tight",
         metadata={"Software": "paper_plots.py"},
     )
@@ -743,7 +860,9 @@ def _plot_splitting_diagram(output_dir: Path) -> None:
             zorder=0,
         )
 
-    def connect(parent: tuple[float, float], child: tuple[float, float], width: float) -> None:
+    def connect(
+        parent: tuple[float, float], child: tuple[float, float], width: float
+    ) -> None:
         ax.plot(
             [parent[0], child[0]],
             [parent[1], child[1]],
@@ -819,7 +938,7 @@ def _plot_splitting_diagram(output_dir: Path) -> None:
     ax.axis("off")
     fig.savefig(
         output_dir / "splitting_diagram.png",
-        dpi=300,
+        dpi=round(300 * OUTPUT_SCALE),
         bbox_inches="tight",
         pad_inches=0.18,
         metadata={"Software": "paper_plots.py"},
@@ -829,21 +948,23 @@ def _plot_splitting_diagram(output_dir: Path) -> None:
 
 def _plot_reductions(
     all_rows: dict[str, dict[tuple[float, ...], list[ResultRow]]],
-    reductions: dict[
-        tuple[str, tuple[float, ...], int], tuple[float, float, float]
-    ],
+    reductions: dict[tuple[str, tuple[float, ...], int], tuple[float, float, float]],
     output_dir: Path,
 ) -> None:
     _style()
     fig, axes = plt.subplots(2, 2, figsize=(7.15, 4.25), sharey=True)
-    colors = {FOUR: "#0072B2", NINE: "#D55E00"}
-    markers = {FOUR: "o", NINE: "s"}
-    linestyles = {FOUR: "-", NINE: "--"}
     interval_extrema: list[float] = []
+    legend_handles: list[Any] = []
+    legend_labels: list[str] = []
 
     for ax, model in zip(axes.flat, MODELS):
+        if model["directory"] not in all_rows:
+            ax.set_visible(False)
+            continue
         rows_by_schedule = all_rows[model["directory"]]
         for schedule, label in SCHEDULES:
+            if schedule not in rows_by_schedule:
+                continue
             budgets = sorted({row.budget for row in rows_by_schedule[schedule]})
             values = np.asarray(
                 [
@@ -862,18 +983,16 @@ def _plot_reductions(
                     lower,
                     upper,
                     where=finite,
-                    color=colors[schedule],
+                    color=SCHEDULE_COLORS[schedule],
                     alpha=0.14,
                     linewidth=0,
                 )
             ax.plot(
                 budgets,
                 observed,
-                color=colors[schedule],
-                marker=markers[schedule],
-                linestyle=linestyles[schedule],
+                color=SCHEDULE_COLORS[schedule],
+                linestyle=SCHEDULE_LINESTYLES[schedule],
                 linewidth=1.6,
-                markersize=3.8,
                 label=label,
             )
         ax.axhline(0.0, color="#555555", linewidth=0.8, linestyle=":")
@@ -882,6 +1001,11 @@ def _plot_reductions(
         ax.grid(axis="y", color="#D8D8D8", linewidth=0.55)
         ax.xaxis.set_major_formatter(FuncFormatter(_budget_tick))
         ax.tick_params(axis="x", which="minor", bottom=False)
+        axis_handles, axis_labels = ax.get_legend_handles_labels()
+        for handle, label in zip(axis_handles, axis_labels):
+            if label not in legend_labels:
+                legend_handles.append(handle)
+                legend_labels.append(label)
 
     low = min(interval_extrema)
     high = max(interval_extrema)
@@ -892,12 +1016,11 @@ def _plot_reductions(
         ax.set_ylabel("Mean Metric Reduction (%)")
     for ax in axes[-1, :]:
         ax.set_xlabel("Budget $B$")
-    handles, labels = axes[0, 0].get_legend_handles_labels()
     fig.legend(
-        handles,
-        labels,
+        legend_handles,
+        legend_labels,
         loc="upper center",
-        ncol=2,
+        ncol=len(SCHEDULES),
         frameon=False,
         bbox_to_anchor=(0.5, 1.01),
     )
@@ -905,26 +1028,62 @@ def _plot_reductions(
     _save_figure(fig, output_dir, "experiment_metric_gain")
 
 
+def _allocation_curve(
+    schedule: tuple[float, ...], cumulative: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return post-step coordinates and pointwise confidence limits for R(t)."""
+    split_times = 1.0 - np.asarray(schedule, dtype=float)
+    if np.any(np.diff(split_times) <= 0.0):
+        raise RuntimeError("Split times must be strictly increasing")
+
+    mean_at_splits = cumulative.mean(axis=0)
+    if cumulative.shape[0] > 1:
+        standard_error = cumulative.std(axis=0, ddof=1) / math.sqrt(cumulative.shape[0])
+        lower_at_splits = mean_at_splits - Z_975 * standard_error
+        upper_at_splits = mean_at_splits + Z_975 * standard_error
+    else:
+        lower_at_splits = mean_at_splits
+        upper_at_splits = mean_at_splits
+
+    times = np.concatenate(([0.0], split_times, [1.0]))
+
+    def extend(values: np.ndarray, initial: float) -> np.ndarray:
+        return np.concatenate(([initial], values, [values[-1]]))
+
+    return (
+        times,
+        extend(mean_at_splits, 1.0),
+        extend(lower_at_splits, 1.0),
+        extend(upper_at_splits, 1.0),
+    )
+
+
 def _plot_allocations(
     all_rows: dict[str, dict[tuple[float, ...], list[ResultRow]]], output_dir: Path
 ) -> None:
     _style()
-    fig, axes = plt.subplots(2, 2, figsize=(7.15, 4.25))
-    colors = {FOUR: "#0072B2", NINE: "#D55E00"}
-    markers = {FOUR: "o", NINE: "s"}
-    linestyles = {FOUR: "-", NINE: "--"}
-    elapsed = {
-        FOUR: np.asarray([0.2, 0.4, 0.6, 0.8]),
-        NINE: np.asarray([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]),
-    }
+    fig, axes = plt.subplots(2, 2, figsize=(7.15, 4.65))
+    legend_handles: list[Any] = []
+    legend_labels: list[str] = []
 
     for ax, model in zip(axes.flat, MODELS):
+        if model["directory"] not in all_rows:
+            ax.set_visible(False)
+            continue
+        curves: list[
+            tuple[
+                tuple[float, ...],
+                str,
+                np.ndarray,
+                np.ndarray,
+            ]
+        ] = []
         for schedule, label in SCHEDULES:
+            if schedule not in all_rows[model["directory"]]:
+                continue
             rows = all_rows[model["directory"]][schedule]
             if ALLOCATION_BUDGET not in {row.budget for row in rows}:
-                raise RuntimeError(
-                    f"Missing B={ALLOCATION_BUDGET} for {model['directory']}"
-                )
+                continue
             _, splitting = _group_at_budget(rows, ALLOCATION_BUDGET)
             if splitting.split_factors is None:
                 raise RuntimeError("Missing split-factor samples")
@@ -940,46 +1099,51 @@ def _plot_allocations(
                 np.diff(cumulative, axis=1) < -1e-10
             ):
                 raise RuntimeError(f"Invalid allocation for {model['directory']}")
-            mean = cumulative.mean(axis=0)
-            allocation_runs = cumulative.shape[0]
-            if allocation_runs > 1:
-                standard_error = cumulative.std(axis=0, ddof=1) / math.sqrt(
-                    allocation_runs
-                )
-                lower = mean - Z_975 * standard_error
-                upper = mean + Z_975 * standard_error
-                ax.fill_between(
-                    elapsed[schedule],
-                    lower,
-                    upper,
-                    color=colors[schedule],
-                    alpha=0.14,
-                    linewidth=0,
-                )
-            ax.plot(
-                elapsed[schedule],
+            times, mean, _, _ = _allocation_curve(schedule, cumulative)
+            curves.append((schedule, label, times, mean))
+
+        # Dense schedules go down first; shorter schedules stay visible where
+        # their horizontal segments overlap the denser curves.
+        for schedule, label, times, mean in reversed(curves):
+            ax.step(
+                times,
                 mean,
-                color=colors[schedule],
-                marker=markers[schedule],
-                linestyle=linestyles[schedule],
+                where="post",
+                color=SCHEDULE_COLORS[schedule],
+                linestyle="-",
                 linewidth=1.5,
-                markersize=3.5,
                 label=label,
+                zorder=3,
             )
         ax.axhline(1.0, color="#555555", linewidth=0.8, linestyle=":")
         ax.set_title(model["plot_title"].rsplit(" (", 1)[0])
-        ax.set_xlim(0.05, 0.95)
-        ax.grid(axis="y", color="#D8D8D8", linewidth=0.55)
+        ax.set_xlim(0.0, 1.0)
+        ax.set_yscale("log", base=2)
+        ax.set_ylim(bottom=0.95)
+        ax.yaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value:g}"))
+        ax.tick_params(axis="y", which="minor", left=False)
+        ax.grid(axis="y", which="major", color="#D8D8D8", linewidth=0.55)
+        axis_handles, axis_labels = ax.get_legend_handles_labels()
+        for handle, label in zip(axis_handles, axis_labels):
+            if label not in legend_labels:
+                legend_handles.append(handle)
+                legend_labels.append(label)
     for ax in axes[:, 0]:
         ax.set_ylabel(r"Learned $R_i$")
     for ax in axes[-1, :]:
         ax.set_xlabel("Elapsed fraction of trajectory")
-    handles, labels = axes[0, 0].get_legend_handles_labels()
+    label_order = {label: index for index, (_, label) in enumerate(SCHEDULES)}
+    ordered_legend = sorted(
+        zip(legend_handles, legend_labels),
+        key=lambda item: label_order[item[1]],
+    )
+    legend_handles = [handle for handle, _ in ordered_legend]
+    legend_labels = [label for _, label in ordered_legend]
     fig.legend(
-        handles,
-        labels,
+        legend_handles,
+        legend_labels,
         loc="upper center",
-        ncol=2,
+        ncol=len(SCHEDULES),
         frameon=False,
         bbox_to_anchor=(0.5, 1.01),
     )
@@ -993,17 +1157,34 @@ def main() -> None:
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    all_rows = _load_manifest_rows(outputs_root)
-    _attach_and_verify_caches(outputs_root, all_rows)
-    reductions = _compute_reductions(all_rows)
+    all_rows = _load_and_verify_rows(outputs_root, debug=args.debug)
     _plot_splitting_diagram(output_dir)
-    _plot_reductions(all_rows, reductions, output_dir)
-    _plot_allocations(all_rows, output_dir)
+    if all_rows:
+        reductions = _compute_reductions(all_rows)
+        _plot_reductions(all_rows, reductions, output_dir)
+        _plot_allocations(all_rows, output_dir)
+    else:
+        warnings.warn(
+            "No complete runners found; experiment figures were not generated.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
 
-    counts = ", ".join(
-        f"{model['title']}: {model['n_runs']} runs" for model in MODELS
-    )
-    print(f"Validated {counts}; wrote publication PNGs to {output_dir}")
+    completed_models = [model for model in MODELS if model["directory"] in all_rows]
+
+    def run_count_summary(model: dict[str, Any]) -> str:
+        observed = sorted(
+            {row.n for rows in all_rows[model["directory"]].values() for row in rows}
+        )
+        if len(observed) == 1:
+            count = f"{observed[0]} runs"
+        else:
+            count = f"{observed[0]}-{observed[-1]} runs per result"
+        return f"{model['title']}: {count}"
+
+    counts = ", ".join(run_count_summary(model) for model in completed_models)
+    validated = counts or "no experiment runners"
+    print(f"Validated {validated}; wrote publication PNGs to {output_dir}")
 
 
 if __name__ == "__main__":

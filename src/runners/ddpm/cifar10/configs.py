@@ -1,22 +1,12 @@
-from runners.common_configs import crossfit_q_config
+from runners.common_configs import (
+    OPTIMIZATION_MODES,
+    crossfit_q_config,
+    split_schedules,
+)
 
 _MODEL_REFERENCE_SAMPLE_COUNT = 20_000
-
-SUPPORTED_B = [
-    50_000,
-    100_000,
-    250_000,
-    500_000,
-    1_000_000,
-    2_000_000,
-    5_000_000,
-    10_000_000,
-]
-_N200_SCALE = {50_000: 200, 100_000: 252, 250_000: 340, 500_000: 430, 1_000_000: 542}
-_SPLITS = [
-    [0.8, 0.6, 0.4, 0.2],
-    [0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1],
-]
+_N200_SCALE = {50_000: 200, 100_000: 252, 200_000: 317, 500_000: 430, 1_000_000: 542}
+_SPLITS = split_schedules()
 
 _MMD_METRIC_PARAMS = {
     "batch_size": 2500,
@@ -35,10 +25,9 @@ _SAMPLING_BASE = {
     "B_list": [
         50_000,
         100_000,
-        250_000,
+        200_000,
         500_000,
         1_000_000,
-        2_000_000,
     ],
     "B1_list": [
         "10,0.66",
@@ -70,7 +59,7 @@ _METADATA_DEFAULTS = {
         "mmd": _MMD_METRIC_PARAMS,
     },
     "split_percentages_list": _SPLITS,
-    "optimization_modes": ["monotone_cvar95"],
+    "optimization_modes": OPTIMIZATION_MODES,
     "crossfit_q_mlp_losses": ["mse"],
     "num_base_samples": _MODEL_REFERENCE_SAMPLE_COUNT,
     "max_sampling_batch_size": 2500,
