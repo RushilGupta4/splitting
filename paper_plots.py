@@ -110,8 +110,8 @@ LANGEVIN_TARGET = {
     "initial_distribution": {
         "kind": "diagonal_normal",
         "dimension": 2,
-        "mean": [0.0, 0.0],
-        "variance": [0.5, 0.5],
+        "mean": [-1.0, -1.0],
+        "variance": [0.05, 0.05],
     },
     "params": {
         "barrier_coefficient": 4.0,
@@ -208,7 +208,7 @@ MODELS = (
         "title": "CIFAR-10 DDPM",
         "plot_title": "CIFAR-10 DDPM (MMD)",
         "metric": "mmd",
-        "n_runs": 25,
+        "n_runs": 50,
         "pilot_coefficient": 10.0,
         "pilot_exponent": 0.66,
         "budgets": (50_000, 100_000, 200_000, 500_000, 1_000_000),
@@ -493,11 +493,16 @@ def _metric_config_is_expected(model: dict[str, Any], config: dict[str, Any]) ->
     mmd = metric_config.get("mmd", {})
     return (
         mmd.get("kind") == "target_space_random_fourier_mmd"
+        and mmd.get("version") == 1
+        and mmd.get("estimator") == "biased_empirical_root"
         and mmd.get("kernel") == "equal_weight_multiscale_gaussian"
+        and mmd.get("standardization") == "reference_coordinate_zscore_v1"
         and mmd.get("representation") == "quantized_image_target"
         and mmd.get("num_frequencies") == 1_024
         and mmd.get("bandwidth_multipliers")
         == [0.0625, 0.125, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0]
+        and mmd.get("bandwidth_pairs") == 8_192
+        and mmd.get("seed") == 0
         and mmd.get("quantize_images") is True
     )
 
@@ -1058,6 +1063,129 @@ def _allocation_curve(
     )
 
 
+def _pava_nondecreasing(values: np.ndarray) -> np.ndarray:
+    """Return the unit-weight nondecreasing PAVA fit."""
+    levels: list[float] = []
+    weights: list[int] = []
+    counts: list[int] = []
+    for value in values:
+        levels.append(float(value))
+        weights.append(1)
+        counts.append(1)
+        while len(levels) >= 2 and levels[-2] > levels[-1]:
+            pooled_weight = weights[-2] + weights[-1]
+            levels[-2] = (
+                weights[-2] * levels[-2] + weights[-1] * levels[-1]
+            ) / pooled_weight
+            weights[-2] = pooled_weight
+            counts[-2] += counts[-1]
+            levels.pop()
+            weights.pop()
+            counts.pop()
+    return np.concatenate(
+        [np.full(count, level) for level, count in zip(levels, counts)]
+    )
+
+
+def _ou_oracle_allocation(
+    schedule: tuple[float, ...], *, steps: int = 280
+) -> np.ndarray:
+    """Compute the Appendix C oracle for the Euler-discretized OU process."""
+    delta = 1.0 / steps
+    rates = (1.35, 1.60)
+
+    def mode_variance(rate: float, step: int) -> float:
+        decay = 1.0 - rate * delta
+        decay_power = decay ** (2 * step)
+        return decay_power + 0.65**2 * delta * (1.0 - decay_power) / (
+            1.0 - decay**2
+        )
+
+    terminal_variance = sum(mode_variance(rate, steps) for rate in rates) / 2.0
+    split_times = 1.0 - np.asarray(schedule, dtype=float)
+    joint_probabilities = [0.25]
+    for split_time in split_times:
+        split_step = round(float(split_time) * steps)
+        retained_covariance = sum(
+            (1.0 - rate * delta) ** (2 * (steps - split_step))
+            * mode_variance(rate, split_step)
+            for rate in rates
+        )
+        correlation = retained_covariance / (2.0 * terminal_variance)
+        joint_probabilities.append(
+            0.25 + math.asin(correlation) / (2.0 * math.pi)
+        )
+    joint_probabilities.append(0.5)
+
+    contributions = np.diff(np.asarray(joint_probabilities))
+    pooled = _pava_nondecreasing(contributions)
+    return np.sqrt(pooled / pooled[0])
+
+
+def _plot_ou_oracle_allocations(
+    all_rows: dict[str, dict[tuple[float, ...], list[ResultRow]]], output_dir: Path
+) -> None:
+    """Compare theoretical and learned OU allocations for each schedule."""
+    rows_by_schedule = all_rows["simple_ou"]
+    _style()
+    fig, axes = plt.subplots(1, 3, figsize=(7.15, 2.35), sharex=True, sharey=True)
+    legend_handles: list[Any] = []
+    legend_labels: list[str] = []
+
+    for ax, (schedule, schedule_label) in zip(axes, SCHEDULES):
+        rows = rows_by_schedule[schedule]
+        _, splitting = _group_at_budget(rows, ALLOCATION_BUDGET)
+        if splitting.split_factors is None:
+            raise RuntimeError("Missing OU split-factor samples")
+        cumulative = np.cumprod(splitting.split_factors, axis=1)
+        times, learned_mean, _, _ = _allocation_curve(schedule, cumulative)
+        oracle = _ou_oracle_allocation(schedule)
+        oracle_curve = np.concatenate((oracle, [oracle[-1]]))
+
+        ax.step(
+            times,
+            oracle_curve,
+            where="post",
+            color="#D55E00",
+            linestyle="--",
+            linewidth=1.7,
+            label="Theoretical (oracle)",
+            zorder=3,
+        )
+        ax.step(
+            times,
+            learned_mean,
+            where="post",
+            color="#0072B2",
+            linewidth=1.5,
+            label="Learned mean",
+            zorder=4,
+        )
+        ax.axhline(1.0, color="#555555", linewidth=0.8, linestyle=":")
+        ax.set_title(schedule_label)
+        ax.set_xlim(0.0, 1.0)
+        ax.set_ylim(0.95, 3.5)
+        ax.grid(axis="y", color="#D8D8D8", linewidth=0.55)
+        axis_handles, axis_labels = ax.get_legend_handles_labels()
+        for handle, label in zip(axis_handles, axis_labels):
+            if label not in legend_labels:
+                legend_handles.append(handle)
+                legend_labels.append(label)
+
+    axes[0].set_ylabel(r"Cumulative allocation $R_i$")
+    axes[1].set_xlabel("Elapsed fraction of trajectory")
+    fig.legend(
+        legend_handles,
+        legend_labels,
+        loc="upper center",
+        ncol=2,
+        frameon=False,
+        bbox_to_anchor=(0.5, 1.03),
+    )
+    fig.tight_layout(rect=(0, 0, 1, 0.88), w_pad=1.0)
+    _save_figure(fig, output_dir, "ou_oracle_allocations")
+
+
 def _plot_allocations(
     all_rows: dict[str, dict[tuple[float, ...], list[ResultRow]]], output_dir: Path
 ) -> None:
@@ -1163,6 +1291,8 @@ def main() -> None:
         reductions = _compute_reductions(all_rows)
         _plot_reductions(all_rows, reductions, output_dir)
         _plot_allocations(all_rows, output_dir)
+        if "simple_ou" in all_rows:
+            _plot_ou_oracle_allocations(all_rows, output_dir)
     else:
         warnings.warn(
             "No complete runners found; experiment figures were not generated.",
