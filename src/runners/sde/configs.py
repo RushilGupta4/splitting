@@ -51,7 +51,13 @@ _SAMPLING_BASE = {
     "B1_list": [
         "5,0.66",
     ],
-    "baselines": ["fixed_N"],
+    "baselines": [
+        "fixed_N",
+        "uniform_1.1",
+        "uniform_1.2",
+        "uniform_1.5",
+        "uniform_2",
+    ],
     "max_sampling_batch_size": SDE_MAX_SAMPLING_BATCH_SIZE,
 }
 

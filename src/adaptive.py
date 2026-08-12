@@ -12,7 +12,7 @@ from numba import njit
 from runners.splitting import (
     apply_to_run_batches,
     append_by_counts as _append_by_counts,
-    floor_split_total_count,
+    max_floor_split_roots_for_budget,
     normalize_max_sampling_batch_size,
     split_counts_by_run_batches,
 )
@@ -1380,77 +1380,6 @@ def _run_crossfit_q_phase1_sampling_batch(
 # --- Phase 1 → Phase 2 ------------------------------------------------------
 
 
-def _floor_split_sampling_cost(runner, split_points, split_factors, n0: int) -> float:
-    n0 = int(n0)
-    if n0 < 1:
-        raise ValueError("n0 must be at least 1")
-    if not split_points:
-        return n0 * int(runner.segment_cost(runner.start_time, runner.end_time))
-
-    if len(split_factors) != len(split_points):
-        raise ValueError("split_factors must match split_points length")
-    starts = [runner.start_time] + list(split_points)
-    ends = list(split_points) + [runner.end_time]
-
-    current_count = n0
-    cost = current_count * int(runner.segment_cost(starts[0], ends[0]))
-    for idx, split_factor in enumerate(split_factors):
-        current_count = floor_split_total_count(current_count, float(split_factor))
-        cost += current_count * int(runner.segment_cost(starts[idx + 1], ends[idx + 1]))
-    return float(cost)
-
-
-def _max_floor_split_roots_for_budget(
-    runner,
-    split_points,
-    split_factors,
-    *,
-    budget: int,
-    expected_cost_per_root: float,
-) -> int:
-    budget = int(budget)
-    if budget <= 0:
-        raise ValueError("budget must be positive")
-    if expected_cost_per_root <= 0.0 or not math.isfinite(expected_cost_per_root):
-        raise ValueError("expected_cost_per_root must be finite and positive")
-
-    cost_for_one = _floor_split_sampling_cost(runner, split_points, split_factors, 1)
-    if cost_for_one > budget:
-        raise ValueError(
-            f"B2={budget} too small; floor split cost for one root is {cost_for_one:.6f}"
-        )
-
-    upper = max(1, int(budget // expected_cost_per_root))
-    while (
-        _floor_split_sampling_cost(runner, split_points, split_factors, upper) > budget
-    ):
-        upper //= 2
-        if upper < 1:
-            raise ValueError(
-                f"B2={budget} too small; floor split cost for one root is {cost_for_one:.6f}"
-            )
-
-    lower = upper
-    probe = max(upper * 2, 2)
-    while (
-        _floor_split_sampling_cost(runner, split_points, split_factors, probe) <= budget
-    ):
-        lower = probe
-        probe *= 2
-
-    high = probe - 1
-    while lower < high:
-        mid = (lower + high + 1) // 2
-        if (
-            _floor_split_sampling_cost(runner, split_points, split_factors, mid)
-            <= budget
-        ):
-            lower = mid
-        else:
-            high = mid - 1
-    return int(lower)
-
-
 def _solve_phase1_allocation(
     payload,
     runner,
@@ -1473,7 +1402,7 @@ def _solve_phase1_allocation(
     )
     cost_per_root = runner.expected_cost_per_root(split_points, split_factors)
     B2 = B - int(payload["used_B1"])
-    n0 = _max_floor_split_roots_for_budget(
+    n0 = max_floor_split_roots_for_budget(
         runner,
         split_points,
         split_factors,

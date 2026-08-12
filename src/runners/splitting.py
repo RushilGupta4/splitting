@@ -397,6 +397,73 @@ def trajectory_expected_cost_per_root(runner, split_points, split_factors) -> fl
     return float(cost)
 
 
+def floor_split_sampling_cost(runner, split_points, split_factors, n0: int) -> float:
+    """Return realized cost after flooring the path count at every split."""
+    n0 = int(n0)
+    if n0 < 1:
+        raise ValueError("n0 must be at least 1")
+
+    points = list(split_points)
+    factors = [float(value) for value in split_factors]
+    if len(factors) != len(points):
+        raise ValueError("split_factors must match split_points length")
+
+    costs = trajectory_segment_costs(runner, points)
+    current_count = n0
+    total_cost = current_count * int(costs[0])
+    for factor, segment_cost in zip(factors, costs[1:]):
+        current_count = floor_split_total_count(current_count, factor)
+        total_cost += current_count * int(segment_cost)
+    return float(total_cost)
+
+
+def max_floor_split_roots_for_budget(
+    runner,
+    split_points,
+    split_factors,
+    *,
+    budget: int,
+    expected_cost_per_root: float,
+) -> int:
+    """Find the largest integer root count whose realized cost fits ``budget``."""
+    budget = int(budget)
+    if budget <= 0:
+        raise ValueError("budget must be positive")
+    if expected_cost_per_root <= 0.0 or not math.isfinite(expected_cost_per_root):
+        raise ValueError("expected_cost_per_root must be finite and positive")
+
+    cost_for_one = floor_split_sampling_cost(runner, split_points, split_factors, 1)
+    if cost_for_one > budget:
+        raise ValueError(
+            f"Budget {budget} is too small; floor split cost for one root is "
+            f"{cost_for_one:.6f}"
+        )
+
+    upper = max(1, int(budget // expected_cost_per_root))
+    while floor_split_sampling_cost(runner, split_points, split_factors, upper) > budget:
+        upper //= 2
+        if upper < 1:
+            raise ValueError(
+                f"Budget {budget} is too small; floor split cost for one root is "
+                f"{cost_for_one:.6f}"
+            )
+
+    lower = upper
+    probe = max(upper * 2, 2)
+    while floor_split_sampling_cost(runner, split_points, split_factors, probe) <= budget:
+        lower = probe
+        probe *= 2
+
+    high = probe - 1
+    while lower < high:
+        mid = (lower + high + 1) // 2
+        if floor_split_sampling_cost(runner, split_points, split_factors, mid) <= budget:
+            lower = mid
+        else:
+            high = mid - 1
+    return int(lower)
+
+
 def run_full_trajectory_batch(
     runner,
     *,

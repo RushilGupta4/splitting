@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import math
 import os
 from abc import ABC, abstractmethod
 from collections.abc import Mapping as MappingABC
@@ -421,12 +422,25 @@ class BaseRunner(ABC):
         """Parse a config baseline name into a generic compare spec."""
         if name == "fixed_N":
             return {"mode": "fixed_N"}
+        if name.startswith("uniform_"):
+            raw_c = name.removeprefix("uniform_")
+            try:
+                c = float(raw_c)
+            except ValueError as exc:
+                raise ValueError(
+                    f"baseline {name!r} must end in a numeric c"
+                ) from exc
+            if not math.isfinite(c) or c < 1.0:
+                raise ValueError(
+                    f"baseline {name!r} must use a finite c >= 1"
+                )
+            return {"mode": "uniform_c", "c": c}
         for solver in sorted(self.solver_names(), key=len, reverse=True):
             parsed = self.parse_solver_baseline_name(name, solver)
             if parsed is not None:
                 return parsed
         raise ValueError(
-            f"Unknown baseline {name!r}. Expected fixed_N or one of: "
+            f"Unknown baseline {name!r}. Expected fixed_N, uniform_<c>, or one of: "
             f"{', '.join(self.solver_names())}"
         )
 

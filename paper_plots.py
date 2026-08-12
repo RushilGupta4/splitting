@@ -369,6 +369,8 @@ def _load_manifest_rows(
             rows: list[ResultRow] = []
             with csv_path.open(newline="") as handle:
                 for raw in csv.DictReader(handle):
+                    if raw["mode"] == "uniform_c":
+                        continue
                     metric = model["metric"]
                     metric_n = raw.get(f"n_valid_{metric}", "")
                     n = int(metric_n or raw["n_valid_ks"])
@@ -1097,9 +1099,7 @@ def _ou_oracle_allocation(
     def mode_variance(rate: float, step: int) -> float:
         decay = 1.0 - rate * delta
         decay_power = decay ** (2 * step)
-        return decay_power + 0.65**2 * delta * (1.0 - decay_power) / (
-            1.0 - decay**2
-        )
+        return decay_power + 0.65**2 * delta * (1.0 - decay_power) / (1.0 - decay**2)
 
     terminal_variance = sum(mode_variance(rate, steps) for rate in rates) / 2.0
     split_times = 1.0 - np.asarray(schedule, dtype=float)
@@ -1112,9 +1112,7 @@ def _ou_oracle_allocation(
             for rate in rates
         )
         correlation = retained_covariance / (2.0 * terminal_variance)
-        joint_probabilities.append(
-            0.25 + math.asin(correlation) / (2.0 * math.pi)
-        )
+        joint_probabilities.append(0.25 + math.asin(correlation) / (2.0 * math.pi))
     joint_probabilities.append(0.5)
 
     contributions = np.diff(np.asarray(joint_probabilities))

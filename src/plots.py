@@ -341,7 +341,7 @@ def _load_rows(csv_path: str):
             mode = (raw_row.get("mode") or "").strip()
             if mode == "estimate_and_sample":
                 mode = "adaptive"
-            if mode not in {"fixed_N", "solver_baseline", "adaptive"}:
+            if mode not in {"fixed_N", "uniform_c", "solver_baseline", "adaptive"}:
                 continue
 
             reuse = _parse_bool(raw_row.get("reuse", ""))
@@ -501,7 +501,8 @@ def _main_panel_title(rows, facet_key) -> str:
     matching_rows = [
         row
         for row in rows
-        if row.mode in {"adaptive", "fixed_N"} and _schedule_key(row) == facet_key
+        if row.mode in {"adaptive", "fixed_N", "uniform_c"}
+        and _schedule_key(row) == facet_key
     ]
     if matching_rows:
         return _format_schedule_short(_schedule_key(matching_rows[0]))
@@ -525,6 +526,8 @@ def _set_main_panel_title(ax, title: str):
 def _method_key(row: Row):
     if row.mode == "fixed_N":
         return ("fixed_N",)
+    if row.mode == "uniform_c":
+        return ("uniform_c", _uniform_c(row))
     if row.mode == "solver_baseline":
         return ("solver", *_solver_family_key(row))
     return (
@@ -538,6 +541,8 @@ def _method_key(row: Row):
 def _method_display_label(key) -> str:
     if key[0] == "fixed_N":
         return "fixed"
+    if key[0] == "uniform_c":
+        return f"uniform c={key[1]:g}"
     if key[0] == "solver":
         _, solver, solver_steps, params_json = key
         params = json.loads(params_json) if params_json else {}
@@ -578,8 +583,16 @@ def _baseline_rows(rows):
     return [row for row in rows if row.mode == "fixed_N"]
 
 
+def _uniform_rows(rows):
+    return [row for row in rows if row.mode == "uniform_c"]
+
+
 def _all_baseline_rows(rows):
-    return [row for row in rows if row.mode in {"fixed_N", "solver_baseline"}]
+    return [
+        row
+        for row in rows
+        if row.mode in {"fixed_N", "uniform_c", "solver_baseline"}
+    ]
 
 
 def _solver_rows(rows):
@@ -604,9 +617,20 @@ def _mode_title(mode_key):
     return label
 
 
+def _uniform_c(row: Row) -> float:
+    if not row.N_i:
+        raise ValueError("uniform_c row must contain N_i")
+    c = float(row.N_i[0])
+    if any(not math.isclose(float(value), c) for value in row.N_i[1:]):
+        raise ValueError("uniform_c row must use the same value for every N_i")
+    return c
+
+
 def _baseline_series_key(row: Row):
     if row.mode == "fixed_N":
         return ("fixed_N", _schedule_key(row))
+    if row.mode == "uniform_c":
+        return ("uniform_c", _uniform_c(row), _schedule_key(row))
     if row.mode == "solver_baseline":
         return ("solver", _solver_family_key(row), row.step_schedule)
     raise ValueError(f"Not a baseline row: {row.mode!r}")
@@ -615,6 +639,8 @@ def _baseline_series_key(row: Row):
 def _baseline_method_key(series_key):
     if series_key[0] == "fixed_N":
         return ("fixed_N",)
+    if series_key[0] == "uniform_c":
+        return ("uniform_c", series_key[1])
     if series_key[0] == "solver":
         return ("solver", *series_key[1])
     raise ValueError(f"Unknown baseline series key: {series_key!r}")
@@ -623,6 +649,8 @@ def _baseline_method_key(series_key):
 def _baseline_series_label(series_key) -> str:
     if series_key[0] == "fixed_N":
         return f"fixed, {_format_schedule_short(series_key[1])}"
+    if series_key[0] == "uniform_c":
+        return f"uniform c={series_key[1]:g}, {_format_schedule_short(series_key[2])}"
     if series_key[0] == "solver":
         label = _method_display_label(("solver", *series_key[1]))
         if series_key[2]:
@@ -882,7 +910,10 @@ def _plot_main_panel(
     panel_rows = [
         row
         for row in rows
-        if (row.mode in {"adaptive", "fixed_N"} and _schedule_key(row) == facet_key)
+        if (
+            row.mode in {"adaptive", "fixed_N", "uniform_c"}
+            and _schedule_key(row) == facet_key
+        )
         or row.mode == "solver_baseline"
     ]
     grouped = defaultdict(list)
@@ -1128,6 +1159,8 @@ def _best_solver_rows(rows, metric: str = "ks"):
 def _best_config_series_key(row: Row):
     if row.mode == "fixed_N":
         return ("fixed_N", _schedule_key(row))
+    if row.mode == "uniform_c":
+        return ("uniform_c", _uniform_c(row), _schedule_key(row))
     if row.mode == "solver_baseline":
         return ("solver", _solver_family_key(row), row.step_schedule)
     return ("best_adaptive", _schedule_key(row))
@@ -1137,6 +1170,8 @@ def _format_best_config_label(series_key):
     kind = series_key[0]
     if kind == "fixed_N":
         return f"fixed, {_format_schedule_short(series_key[1])}"
+    if kind == "uniform_c":
+        return f"uniform c={series_key[1]:g}, {_format_schedule_short(series_key[2])}"
     if kind == "solver":
         return f"{_method_display_label(('solver', *series_key[1]))}, {series_key[2]}"
     return f"best, {_format_schedule_short(series_key[1])}"
@@ -1149,7 +1184,11 @@ def _best_adaptive_improvement_points(rows, metric: str = "ks"):
         metric=metric,
     )
     best_baseline = _best_by_group(
-        (row for row in rows if row.mode in {"fixed_N", "solver_baseline"}),
+        (
+            row
+            for row in rows
+            if row.mode in {"fixed_N", "uniform_c", "solver_baseline"}
+        ),
         key_fn=lambda row: row.B,
         metric=metric,
     )
@@ -1171,6 +1210,7 @@ def _best_adaptive_improvement_points(rows, metric: str = "ks"):
 def _plot_best_config(rows, metric: str, show_std, ci_level, title=None):
     selected_rows = []
     selected_rows.extend(_baseline_rows(rows))
+    selected_rows.extend(_uniform_rows(rows))
     selected_rows.extend(_best_solver_rows(rows, metric=metric))
     selected_rows.extend(_best_adaptive_rows(rows, metric=metric))
     if not selected_rows:
@@ -1200,6 +1240,9 @@ def _plot_best_config(rows, metric: str, show_std, ci_level, title=None):
         elif kind == "best_adaptive":
             color = method_styles.get(_method_key(series_rows[0]), "#2ca02c")
             linestyle, marker = ":", "*"
+        elif kind == "uniform_c":
+            color = method_styles.get(("uniform_c", series_key[1]), "#9467bd")
+            linestyle, marker = "--", "s"
         else:
             color = method_styles.get(("fixed_N",), "#1f77b4")
             linestyle, marker = "-", "o"
@@ -1628,6 +1671,7 @@ def _plot_percent_change_panel(
     schedule,
     metric,
     baseline_by_group,
+    uniform_by_group,
     adaptive_by_group,
     solver_by_group,
     solver_styles,
@@ -1639,6 +1683,30 @@ def _plot_percent_change_panel(
         if group_schedule == schedule
     }
     plotted_any = False
+
+    uniform_values = sorted(
+        {
+            c
+            for (group_schedule, c, _) in uniform_by_group
+            if group_schedule == schedule
+        }
+    )
+    for c in uniform_values:
+        uniform_by_budget = {
+            budget: row
+            for (group_schedule, group_c, budget), row in uniform_by_group.items()
+            if group_schedule == schedule and group_c == c
+        }
+        plotted_any |= _plot_percent_line(
+            ax,
+            baseline_by_budget,
+            uniform_by_budget,
+            color=plt.get_cmap("tab10")((uniform_values.index(c) + 1) % 10),
+            linestyle="--",
+            marker="s",
+            label=f"uniform c={c:g}",
+            metric=metric,
+        )
 
     adaptive_mode_keys = sorted(
         {
@@ -1738,6 +1806,11 @@ def _plot_percent_change(rows, title_prefix, solver_styles, mode_styles):
                 metric=metric,
             ),
             _best_by_group(
+                _uniform_rows(rows),
+                key_fn=lambda row: (_schedule_key(row), _uniform_c(row), row.B),
+                metric=metric,
+            ),
+            _best_by_group(
                 _adaptive_rows(rows),
                 key_fn=lambda row: (_schedule_key(row), _mode_key(row), row.B),
                 metric=metric,
@@ -1749,12 +1822,18 @@ def _plot_percent_change(rows, title_prefix, solver_styles, mode_styles):
             ),
         )
     for ax, (metric, schedule) in zip(axes_flat, panels):
-        baseline_by_group, adaptive_by_group, solver_by_group = groups_by_metric[metric]
+        (
+            baseline_by_group,
+            uniform_by_group,
+            adaptive_by_group,
+            solver_by_group,
+        ) = groups_by_metric[metric]
         _plot_percent_change_panel(
             ax,
             schedule,
             metric,
             baseline_by_group,
+            uniform_by_group,
             adaptive_by_group,
             solver_by_group,
             solver_styles,
