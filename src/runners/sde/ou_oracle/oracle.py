@@ -1,10 +1,11 @@
 """Finite-query minimax oracle for the Euler-discretized 2D OU benchmark.
 
-The query set contains a Cartesian grid of finite lower-orthant thresholds and
-both one-dimensional boundary families.  Gaussian CDFs give each query's exact
-Euler-chain variance profile up to numerical CDF integration error.  A local
-copy of the monotone Frank--Wolfe solver from ``src/adaptive.py`` then optimizes
-over the convex hull of those profiles, as required by the minimax lemma.
+The query set contains a dense Cartesian grid of finite lower-orthant
+thresholds and both one-dimensional boundary families.  Gaussian CDFs give
+each query's exact Euler-chain variance profile up to numerical CDF integration
+error.  A local copy of the monotone Frank--Wolfe solver from
+``src/adaptive.py`` then optimizes over the convex hull of those profiles, as
+required by the minimax lemma.
 """
 
 from __future__ import annotations
@@ -16,26 +17,22 @@ import numpy as np
 from scipy.stats import multivariate_normal, norm
 
 REFERENCE_SCHEDULE = tuple(round(value / 20, 2) for value in range(19, 0, -1))
-QUERY_PROBABILITIES = (
-    0.01,
-    0.025,
-    0.05,
-    0.10,
-    0.20,
-    0.30,
-    0.40,
-    0.50,
-    0.60,
-    0.70,
-    0.80,
-    0.90,
-    0.95,
-    0.975,
-    0.99,
+QUERY_GRID_SIZE = 320
+QUERY_PROBABILITY_MIN = 0.01
+QUERY_PROBABILITY_MAX = 0.99
+QUERY_PROBABILITIES = tuple(
+    float(value)
+    for value in np.linspace(
+        QUERY_PROBABILITY_MIN,
+        QUERY_PROBABILITY_MAX,
+        QUERY_GRID_SIZE,
+    )
 )
+QUERY_COUNT = QUERY_GRID_SIZE**2 + 2 * QUERY_GRID_SIZE
 CDF_SEED = 20260812
 CDF_MAX_POINTS = 250_000
 CDF_TOLERANCE = 2e-6
+CDF_QUERY_BATCH_SIZE = 4_096
 DEFAULT_RELATIVE_TOLERANCE = 1e-7
 DEFAULT_MAX_ITERATIONS = 2_000
 
@@ -236,6 +233,31 @@ def _coordinate_covariance(common: float, difference: float) -> np.ndarray:
     )
 
 
+def _multivariate_normal_cdf_batched(
+    points: np.ndarray,
+    *,
+    mean: np.ndarray,
+    covariance: np.ndarray,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Evaluate Gaussian CDFs in bounded batches using one RNG stream."""
+    points = np.asarray(points, dtype=float)
+    values = np.empty(points.shape[0], dtype=float)
+    for start in range(0, points.shape[0], CDF_QUERY_BATCH_SIZE):
+        end = min(start + CDF_QUERY_BATCH_SIZE, points.shape[0])
+        batch = multivariate_normal.cdf(
+            points[start:end],
+            mean=mean,
+            cov=covariance,
+            maxpts=CDF_MAX_POINTS,
+            abseps=CDF_TOLERANCE,
+            releps=CDF_TOLERANCE,
+            rng=rng,
+        )
+        values[start:end] = np.asarray(batch, dtype=float).reshape(-1)
+    return values
+
+
 @functools.lru_cache(maxsize=None)
 def _query_q_values(
     steps: int = 280,
@@ -253,20 +275,11 @@ def _query_q_values(
     )
     finite_thresholds = terminal_std * finite_z
     rng = np.random.default_rng(CDF_SEED)
-    cdf_kwargs = {
-        "maxpts": CDF_MAX_POINTS,
-        "abseps": CDF_TOLERANCE,
-        "releps": CDF_TOLERANCE,
-        "rng": rng,
-    }
-    finite_terminal_probabilities = np.asarray(
-        multivariate_normal.cdf(
-            finite_thresholds,
-            mean=np.zeros(2),
-            cov=terminal_covariance,
-            **cdf_kwargs,
-        ),
-        dtype=float,
+    finite_terminal_probabilities = _multivariate_normal_cdf_batched(
+        finite_thresholds,
+        mean=np.zeros(2),
+        covariance=terminal_covariance,
+        rng=rng,
     )
     terminal_probabilities = np.concatenate(
         (finite_terminal_probabilities, probabilities, probabilities)
@@ -296,29 +309,23 @@ def _query_q_values(
                 [retained_covariance, terminal_covariance],
             ]
         )
-        finite_q = np.asarray(
-            multivariate_normal.cdf(
-                paired_finite_thresholds,
-                mean=np.zeros(4),
-                cov=descendant_covariance,
-                **cdf_kwargs,
-            ),
-            dtype=float,
+        finite_q = _multivariate_normal_cdf_batched(
+            paired_finite_thresholds,
+            mean=np.zeros(4),
+            covariance=descendant_covariance,
+            rng=rng,
         )
 
         marginal_correlation = float(
             retained_covariance[0, 0] / terminal_covariance[0, 0]
         )
-        marginal_q = np.asarray(
-            multivariate_normal.cdf(
-                paired_marginal_thresholds,
-                mean=np.zeros(2),
-                cov=np.asarray(
-                    [[1.0, marginal_correlation], [marginal_correlation, 1.0]]
-                ),
-                **cdf_kwargs,
+        marginal_q = _multivariate_normal_cdf_batched(
+            paired_marginal_thresholds,
+            mean=np.zeros(2),
+            covariance=np.asarray(
+                [[1.0, marginal_correlation], [marginal_correlation, 1.0]]
             ),
-            dtype=float,
+            rng=rng,
         )
         q_values[:, column] = np.concatenate((finite_q, marginal_q, marginal_q))
 

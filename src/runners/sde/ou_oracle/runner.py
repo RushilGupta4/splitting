@@ -8,6 +8,8 @@ from runners.sde.ou_oracle.oracle import (
     CDF_MAX_POINTS,
     CDF_SEED,
     CDF_TOLERANCE,
+    QUERY_COUNT,
+    QUERY_GRID_SIZE,
     QUERY_PROBABILITIES,
     ou_oracle_allocation,
     ou_oracle_relative_gap,
@@ -62,9 +64,11 @@ class OUOracleRunner(SimpleOURunner):
             )
 
         return {
-            "version": 1,
+            "version": 2,
             "sampling_steps": int(self._sampling_steps),
             "split_percentages": list(schedule),
+            "query_count": int(QUERY_COUNT),
+            "query_grid_size": int(QUERY_GRID_SIZE),
             "query_probabilities": list(QUERY_PROBABILITIES),
             "cdf_seed": int(CDF_SEED),
             "cdf_max_points": int(CDF_MAX_POINTS),
