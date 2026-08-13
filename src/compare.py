@@ -539,7 +539,9 @@ def _run_trial(
             N_i_list=[],
         )
     if spec["mode"] == "ou_oracle":
-        oracle = runner.oracle_definition(split_percentages)
+        oracle = spec.get("oracle_definition") or runner.oracle_definition(
+            split_percentages
+        )
         return run_fixed_N_sampling(
             **common,
             split_percentages=split_percentages,
@@ -697,7 +699,9 @@ def _canonical_spec_for_cache(spec: Mapping[str, Any], *, runner, split_percenta
         return key
 
     if mode == "ou_oracle":
-        key["oracle"] = runner.oracle_definition(split_percentages)
+        key["oracle"] = spec.get("oracle_definition") or runner.oracle_definition(
+            split_percentages
+        )
         return key
 
     key["runner_sampling_config"] = runner.sampling_cache_key()
@@ -825,6 +829,53 @@ def _load_cached_runs(config_dir, n_runs):
     return cached
 
 
+def _cached_oracle_definition(output_dir, split_percentages, target_runs):
+    """Reuse the most advanced runs cache for an identical split schedule."""
+    schedule = tuple(float(value) for value in split_percentages)
+    runs_dir = _runs_dir(output_dir)
+    if not os.path.isdir(runs_dir):
+        return None
+
+    candidates = []
+    for config_id in sorted(os.listdir(runs_dir)):
+        config_dir = os.path.join(runs_dir, config_id)
+        config_path = os.path.join(config_dir, "config.json")
+        if not os.path.isfile(config_path):
+            continue
+        try:
+            with open(config_path) as f:
+                config = json.load(f)
+            key = config.get("cache_key", {})
+            spec = key.get("spec", {})
+            oracle = spec.get("oracle", {})
+            cached_schedule = tuple(
+                float(value) for value in oracle.get("split_percentages", [])
+            )
+            factors = [float(value) for value in oracle.get("split_factors", [])]
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if (
+            key.get("runner") != "ou_oracle"
+            or spec.get("mode") != "ou_oracle"
+            or cached_schedule != schedule
+            or len(factors) != len(schedule)
+            or any(not np.isfinite(value) or value < 1.0 - 1e-10 for value in factors)
+        ):
+            continue
+        completed = len(_load_cached_runs(config_dir, target_runs))
+        candidates.append((completed, config_id, oracle))
+
+    if not candidates:
+        return None
+    completed, config_id, oracle = max(candidates, key=lambda item: (item[0], item[1]))
+    log.info(
+        "Reusing OU oracle allocation from runs cache %s (%d cached runs)",
+        config_id,
+        completed,
+    )
+    return oracle
+
+
 def _write_cached_runs(config_dir, cached):
     path = _runs_jsonl_path(config_dir)
     os.makedirs(config_dir, exist_ok=True)
@@ -928,7 +979,9 @@ def _aggregate_cached_runs(spec, trials, *, base_runner, split_percentages, cfg)
     if spec["mode"] == "fixed_N":
         return base
     if spec["mode"] == "ou_oracle":
-        oracle = runner.oracle_definition(split_percentages)
+        oracle = spec.get("oracle_definition") or runner.oracle_definition(
+            split_percentages
+        )
         factors = [float(value) for value in oracle["split_factors"]]
         return {
             **base,
@@ -1004,6 +1057,13 @@ def _run_split(args, cfg, base_runner, baselines, split_percentages):
     entries: List[Dict[str, Any]] = []
     total_remaining = 0
     target_runs = int(cfg["n_runs"])
+    cached_oracle = _cached_oracle_definition(
+        args.output_dir, split_percentages, target_runs
+    )
+    if cached_oracle is not None:
+        for spec in specs:
+            if spec["mode"] == "ou_oracle":
+                spec["oracle_definition"] = cached_oracle
     mode_spec = next(
         (s for s in base_runner.comparison_modes() if s.name == cfg["comparison_mode"]),
         None,
@@ -1067,10 +1127,12 @@ def _run_split(args, cfg, base_runner, baselines, split_percentages):
                 },
             )
             if spec["mode"] == "ou_oracle":
-                oracle_runner = _runner_for_spec(base_runner, spec)
                 _write_json_atomic(
                     os.path.join(config_dir, "oracle.json"),
-                    oracle_runner.oracle_definition(split_percentages),
+                    spec.get("oracle_definition")
+                    or _runner_for_spec(base_runner, spec).oracle_definition(
+                        split_percentages
+                    ),
                 )
             comparison_state = _state_for_spec(comparison_states, mode_spec, spec, cfg)
 

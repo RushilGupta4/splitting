@@ -55,6 +55,8 @@ done
 
 wait
 
+N_PARALLEL=1000
+N_RUNS=10000
 for base_dir in "${BASE_DIRS[@]}"
 do
     output_dir="$base_dir/ou_oracle"

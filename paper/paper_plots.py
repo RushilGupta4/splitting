@@ -229,6 +229,7 @@ OU_ORACLE_MODEL = {
     "runner": "ou_oracle",
     "config_name": "default",
     "title": "OU oracle",
+    "n_runs": 10_000,
     "budgets": (MODELS[0]["budgets"][-1],),
     "steps": (MODELS[0]["steps"][-1],),
 }
@@ -526,7 +527,9 @@ def _load_ou_oracle_rows(
                 if n != model["n_runs"] and not (
                     allow_partial_runs and 1 <= n < model["n_runs"]
                 ):
-                    raise RuntimeError(f"{csv_path}: expected {model['n_runs']} runs")
+                    raise RuntimeError(
+                        f"{csv_path}: expected {model['n_runs']} runs, found {n}"
+                    )
                 row = ResultRow(
                     model=model,
                     schedule=schedule,
@@ -1381,7 +1384,10 @@ def main() -> None:
             stacklevel=2,
         )
 
-    completed_models = [model for model in MODELS if model["directory"] in all_rows]
+    publication_models = (*MODELS, OU_ORACLE_MODEL)
+    completed_models = [
+        model for model in publication_models if model["directory"] in all_rows
+    ]
 
     def run_count_summary(model: dict[str, Any]) -> str:
         observed = sorted(
