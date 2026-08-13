@@ -136,6 +136,8 @@ def run_fixed_N_sampling(
     run_offset: int = 0,
     return_trial_results: bool = False,
     max_sampling_batch_size=None,
+    result_mode: str = "fixed_N",
+    include_allocation: bool = False,
 ):
     if split_percentages:
         _, split_points = runner.resolve_split_percentages(split_percentages)
@@ -147,7 +149,17 @@ def run_fixed_N_sampling(
         if split_points
         else runner.segment_cost(runner.start_time, runner.end_time)
     )
-    n0 = int(B // cost_per_root)
+    n0 = (
+        max_floor_split_roots_for_budget(
+            runner,
+            split_points,
+            split_factors,
+            budget=int(B),
+            expected_cost_per_root=cost_per_root,
+        )
+        if split_points
+        else int(B // cost_per_root)
+    )
     if n0 < 1:
         raise ValueError(
             f"Budget B={B} is too small; expected cost per root is {cost_per_root:.6f}"
@@ -174,8 +186,12 @@ def run_fixed_N_sampling(
         seed=seed,
         run_offset=run_offset,
     )
+    if include_allocation:
+        for trial in trial_results:
+            trial["N_i"] = list(split_factors)
+            trial["n0"] = int(n0)
     result = {
-        "mode": "fixed_N",
+        "mode": str(result_mode),
         "B": int(B),
         **summarize_sampling_trials(trial_results, metrics),
     }

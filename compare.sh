@@ -54,3 +54,15 @@ PY
 done
 
 wait
+
+for base_dir in "${BASE_DIRS[@]}"
+do
+    output_dir="$base_dir/ou_oracle"
+    mkdir -p "$output_dir"
+    debug_flag=""
+    if [ "$DEBUG" -eq 1 ]; then
+        debug_flag="--debug"
+    fi
+    uv run python src/ensure_samples.py --runner ou_oracle --config default --batch_size 1000000 --device cuda:0 $debug_flag || exit 1
+    uv run python src/compare.py --runner ou_oracle --config default --output_dir "$output_dir" --device cuda:0 --n_parallel $N_PARALLEL --n_runs $N_RUNS $debug_flag || exit 1
+done

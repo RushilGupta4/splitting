@@ -73,6 +73,8 @@ CSV_FIELDS = [
     "solver_steps",
     "solver_params",
     "nfe_per_sample",
+    "n0",
+    "oracle_gap",
     "mean_mmd",
     "std_mmd",
     "n_valid_mmd",
@@ -547,6 +549,15 @@ def _run_trial(
             split_percentages=split_percentages,
             c=float(spec["c"]),
         )
+    if spec["mode"] == "ou_oracle":
+        oracle = runner.oracle_definition(split_percentages)
+        return run_fixed_N_sampling(
+            **common,
+            split_percentages=split_percentages,
+            N_i_list=oracle["split_factors"],
+            result_mode="ou_oracle",
+            include_allocation=True,
+        )
     crossfit_q_mlp_params = dict(cfg.get("crossfit_q_mlp_params") or {})
     crossfit_q_mlp_params["loss"] = str(spec["crossfit_q_mlp_loss"])
     return run_estimate_and_sample(
@@ -653,6 +664,8 @@ def _method_display(row: Mapping[str, Any]) -> str:
     if mode == "uniform_c":
         factors = row.get("N_i") or []
         return f"uniform_{float(factors[0]):g}" if factors else "uniform_c"
+    if mode == "ou_oracle":
+        return "ou_oracle"
     if mode == "solver_baseline":
         label = str(row.get("solver") or "solver")
         if row.get("solver_steps") not in (None, ""):
@@ -695,6 +708,10 @@ def _canonical_spec_for_cache(spec: Mapping[str, Any], *, runner, split_percenta
         key["solver_kwargs"] = runner.solver_cache_key(
             solver, **spec.get("solver_kwargs", {})
         )
+        return key
+
+    if mode == "ou_oracle":
+        key["oracle"] = runner.oracle_definition(split_percentages)
         return key
 
     key["runner_sampling_config"] = runner.sampling_cache_key()
@@ -799,9 +816,10 @@ def _trial_to_cache_record(spec, trial):
         record["ks_distance"] = float(metrics["ks"])
     if trial.get("metric_payloads"):
         record["metric_payloads"] = trial["metric_payloads"]
-    if spec["mode"] == "estimate_and_sample":
+    if spec["mode"] in {"estimate_and_sample", "ou_oracle"}:
         record["N_i"] = [float(x) for x in trial["N_i"]]
         record["n0"] = int(trial["n0"])
+    if spec["mode"] == "estimate_and_sample":
         record["used_B1"] = int(trial["used_B1"])
     return record
 
@@ -918,6 +936,8 @@ def _aggregate_cached_runs(spec, trials, *, base_runner, split_percentages, cfg)
         "solver_steps": int(solver_steps) if solver_steps != "" else "",
         "solver_params": solver_params,
         "nfe_per_sample": int(nfe_per_sample),
+        "n0": "",
+        "oracle_gap": "",
         "primary_metric": str(cfg.get("primary_metric", cfg["metrics"][0])),
         **metric_summary,
         "N_i": [],
@@ -929,6 +949,17 @@ def _aggregate_cached_runs(spec, trials, *, base_runner, split_percentages, cfg)
         factors = [float(spec["c"])] * len(split_percentages)
         return {
             **base,
+            "N_i": factors,
+            "N_i_std": [0.0] * len(factors),
+        }
+    if spec["mode"] == "ou_oracle":
+        oracle = runner.oracle_definition(split_percentages)
+        factors = [float(value) for value in oracle["split_factors"]]
+        return {
+            **base,
+            "n0": int(trials[0]["n0"]) if trials else "",
+            "oracle_gap": float(oracle["relative_gap"]),
+            "optimizer": "finite_query_minimax",
             "N_i": factors,
             "N_i_std": [0.0] * len(factors),
         }
@@ -1072,6 +1103,12 @@ def _run_split(args, cfg, base_runner, baselines, split_percentages):
                     "cache_key": entry["cache_key"],
                 },
             )
+            if spec["mode"] == "ou_oracle":
+                oracle_runner = _runner_for_spec(base_runner, spec)
+                _write_json_atomic(
+                    os.path.join(config_dir, "oracle.json"),
+                    oracle_runner.oracle_definition(split_percentages),
+                )
             comparison_state = _state_for_spec(comparison_states, mode_spec, spec, cfg)
 
             completed_runs = int(entry["completed_runs"])
