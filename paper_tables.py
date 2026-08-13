@@ -9,10 +9,7 @@ import math
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
-import numpy as np
-
 from paper_plots import (
-    ALLOCATION_BUDGET,
     MODELS,
     SCHEDULES,
     ResultRow,
@@ -264,19 +261,25 @@ def _ou_oracle_rows(
     rows: list[dict[str, Any]] = []
     for schedule, _ in SCHEDULES:
         oracle_rows = oracle_by_schedule.get(schedule, [])
+        learned_rows = learned_by_schedule.get(schedule, [])
+        common_budgets = {row.budget for row in oracle_rows} & {
+            row.budget for row in learned_rows
+        }
+        if not common_budgets:
+            raise RuntimeError("OU learned and oracle results have no common budget")
+        display_budget = max(common_budgets)
         oracle_independent = _row_at_budget(
-            oracle_rows, ALLOCATION_BUDGET, mode="fixed_N"
+            oracle_rows, display_budget, mode="fixed_N"
         )
         oracle = _row_at_budget(
-            oracle_rows, ALLOCATION_BUDGET, mode="ou_oracle"
+            oracle_rows, display_budget, mode="ou_oracle"
         )
-        learned_rows = learned_by_schedule.get(schedule, [])
         learned_independent = _row_at_budget(
-            learned_rows, ALLOCATION_BUDGET, mode="fixed_N"
+            learned_rows, display_budget, mode="fixed_N"
         )
         learned = _row_at_budget(
             learned_rows,
-            ALLOCATION_BUDGET,
+            display_budget,
             mode="adaptive",
         )
         if any(
@@ -299,7 +302,7 @@ def _ou_oracle_rows(
         rows.append(
             {
                 "split_points": len(schedule),
-                "B": ALLOCATION_BUDGET,
+                "B": display_budget,
                 "oracle_ks_reduction_percent": oracle_reduction,
                 "oracle_ks_reduction_ci_lower_percent": oracle_lower,
                 "oracle_ks_reduction_ci_upper_percent": oracle_upper,

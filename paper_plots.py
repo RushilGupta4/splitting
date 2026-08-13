@@ -28,7 +28,6 @@ import numpy as np
 from matplotlib.ticker import FuncFormatter
 
 Z_975 = 1.96
-ALLOCATION_BUDGET = 1_000_000
 OUTPUT_SCALE = 1.5
 
 FOUR = (0.8, 0.6, 0.4, 0.2)
@@ -958,6 +957,13 @@ def _group_at_budget(rows: list[ResultRow], budget: int) -> tuple[ResultRow, Res
     return independent, splitting
 
 
+def _largest_budget(rows: list[ResultRow]) -> int:
+    budgets = {row.budget for row in rows}
+    if not budgets:
+        raise RuntimeError("Cannot select a display budget from empty results")
+    return max(budgets)
+
+
 def _normal_reduction(
     independent: ResultRow, splitting: ResultRow
 ) -> tuple[float, float, float]:
@@ -1316,15 +1322,22 @@ def _plot_ou_oracle_allocations(
 
     for ax, (schedule, schedule_label) in zip(axes, SCHEDULES):
         rows = rows_by_schedule[schedule]
-        _, splitting = _group_at_budget(rows, ALLOCATION_BUDGET)
+        oracle_rows = oracle_rows_by_schedule[schedule]
+        common_budgets = {row.budget for row in rows} & {
+            row.budget for row in oracle_rows
+        }
+        if not common_budgets:
+            raise RuntimeError("OU learned and oracle results have no common budget")
+        display_budget = max(common_budgets)
+        _, splitting = _group_at_budget(rows, display_budget)
         if splitting.split_factors is None:
             raise RuntimeError("Missing OU split-factor samples")
         cumulative = np.cumprod(splitting.split_factors, axis=1)
         times, learned_mean, _, _ = _allocation_curve(schedule, cumulative)
         oracle_row = next(
             row
-            for row in oracle_rows_by_schedule[schedule]
-            if row.budget == ALLOCATION_BUDGET and row.is_oracle
+            for row in oracle_rows
+            if row.budget == display_budget and row.is_oracle
         )
         factors = np.asarray(
             [float(value) for value in oracle_row.raw["N_i"].split(",")],
@@ -1401,9 +1414,8 @@ def _plot_allocations(
             if schedule not in all_rows[model["directory"]]:
                 continue
             rows = all_rows[model["directory"]][schedule]
-            if ALLOCATION_BUDGET not in {row.budget for row in rows}:
-                continue
-            _, splitting = _group_at_budget(rows, ALLOCATION_BUDGET)
+            display_budget = _largest_budget(rows)
+            _, splitting = _group_at_budget(rows, display_budget)
             if splitting.split_factors is None:
                 raise RuntimeError("Missing split-factor samples")
             expected_shape = (splitting.n, len(schedule))

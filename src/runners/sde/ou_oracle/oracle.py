@@ -362,8 +362,10 @@ def _minimax_solution(
     schedule: tuple[float, ...], *, steps: int = 280
 ) -> tuple[np.ndarray, np.ndarray, float]:
     contributions = query_variance_contributions(schedule, steps=steps)
-    split_times = 1.0 - np.asarray(schedule, dtype=float)
-    cost_w = np.diff(np.concatenate(([0.0], split_times, [1.0])))
+    split_steps = np.asarray(
+        [round((1.0 - split) * steps) for split in schedule], dtype=float
+    )
+    cost_w = np.diff(np.concatenate(([0.0], split_steps, [float(steps)])))
     cost_w /= float(cost_w.sum())
     simplex, profile, relative_gap = _solve_frank_wolfe_monotone_allocation(
         contributions,
