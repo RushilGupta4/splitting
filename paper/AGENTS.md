@@ -1,15 +1,15 @@
 # Paper workflow
 
-This directory contains the scripts that turn completed experiment results in `code/outputs_paper_final/` into paper figures and table data.
+This directory contains the scripts that turn completed experiment results in the repository-root `outputs_paper_final/` into paper figures and table data.
 
 From `code/`, run:
 
 ```bash
-uv run python paper/paper_plots.py
-uv run python paper/paper_tables.py
+uv run python paper/paper_plots.py --outputs-root ../outputs_paper_final --output-dir ../plots
+uv run python paper/paper_tables.py --outputs-root ../outputs_paper_final --output-dir ../tables
 ```
 
-The plot script writes publication PNGs to `code/plots/`. The table script writes CSVs to `code/tables/`. Normal runs validate that the expected results and run counts are complete; do not weaken validation or use `--debug` for final paper artifacts.
+The plot script writes publication PNGs to the repository-root `plots/`. The table script writes CSVs to the repository-root `tables/`. Normal runs validate that the expected results and run counts are complete; do not weaken validation or use `--debug` for final paper artifacts.
 
 ## Updating `main.tex`
 
