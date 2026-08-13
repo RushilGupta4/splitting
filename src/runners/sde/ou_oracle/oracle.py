@@ -17,7 +17,7 @@ import numpy as np
 from scipy.stats import multivariate_normal, norm
 
 REFERENCE_SCHEDULE = tuple(round(value / 20, 2) for value in range(19, 0, -1))
-QUERY_GRID_SIZE = 320
+QUERY_GRID_SIZE = 100
 QUERY_PROBABILITY_MIN = 0.01
 QUERY_PROBABILITY_MAX = 0.99
 QUERY_PROBABILITIES = tuple(
@@ -220,17 +220,13 @@ def _mode_variance(rate: float, step: int, *, steps: int) -> float:
     delta = 1.0 / steps
     decay = 1.0 - rate * delta
     decay_power = decay ** (2 * step)
-    return decay_power + OU_SIGMA**2 * delta * (1.0 - decay_power) / (
-        1.0 - decay**2
-    )
+    return decay_power + OU_SIGMA**2 * delta * (1.0 - decay_power) / (1.0 - decay**2)
 
 
 def _coordinate_covariance(common: float, difference: float) -> np.ndarray:
     diagonal = 0.5 * (common + difference)
     off_diagonal = 0.5 * (common - difference)
-    return np.asarray(
-        [[diagonal, off_diagonal], [off_diagonal, diagonal]], dtype=float
-    )
+    return np.asarray([[diagonal, off_diagonal], [off_diagonal, diagonal]], dtype=float)
 
 
 def _multivariate_normal_cdf_batched(
@@ -263,7 +259,9 @@ def _query_q_values(
     steps: int = 280,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Return terminal probabilities and shared-descendant Q values."""
-    terminal_modes = tuple(_mode_variance(rate, steps, steps=steps) for rate in OU_RATES)
+    terminal_modes = tuple(
+        _mode_variance(rate, steps, steps=steps) for rate in OU_RATES
+    )
     terminal_covariance = _coordinate_covariance(*terminal_modes)
     terminal_std = math.sqrt(float(terminal_covariance[0, 0]))
 
@@ -400,9 +398,7 @@ def ou_oracle_variance_contributions(
     return profile.copy()
 
 
-def ou_oracle_relative_gap(
-    schedule: tuple[float, ...], *, steps: int = 280
-) -> float:
+def ou_oracle_relative_gap(schedule: tuple[float, ...], *, steps: int = 280) -> float:
     """Return the finite-query Frank--Wolfe relative primal-dual gap."""
     _, _, relative_gap = _minimax_solution(schedule, steps=steps)
     return float(relative_gap)
