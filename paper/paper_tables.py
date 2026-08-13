@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import math
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
@@ -13,11 +12,10 @@ from paper_plots import (
     MODELS,
     SCHEDULES,
     ResultRow,
-    _expected_uniform_cs,
     _load_and_verify_rows,
     _normal_reduction,
 )
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_OUTPUT_DIR = ROOT / "tables"
 RESULT_TABLE_STEMS = {
     "simple_ou": "complete_ou",
@@ -139,20 +137,10 @@ def _row_at_budget(
     budget: int,
     *,
     mode: str,
-    uniform_c: float | None = None,
 ) -> ResultRow | None:
     matches = [row for row in rows if row.budget == budget and row.mode == mode]
-    if uniform_c is not None:
-        matches = [
-            row
-            for row in matches
-            if math.isclose(row.uniform_c, uniform_c, rel_tol=0.0, abs_tol=1e-12)
-        ]
     if len(matches) > 1:
-        raise RuntimeError(
-            f"Duplicate {mode} result at B={budget}"
-            + (f", c={uniform_c:g}" if uniform_c is not None else "")
-        )
+        raise RuntimeError(f"Duplicate {mode} result at B={budget}")
     return matches[0] if matches else None
 
 
@@ -161,15 +149,9 @@ def _metric_reduction(
     budget: int,
     *,
     mode: str,
-    uniform_c: float | None = None,
 ) -> tuple[float, float, float] | None:
     independent = _row_at_budget(rows, budget, mode="fixed_N")
-    method = _row_at_budget(
-        rows,
-        budget,
-        mode=mode,
-        uniform_c=uniform_c,
-    )
+    method = _row_at_budget(rows, budget, mode=mode)
     if independent is None or method is None:
         return None
     return _normal_reduction(independent, method)
@@ -183,63 +165,51 @@ def _complete_result_rows(
     rows: list[dict[str, Any]] = []
     for schedule, _ in SCHEDULES:
         schedule_rows = rows_by_schedule.get(schedule, [])
-        methods: list[tuple[str, str, float | None]] = [
-            ("learned", "adaptive", None),
-            *[
-                ("uniform", "uniform_c", c)
-                for c in _expected_uniform_cs(schedule)
-            ],
-        ]
-        for allocation, mode, c in methods:
-            for budget in model["budgets"]:
-                reduction = _metric_reduction(
+        for budget in model["budgets"]:
+            reduction = _metric_reduction(
+                schedule_rows,
+                budget,
+                mode="adaptive",
+            )
+            if reduction is None:
+                observed = lower = upper = ""
+                n_method = n_independent = ""
+                mean_method = mean_independent = ""
+            else:
+                observed, lower, upper = reduction
+                independent = _row_at_budget(
                     schedule_rows,
                     budget,
-                    mode=mode,
-                    uniform_c=c,
+                    mode="fixed_N",
                 )
-                if reduction is None:
-                    observed = lower = upper = ""
-                    n_method = n_independent = ""
-                    mean_method = mean_independent = ""
-                else:
-                    observed, lower, upper = reduction
-                    independent = _row_at_budget(
-                        schedule_rows,
-                        budget,
-                        mode="fixed_N",
-                    )
-                    method = _row_at_budget(
-                        schedule_rows,
-                        budget,
-                        mode=mode,
-                        uniform_c=c,
-                    )
-                    assert independent is not None and method is not None
-                    n_method = method.n
-                    n_independent = independent.n
-                    mean_method = method.mean
-                    mean_independent = independent.mean
-                rows.append(
-                    {
-                        "split_points": len(schedule),
-                        "allocation": allocation,
-                        "c": "" if c is None else c,
-                        "B": budget,
-                        "metric": model["metric"],
-                        "mean_method": mean_method,
-                        "mean_independent": mean_independent,
-                        "reduction_percent": observed,
-                        "reduction_ci_lower_percent": lower,
-                        "reduction_ci_upper_percent": upper,
-                        "n_method": n_method,
-                        "n_independent": n_independent,
-                    }
+                method = _row_at_budget(
+                    schedule_rows,
+                    budget,
+                    mode="adaptive",
                 )
+                assert independent is not None and method is not None
+                n_method = method.n
+                n_independent = independent.n
+                mean_method = method.mean
+                mean_independent = independent.mean
+            rows.append(
+                {
+                    "split_points": len(schedule),
+                    "allocation": "learned",
+                    "B": budget,
+                    "metric": model["metric"],
+                    "mean_method": mean_method,
+                    "mean_independent": mean_independent,
+                    "reduction_percent": observed,
+                    "reduction_ci_lower_percent": lower,
+                    "reduction_ci_upper_percent": upper,
+                    "n_method": n_method,
+                    "n_independent": n_independent,
+                }
+            )
     fieldnames = [
         "split_points",
         "allocation",
-        "c",
         "B",
         "metric",
         "mean_method",
@@ -255,6 +225,8 @@ def _complete_result_rows(
 
 def _ou_oracle_rows(
     all_rows: dict[str, dict[tuple[float, ...], list[ResultRow]]],
+    *,
+    debug: bool = False,
 ) -> tuple[list[str], list[dict[str, Any]]]:
     learned_by_schedule = all_rows.get("simple_ou", {})
     oracle_by_schedule = all_rows.get("ou_oracle", {})
@@ -268,13 +240,8 @@ def _ou_oracle_rows(
         if not common_budgets:
             raise RuntimeError("OU learned and oracle results have no common budget")
         display_budget = max(common_budgets)
-        oracle_independent = _row_at_budget(
-            oracle_rows, display_budget, mode="fixed_N"
-        )
-        oracle = _row_at_budget(
-            oracle_rows, display_budget, mode="ou_oracle"
-        )
-        learned_independent = _row_at_budget(
+        oracle = _row_at_budget(oracle_rows, display_budget, mode="ou_oracle")
+        shared_independent = _row_at_budget(
             learned_rows, display_budget, mode="fixed_N"
         )
         learned = _row_at_budget(
@@ -282,20 +249,33 @@ def _ou_oracle_rows(
             display_budget,
             mode="adaptive",
         )
+        if debug:
+            shared_fixed_mean = (
+                "missing"
+                if shared_independent is None
+                else f"{shared_independent.mean:.12g}"
+            )
+            oracle_mean = "missing" if oracle is None else f"{oracle.mean:.12g}"
+            learned_mean = "missing" if learned is None else f"{learned.mean:.12g}"
+            print(
+                f"[debug] OU KS sanity: splits={len(schedule)}, B={display_budget}, "
+                f"shared fixed_N mean_ks={shared_fixed_mean}, "
+                f"oracle mean_ks={oracle_mean}, learned mean_ks={learned_mean}"
+            )
         if any(
             value is None
-            for value in (oracle_independent, oracle, learned_independent, learned)
+            for value in (shared_independent, oracle, learned)
         ):
             oracle_reduction = learned_reduction = oracle_captured = ""
             oracle_lower = oracle_upper = learned_lower = learned_upper = ""
         else:
-            assert oracle_independent is not None and oracle is not None
-            assert learned_independent is not None and learned is not None
+            assert shared_independent is not None and oracle is not None
+            assert learned is not None
             oracle_reduction, oracle_lower, oracle_upper = _normal_reduction(
-                oracle_independent, oracle
+                shared_independent, oracle
             )
             learned_reduction, learned_lower, learned_upper = _normal_reduction(
-                learned_independent, learned
+                shared_independent, learned
             )
             oracle_captured = 100.0 * learned_reduction / oracle_reduction
 
@@ -332,12 +312,7 @@ def main() -> None:
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    all_rows = _load_and_verify_rows(
-        outputs_root,
-        debug=args.debug,
-        require_uniform=not args.debug,
-        report_missing_uniform=args.debug,
-    )
+    all_rows = _load_and_verify_rows(outputs_root, debug=args.debug)
 
     fieldnames, rows = _numerical_schedule_rows()
     written = [_write_csv(output_dir, "numerical_schedules", fieldnames, rows)]
@@ -345,7 +320,7 @@ def main() -> None:
     fieldnames, rows = _reference_sample_rows()
     written.append(_write_csv(output_dir, "reference_samples", fieldnames, rows))
 
-    fieldnames, rows = _ou_oracle_rows(all_rows)
+    fieldnames, rows = _ou_oracle_rows(all_rows, debug=args.debug)
     written.append(_write_csv(output_dir, "ou_oracle_reductions", fieldnames, rows))
 
     for model in MODELS:

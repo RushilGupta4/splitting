@@ -15,6 +15,8 @@ from runners.sde.ou_oracle.oracle import (
 )
 from runners.sde.runner import SimpleOURunner
 
+_FACTOR_TOLERANCE = 1e-10
+
 
 class OUOracleRunner(SimpleOURunner):
     """Simple OU simulation with deterministic minimax split factors."""
@@ -37,24 +39,28 @@ class OUOracleRunner(SimpleOURunner):
         reference_generation_config: Mapping[str, Any] | None = None,
     ) -> Mapping[str, Any]:
         key = dict(
-            super().reference_cache_key(
-                comparison_mode, reference_generation_config
-            )
+            super().reference_cache_key(comparison_mode, reference_generation_config)
         )
         key["runner"] = SimpleOURunner.runner_name
         return key
 
-    def oracle_definition(
-        self, split_percentages: Sequence[float]
-    ) -> dict[str, Any]:
+    def oracle_definition(self, split_percentages: Sequence[float]) -> dict[str, Any]:
         if self.input_dim != 2 or self._sampler != "euler":
             raise ValueError("OU oracle requires the 2D Euler Simple OU runner")
         schedule = tuple(float(value) for value in split_percentages)
         self.resolve_split_percentages(schedule)
         cumulative = ou_oracle_allocation(schedule, steps=self._sampling_steps)
         factors = cumulative[1:] / cumulative[:-1]
-        if factors.shape != (len(schedule),) or np.any(factors < 1.0):
-            raise RuntimeError("OU oracle produced invalid split factors")
+        if factors.shape != (len(schedule),):
+            raise RuntimeError(
+                f"OU oracle produced invalid split factors. Expected shape {(len(schedule),)}, got {factors.shape}"
+            )
+
+        if np.any(factors < 1.0 - _FACTOR_TOLERANCE):
+            raise RuntimeError(
+                f"OU oracle produced invalid split factors. Expected all factors >= 1.0, got {factors}"
+            )
+
         return {
             "version": 1,
             "sampling_steps": int(self._sampling_steps),

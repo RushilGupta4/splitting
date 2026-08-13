@@ -13,11 +13,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent.parent
 
-os.environ.setdefault(
-    "MPLCONFIGDIR", str(Path(__file__).resolve().parent / ".mplconfig")
-)
+os.environ.setdefault("MPLCONFIGDIR", str(ROOT / ".mplconfig"))
 
 import matplotlib
 
@@ -40,13 +38,6 @@ SCHEDULES = (
     (NINE, "9 splits"),
     (NINETEEN, "19 splits"),
 )
-UNIFORM_C_VALUES = (1.1, 1.2, 1.5, 2.0)
-MAX_UNIFORM_C_BY_SPLIT_COUNT = {
-    4: 2.0,
-    9: 1.2,
-    19: 1.1,
-}
-
 SCHEDULE_COLORS = {
     SINGLE_01: "#009E73",
     SINGLE_02: "#CC79A7",
@@ -238,6 +229,8 @@ OU_ORACLE_MODEL = {
     "runner": "ou_oracle",
     "config_name": "default",
     "title": "OU oracle",
+    "budgets": (MODELS[0]["budgets"][-1],),
+    "steps": (MODELS[0]["steps"][-1],),
 }
 
 
@@ -271,32 +264,8 @@ class ResultRow:
         return self.mode == "fixed_N"
 
     @property
-    def is_uniform(self) -> bool:
-        return self.mode == "uniform_c"
-
-    @property
     def is_oracle(self) -> bool:
         return self.mode == "ou_oracle"
-
-    @property
-    def uniform_c(self) -> float:
-        if not self.is_uniform:
-            raise ValueError(f"{self.mode!r} is not a uniform-c result")
-        factors = [float(value) for value in self.raw["N_i"].split(",") if value]
-        if len(factors) != len(self.schedule):
-            raise ValueError(
-                f"{self.csv_path}: uniform_c row at B={self.budget} has "
-                f"{len(factors)} factors, expected {len(self.schedule)}"
-            )
-        c = factors[0]
-        if not all(
-            math.isclose(value, c, rel_tol=0.0, abs_tol=1e-12)
-            for value in factors
-        ):
-            raise ValueError(
-                f"{self.csv_path}: uniform_c row at B={self.budget} has unequal factors"
-            )
-        return c
 
     def mean_ci(self) -> tuple[float, float]:
         if self.n < 2 or not math.isfinite(self.std):
@@ -341,16 +310,6 @@ def _schedule_name(schedule: tuple[float, ...]) -> str:
     return "_".join(f"{value:g}" for value in schedule)
 
 
-def _expected_uniform_cs(schedule: tuple[float, ...]) -> tuple[float, ...]:
-    try:
-        maximum = MAX_UNIFORM_C_BY_SPLIT_COUNT[len(schedule)]
-    except KeyError as exc:
-        raise ValueError(
-            f"No uniform-c limit configured for {len(schedule)} split points"
-        ) from exc
-    return tuple(value for value in UNIFORM_C_VALUES if value <= maximum)
-
-
 def _schedule_from_filename(path: Path) -> tuple[float, ...]:
     expected = {
         f"compare_results_{_schedule_name(schedule)}": schedule
@@ -379,8 +338,6 @@ def _load_manifest_rows(
     *,
     allow_partial_runs: bool = False,
     allow_partial_schedules: bool = False,
-    allow_partial_methods: bool = False,
-    report_missing_methods: bool = False,
 ) -> dict[str, dict[tuple[float, ...], list[ResultRow]]]:
     all_rows: dict[str, dict[tuple[float, ...], list[ResultRow]]] = {}
     expected_csv_names = {
@@ -389,7 +346,6 @@ def _load_manifest_rows(
 
     for model in models:
         partial_run_counts: set[int] = set()
-        missing_uniform_methods: set[tuple[int, float]] = set()
         experiment_dir = outputs_root / model["directory"]
         manifest_path = experiment_dir / "compare_outputs.json"
         if allow_partial_schedules:
@@ -455,47 +411,16 @@ def _load_manifest_rows(
                         csv_path=csv_path,
                         raw=raw,
                     )
-                    if row.mode not in {"adaptive", "fixed_N", "uniform_c"}:
+                    if row.mode not in {"adaptive", "fixed_N"}:
                         raise RuntimeError(
                             f"Unexpected mode {row.mode!r} in {csv_path}"
                         )
-                    if row.is_uniform:
-                        c = row.uniform_c
-                        if c not in _expected_uniform_cs(schedule):
-                            raise RuntimeError(
-                                f"Unexpected uniform c={c:g} in {csv_path}"
-                            )
-                        if any(
-                            value is not None
-                            for value in (
-                                row.pilot_budget,
-                                row.pilot_rule,
-                                row.optimizer,
-                                row.loss,
-                                row.reuse,
-                            )
-                        ):
-                            raise RuntimeError(
-                                f"Uniform row unexpectedly contains adaptive settings in {csv_path}"
-                            )
-                        factor_stds = [
-                            float(value)
-                            for value in row.raw["N_i_std"].split(",")
-                            if value
-                        ]
-                        if len(factor_stds) != len(schedule) or any(
-                            value != 0.0 for value in factor_stds
-                        ):
-                            raise RuntimeError(
-                                f"Uniform row has invalid N_i_std values in {csv_path}"
-                            )
                     rows.append(row)
 
             budgets = sorted({row.budget for row in rows})
             if tuple(budgets) != model["budgets"]:
                 raise RuntimeError(f"Unexpected budget set in {csv_path}: {budgets}")
             expected_steps = dict(zip(model["budgets"], model["steps"]))
-            expected_uniform_cs = set(_expected_uniform_cs(schedule))
             for budget in model["budgets"]:
                 group = [row for row in rows if row.budget == budget]
                 if (
@@ -505,23 +430,6 @@ def _load_manifest_rows(
                     raise RuntimeError(
                         f"Expected one adaptive and one independent row at B={budget}"
                     )
-                observed_uniform_cs = {
-                    row.uniform_c for row in group if row.is_uniform
-                }
-                if observed_uniform_cs - expected_uniform_cs:
-                    raise RuntimeError(
-                        f"Unexpected uniform-c rows at B={budget}: "
-                        f"{sorted(observed_uniform_cs - expected_uniform_cs)}"
-                    )
-                missing = expected_uniform_cs - observed_uniform_cs
-                if missing and not allow_partial_methods:
-                    raise RuntimeError(
-                        f"Missing uniform-c rows at B={budget}: {sorted(missing)}"
-                    )
-                missing_uniform_methods.update((len(schedule), c) for c in missing)
-                if len(observed_uniform_cs) != sum(row.is_uniform for row in group):
-                    raise RuntimeError(f"Duplicate uniform-c row at B={budget}")
-
                 independent = next(row for row in group if row.is_independent)
                 splitting = next(row for row in group if row.is_adaptive)
                 if any(
@@ -573,17 +481,6 @@ def _load_manifest_rows(
                 RuntimeWarning,
                 stacklevel=2,
             )
-        if missing_uniform_methods and report_missing_methods:
-            missing_labels = ", ".join(
-                f"{split_count} splits/c={c:g}"
-                for split_count, c in sorted(missing_uniform_methods)
-            )
-            warnings.warn(
-                f"Loading partial {model['title']} methods; missing "
-                f"uniform baselines: {missing_labels}.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
         all_rows[model["directory"]] = schedule_rows
     return all_rows
 
@@ -621,6 +518,10 @@ def _load_ou_oracle_rows(
             for raw in csv.DictReader(handle):
                 if raw["mode"] not in {"fixed_N", "ou_oracle"}:
                     raise RuntimeError(f"Unexpected oracle mode in {csv_path}")
+                if raw["mode"] == "fixed_N":
+                    # Legacy oracle runs included a separate independent baseline.
+                    # Paper comparisons always use the ordinary Simple OU fixed_N row.
+                    continue
                 n = int(raw["n_valid_ks"])
                 if n != model["n_runs"] and not (
                     allow_partial_runs and 1 <= n < model["n_runs"]
@@ -666,8 +567,7 @@ def _load_ou_oracle_rows(
         for budget in model["budgets"]:
             group = [row for row in rows if row.budget == budget]
             if (
-                sum(row.is_independent for row in group) != 1
-                or sum(row.is_oracle for row in group) != 1
+                sum(row.is_oracle for row in group) != 1
                 or any(
                     row.sampler != model["sampler"]
                     or row.sampling_steps != expected_steps[budget]
@@ -777,19 +677,6 @@ def _config_matches(row: ResultRow, config: dict[str, Any]) -> bool:
         return False
     if row.is_independent:
         return spec.get("mode") == "fixed_N"
-
-    if row.is_uniform:
-        return (
-            spec.get("mode") == "uniform_c"
-            and tuple(float(value) for value in spec.get("split_percentages", []))
-            == row.schedule
-            and math.isclose(
-                float(spec.get("c", math.nan)),
-                row.uniform_c,
-                rel_tol=0.0,
-                abs_tol=1e-12,
-            )
-        )
 
     return (
         spec.get("mode") == "estimate_and_sample"
@@ -903,16 +790,9 @@ def _attach_and_verify_caches(
 def _load_and_verify_rows(
     outputs_root: Path,
     debug: bool,
-    *,
-    require_uniform: bool = False,
-    report_missing_uniform: bool = False,
 ) -> dict[str, dict[tuple[float, ...], list[ResultRow]]]:
     if not debug:
-        all_rows = _load_manifest_rows(
-            outputs_root,
-            allow_partial_methods=not require_uniform,
-            report_missing_methods=report_missing_uniform,
-        )
+        all_rows = _load_manifest_rows(outputs_root)
         _attach_and_verify_caches(outputs_root, all_rows)
         all_rows["ou_oracle"] = _load_ou_oracle_rows(outputs_root)
         return all_rows
@@ -925,8 +805,6 @@ def _load_and_verify_rows(
                 models=(model,),
                 allow_partial_runs=True,
                 allow_partial_schedules=True,
-                allow_partial_methods=True,
-                report_missing_methods=report_missing_uniform,
             )
             _attach_and_verify_caches(outputs_root, model_rows, models=(model,))
         except (OSError, KeyError, RuntimeError, ValueError) as exc:

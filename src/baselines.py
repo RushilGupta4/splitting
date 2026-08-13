@@ -1,5 +1,4 @@
 import logging
-import math
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Mapping, Sequence
 
@@ -192,69 +191,6 @@ def run_fixed_N_sampling(
             trial["n0"] = int(n0)
     result = {
         "mode": str(result_mode),
-        "B": int(B),
-        **summarize_sampling_trials(trial_results, metrics),
-    }
-    if return_trial_results:
-        result["trial_results"] = trial_results
-    return result
-
-
-def run_uniform_c_sampling(
-    runner,
-    comparison_state: Any,
-    *,
-    comparison_mode: str,
-    metrics: Sequence[str] = ("ks",),
-    B: int,
-    split_percentages: Sequence[float],
-    c: float,
-    n_runs: int,
-    seed: int | None,
-    debug: bool = False,
-    n_parallel: int = 1,
-    run_offset: int = 0,
-    return_trial_results: bool = False,
-    max_sampling_batch_size=None,
-):
-    del debug
-    c = float(c)
-    if not math.isfinite(c) or c < 1.0:
-        raise ValueError("c must be finite and at least 1")
-    _, split_points = runner.resolve_split_percentages(split_percentages)
-    split_factors = [c] * len(split_points)
-    cost_per_root = runner.expected_cost_per_root(split_points, split_factors)
-    n0 = max_floor_split_roots_for_budget(
-        runner,
-        split_points,
-        split_factors,
-        budget=int(B),
-        expected_cost_per_root=cost_per_root,
-    )
-
-    def sample_batch(chunk_size, generator):
-        samples, _, _ = runner.run_split_batch(
-            n0_by_run=[n0] * chunk_size,
-            split_points=split_points,
-            split_factors_by_run=[split_factors] * chunk_size,
-            generator=generator,
-            max_sampling_batch_size=max_sampling_batch_size,
-        )
-        return samples
-
-    trial_results = _run_phase2_loop(
-        sample_batch,
-        runner=runner,
-        comparison_mode=comparison_mode,
-        metric_states=comparison_state,
-        metrics=metrics,
-        n_runs=n_runs,
-        n_parallel=n_parallel,
-        seed=seed,
-        run_offset=run_offset,
-    )
-    result = {
-        "mode": "uniform_c",
         "B": int(B),
         **summarize_sampling_trials(trial_results, metrics),
     }

@@ -53,10 +53,6 @@ _SAMPLING_BASE = {
     ],
     "baselines": [
         "fixed_N",
-        "uniform_1.1",
-        "uniform_1.2",
-        "uniform_1.5",
-        "uniform_2",
     ],
     "max_sampling_batch_size": SDE_MAX_SAMPLING_BATCH_SIZE,
 }

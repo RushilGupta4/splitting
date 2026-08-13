@@ -2,11 +2,6 @@ import numpy as np
 
 _BASE_SPLIT_SCHDULES = []
 SPLIT_COUNTS = [4, 9, 19]
-MAX_UNIFORM_C_BY_SPLIT_COUNT = {
-    4: 2.0,
-    9: 1.2,
-    19: 1.1,
-}
 OPTIMIZATION_MODES = ["monotone", "monotone_cvar95"]
 OPTIMIZATION_MODES = ["monotone"]
 
@@ -20,16 +15,6 @@ def split_schedules(counts=SPLIT_COUNTS) -> list[list[float]]:
     return _BASE_SPLIT_SCHDULES + [
         np.round(np.arange(j, 0, -1) / (j + 1), 2).tolist() for j in counts
     ]
-
-
-def uniform_c_allowed(c: float, split_count: int) -> bool:
-    """Return whether a uniform baseline is enabled for this many splits."""
-    split_count = int(split_count)
-    if split_count not in MAX_UNIFORM_C_BY_SPLIT_COUNT:
-        raise ValueError(
-            f"No uniform-c limit configured for {split_count} split points"
-        )
-    return float(c) <= MAX_UNIFORM_C_BY_SPLIT_COUNT[split_count]
 
 
 def crossfit_q_config(num_queries: int | None = None, losses=None) -> dict:
@@ -49,10 +34,8 @@ def crossfit_q_config(num_queries: int | None = None, losses=None) -> dict:
 
 
 __all__ = [
-    "MAX_UNIFORM_C_BY_SPLIT_COUNT",
     "OPTIMIZATION_MODES",
     "SPLIT_COUNTS",
     "crossfit_q_config",
     "split_schedules",
-    "uniform_c_allowed",
 ]

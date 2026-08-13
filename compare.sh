@@ -8,7 +8,7 @@ BASE_DIRS=(outputs_paper_final)
 
 CONFIGS=(
     # "edm_default|edm_gmm2d|default|cuda:0|50000"
-    "simple_ou|simple_ou|default|cuda:0|1000000"
+    # "simple_ou|simple_ou|default|cuda:0|1000000"
     # "coupled_double_well_langevin|coupled_double_well_langevin|default|cuda:1|1000000"
 
     # "simple_ou_mmd|simple_ou|mmd|cuda:0|1000000"

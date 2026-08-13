@@ -21,11 +21,7 @@ from adaptive import (
     _normalize_query_params,
     run_estimate_and_sample,
 )
-from baselines import (
-    run_fixed_N_sampling,
-    run_solver_baseline_sampling,
-    run_uniform_c_sampling,
-)
+from baselines import run_fixed_N_sampling, run_solver_baseline_sampling
 from metrics import (
     aggregate_cached_metric_rows,
     metric_cache_key,
@@ -47,7 +43,6 @@ from runners.base import (
     step_schedules_for_sampler,
     steps_for_budget,
 )
-from runners.common_configs import uniform_c_allowed
 from runners.registry import get_runner_class, names
 from runners.splitting import normalize_max_sampling_batch_size
 from trials import mean_vector, std_vector
@@ -543,12 +538,6 @@ def _run_trial(
             split_percentages=[],
             N_i_list=[],
         )
-    if spec["mode"] == "uniform_c":
-        return run_uniform_c_sampling(
-            **common,
-            split_percentages=split_percentages,
-            c=float(spec["c"]),
-        )
     if spec["mode"] == "ou_oracle":
         oracle = runner.oracle_definition(split_percentages)
         return run_fixed_N_sampling(
@@ -661,9 +650,6 @@ def _method_display(row: Mapping[str, Any]) -> str:
     mode = row.get("mode")
     if mode == "fixed_N":
         return "fixed_N"
-    if mode == "uniform_c":
-        factors = row.get("N_i") or []
-        return f"uniform_{float(factors[0]):g}" if factors else "uniform_c"
     if mode == "ou_oracle":
         return "ou_oracle"
     if mode == "solver_baseline":
@@ -719,10 +705,6 @@ def _canonical_spec_for_cache(spec: Mapping[str, Any], *, runner, split_percenta
         return key
 
     key["split_percentages"] = [float(x) for x in split_percentages]
-
-    if mode == "uniform_c":
-        key["c"] = float(spec["c"])
-        return key
 
     if mode == "estimate_and_sample":
         key["B1"] = int(spec["B1"])
@@ -945,13 +927,6 @@ def _aggregate_cached_runs(spec, trials, *, base_runner, split_percentages, cfg)
     }
     if spec["mode"] == "fixed_N":
         return base
-    if spec["mode"] == "uniform_c":
-        factors = [float(spec["c"])] * len(split_percentages)
-        return {
-            **base,
-            "N_i": factors,
-            "N_i_std": [0.0] * len(factors),
-        }
     if spec["mode"] == "ou_oracle":
         oracle = runner.oracle_definition(split_percentages)
         factors = [float(value) for value in oracle["split_factors"]]
@@ -1024,19 +999,7 @@ def _write_summary_csv(path, rows):
 
 def _run_split(args, cfg, base_runner, baselines, split_percentages):
     split_percentages = [float(x) for x in split_percentages]
-    selected_baselines = []
-    for baseline in baselines:
-        if baseline["mode"] == "uniform_c" and not uniform_c_allowed(
-            baseline["c"], len(split_percentages)
-        ):
-            log.info(
-                "Skipping uniform_c=%g for %d split points",
-                baseline["c"],
-                len(split_percentages),
-            )
-            continue
-        selected_baselines.append(baseline)
-    specs = _build_trial_specs(cfg, selected_baselines)
+    specs = _build_trial_specs(cfg, baselines)
     runs_dir = _runs_dir(args.output_dir)
     entries: List[Dict[str, Any]] = []
     total_remaining = 0
