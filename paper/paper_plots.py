@@ -45,13 +45,6 @@ SCHEDULE_COLORS = {
     NINE: "#D55E00",
     NINETEEN: "#228833",
 }
-SCHEDULE_LINESTYLES = {
-    SINGLE_01: "-.",
-    SINGLE_02: ":",
-    FOUR: "-",
-    NINE: "--",
-    NINETEEN: (0, (3, 1, 1, 1)),
-}
 
 EXPECTED_MLP_PARAMS = {
     "hidden_dims": [128, 64],
@@ -1161,7 +1154,7 @@ def _plot_reductions(
                 budgets,
                 observed,
                 color=SCHEDULE_COLORS[schedule],
-                linestyle=SCHEDULE_LINESTYLES[schedule],
+                linestyle="-",
                 linewidth=1.6,
                 label=label,
             )
@@ -1203,7 +1196,7 @@ def _plot_absolute_metrics(
     output_dir: Path,
 ) -> None:
     _style()
-    fig, axes = plt.subplots(2, 2, figsize=(7.15, 4.25), sharey=True)
+    fig, axes = plt.subplots(2, 2, figsize=(7.15, 4.25))
     legend_handles: list[Any] = []
     legend_labels: list[str] = []
 
@@ -1232,8 +1225,8 @@ def _plot_absolute_metrics(
             baseline_budgets,
             baseline_means,
             color="#333333",
-            linestyle="-",
-            linewidth=1.8,
+            linestyle="--",
+            linewidth=1.2,
             label="Independent MC",
         )
 
@@ -1261,8 +1254,8 @@ def _plot_absolute_metrics(
                 budgets,
                 means,
                 color=SCHEDULE_COLORS[schedule],
-                linestyle=SCHEDULE_LINESTYLES[schedule],
-                linewidth=1.6,
+                linestyle="-",
+                linewidth=1.1,
                 label=label,
             )
 
@@ -1278,7 +1271,7 @@ def _plot_absolute_metrics(
                 legend_handles.append(handle)
                 legend_labels.append(label)
 
-    for ax in axes[:, 0]:
+    for ax in axes.flat:
         ax.set_ylabel("Mean Error Metric")
     for ax in axes[-1, :]:
         ax.set_xlabel("Budget $B$")
@@ -1365,9 +1358,9 @@ def _plot_ou_oracle_allocations(
             times,
             oracle_curve,
             where="post",
-            color="#D55E00",
+            color="#333333",
             linestyle="--",
-            linewidth=1.7,
+            linewidth=1.2,
             label="Finite-query minimax",
             zorder=3,
         )
@@ -1375,8 +1368,8 @@ def _plot_ou_oracle_allocations(
             times,
             learned_mean,
             where="post",
-            color="#0072B2",
-            linewidth=1.5,
+            color=SCHEDULE_COLORS[schedule],
+            linewidth=1.4,
             label="Learned mean",
             zorder=4,
         )
