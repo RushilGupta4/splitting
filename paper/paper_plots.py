@@ -838,6 +838,44 @@ def _group_at_budget(rows: list[ResultRow], budget: int) -> tuple[ResultRow, Res
     return independent, splitting
 
 
+def _validated_independent_rows(
+    rows_by_schedule: dict[tuple[float, ...], list[ResultRow]],
+) -> dict[int, ResultRow]:
+    """Return one independent baseline per budget after checking duplicates."""
+    independent_by_budget: dict[int, ResultRow] = {}
+    for schedule, _ in SCHEDULES:
+        if schedule not in rows_by_schedule:
+            continue
+        for row in rows_by_schedule[schedule]:
+            if not row.is_independent:
+                continue
+            reference = independent_by_budget.setdefault(row.budget, row)
+            summaries_match = (
+                row.sampler == reference.sampler
+                and row.sampling_steps == reference.sampling_steps
+                and row.n == reference.n
+                and math.isclose(
+                    row.mean, reference.mean, rel_tol=0.0, abs_tol=1e-15
+                )
+                and math.isclose(
+                    row.std, reference.std, rel_tol=0.0, abs_tol=1e-15
+                )
+            )
+            samples_match = (
+                row.samples is not None
+                and reference.samples is not None
+                and np.array_equal(row.samples, reference.samples)
+            )
+            if not summaries_match or not samples_match:
+                raise RuntimeError(
+                    f"Independent baselines disagree at B={row.budget} across "
+                    "split-schedule result files"
+                )
+    if not independent_by_budget:
+        raise RuntimeError("No independent baseline rows are available")
+    return independent_by_budget
+
+
 def _largest_budget(rows: list[ResultRow]) -> int:
     budgets = {row.budget for row in rows}
     if not budgets:
@@ -1160,6 +1198,102 @@ def _plot_reductions(
     _save_figure(fig, output_dir, "experiment_metric_gain")
 
 
+def _plot_absolute_metrics(
+    all_rows: dict[str, dict[tuple[float, ...], list[ResultRow]]],
+    output_dir: Path,
+) -> None:
+    _style()
+    fig, axes = plt.subplots(2, 2, figsize=(7.15, 4.25), sharey=True)
+    legend_handles: list[Any] = []
+    legend_labels: list[str] = []
+
+    for ax, model in zip(axes.flat, MODELS):
+        if model["directory"] not in all_rows:
+            ax.set_visible(False)
+            continue
+        rows_by_schedule = all_rows[model["directory"]]
+        independent_by_budget = _validated_independent_rows(rows_by_schedule)
+        baseline_budgets = sorted(independent_by_budget)
+        baseline_rows = [independent_by_budget[budget] for budget in baseline_budgets]
+        baseline_means = np.asarray([row.mean for row in baseline_rows])
+        baseline_intervals = np.asarray([row.mean_ci() for row in baseline_rows])
+
+        if np.any(baseline_means <= 0.0) or np.any(baseline_intervals <= 0.0):
+            raise RuntimeError("Absolute metric plot requires positive baseline values")
+        ax.fill_between(
+            baseline_budgets,
+            baseline_intervals[:, 0],
+            baseline_intervals[:, 1],
+            color="#333333",
+            alpha=0.12,
+            linewidth=0,
+        )
+        ax.plot(
+            baseline_budgets,
+            baseline_means,
+            color="#333333",
+            linestyle="-",
+            linewidth=1.8,
+            label="Independent MC",
+        )
+
+        for schedule, label in SCHEDULES:
+            if schedule not in rows_by_schedule:
+                continue
+            splitting_rows = sorted(
+                (row for row in rows_by_schedule[schedule] if row.is_adaptive),
+                key=lambda row: row.budget,
+            )
+            budgets = [row.budget for row in splitting_rows]
+            means = np.asarray([row.mean for row in splitting_rows])
+            intervals = np.asarray([row.mean_ci() for row in splitting_rows])
+            if np.any(means <= 0.0) or np.any(intervals <= 0.0):
+                raise RuntimeError("Absolute metric plot requires positive values")
+            ax.fill_between(
+                budgets,
+                intervals[:, 0],
+                intervals[:, 1],
+                color=SCHEDULE_COLORS[schedule],
+                alpha=0.14,
+                linewidth=0,
+            )
+            ax.plot(
+                budgets,
+                means,
+                color=SCHEDULE_COLORS[schedule],
+                linestyle=SCHEDULE_LINESTYLES[schedule],
+                linewidth=1.6,
+                label=label,
+            )
+
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+        ax.set_title(model["plot_title"])
+        ax.grid(axis="y", which="both", color="#D8D8D8", linewidth=0.55)
+        ax.xaxis.set_major_formatter(FuncFormatter(_budget_tick))
+        ax.tick_params(axis="x", which="minor", bottom=False)
+        axis_handles, axis_labels = ax.get_legend_handles_labels()
+        for handle, label in zip(axis_handles, axis_labels):
+            if label not in legend_labels:
+                legend_handles.append(handle)
+                legend_labels.append(label)
+
+    for ax in axes[:, 0]:
+        ax.set_ylabel("Mean Error Metric")
+    for ax in axes[-1, :]:
+        ax.set_xlabel("Budget $B$")
+    fig.legend(
+        legend_handles,
+        legend_labels,
+        loc="upper center",
+        ncol=1 + len(SCHEDULES),
+        frameon=False,
+        bbox_to_anchor=(0.5, 1.01),
+    )
+    fig.tight_layout(rect=(0, 0, 1, 0.95), h_pad=1.15, w_pad=1.0)
+    _save_figure(fig, output_dir, "experiment_metric_absolute")
+
+
 def _allocation_curve(
     schedule: tuple[float, ...], cumulative: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -1374,6 +1508,7 @@ def main() -> None:
     if all_rows:
         reductions = _compute_reductions(all_rows)
         _plot_reductions(all_rows, reductions, output_dir)
+        _plot_absolute_metrics(all_rows, output_dir)
         _plot_allocations(all_rows, output_dir)
         if "simple_ou" in all_rows and "ou_oracle" in all_rows:
             _plot_ou_oracle_allocations(all_rows, output_dir)
