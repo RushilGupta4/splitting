@@ -421,12 +421,14 @@ class BaseRunner(ABC):
         """Parse a config baseline name into a generic compare spec."""
         if name == "fixed_N":
             return {"mode": "fixed_N"}
+        if name == "uniform_c":
+            return {"mode": "uniform_c"}
         for solver in sorted(self.solver_names(), key=len, reverse=True):
             parsed = self.parse_solver_baseline_name(name, solver)
             if parsed is not None:
                 return parsed
         raise ValueError(
-            f"Unknown baseline {name!r}. Expected fixed_N or one of: "
+            f"Unknown baseline {name!r}. Expected fixed_N, uniform_c or one of: "
             f"{', '.join(self.solver_names())}"
         )
 

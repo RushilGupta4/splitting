@@ -7,6 +7,10 @@ import numpy as np
 import torch
 
 
+class InsufficientSplitBudgetError(ValueError):
+    """Raised when even one root cannot realize a proposed split allocation."""
+
+
 def sample_branch_counts(
     num_parents: int,
     branching_factor: float,
@@ -434,7 +438,7 @@ def max_floor_split_roots_for_budget(
 
     cost_for_one = floor_split_sampling_cost(runner, split_points, split_factors, 1)
     if cost_for_one > budget:
-        raise ValueError(
+        raise InsufficientSplitBudgetError(
             f"Budget {budget} is too small; floor split cost for one root is "
             f"{cost_for_one:.6f}"
         )
@@ -443,7 +447,7 @@ def max_floor_split_roots_for_budget(
     while floor_split_sampling_cost(runner, split_points, split_factors, upper) > budget:
         upper //= 2
         if upper < 1:
-            raise ValueError(
+            raise InsufficientSplitBudgetError(
                 f"Budget {budget} is too small; floor split cost for one root is "
                 f"{cost_for_one:.6f}"
             )

@@ -12,9 +12,11 @@ from paper_plots import (
     MODELS,
     SCHEDULES,
     ResultRow,
+    _expected_uniform_c,
     _load_and_verify_rows,
     _normal_reduction,
 )
+
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_OUTPUT_DIR = ROOT / "tables"
 RESULT_TABLE_STEMS = {
@@ -37,8 +39,7 @@ def _parse_args() -> argparse.Namespace:
         "--output-dir",
         type=Path,
         help=(
-            "Destination for generated CSV files "
-            f"(default: {DEFAULT_OUTPUT_DIR})."
+            "Destination for generated CSV files " f"(default: {DEFAULT_OUTPUT_DIR})."
         ),
     )
     parser.add_argument(
@@ -137,8 +138,15 @@ def _row_at_budget(
     budget: int,
     *,
     mode: str,
+    uniform_c: float | None = None,
 ) -> ResultRow | None:
-    matches = [row for row in rows if row.budget == budget and row.mode == mode]
+    matches = [
+        row
+        for row in rows
+        if row.budget == budget
+        and row.mode == mode
+        and (uniform_c is None or row.uniform_c == uniform_c)
+    ]
     if len(matches) > 1:
         raise RuntimeError(f"Duplicate {mode} result at B={budget}")
     return matches[0] if matches else None
@@ -149,9 +157,10 @@ def _metric_reduction(
     budget: int,
     *,
     mode: str,
+    uniform_c: float | None = None,
 ) -> tuple[float, float, float] | None:
     independent = _row_at_budget(rows, budget, mode="fixed_N")
-    method = _row_at_budget(rows, budget, mode=mode)
+    method = _row_at_budget(rows, budget, mode=mode, uniform_c=uniform_c)
     if independent is None or method is None:
         return None
     return _normal_reduction(independent, method)
@@ -162,50 +171,63 @@ def _complete_result_rows(
     all_rows: dict[str, dict[tuple[float, ...], list[ResultRow]]],
 ) -> tuple[list[str], list[dict[str, Any]]]:
     rows_by_schedule = all_rows.get(model["directory"], {})
+
+    def result_row(
+        schedule: tuple[float, ...],
+        budget: int,
+        *,
+        allocation: str,
+        mode: str,
+        uniform_c: float | None = None,
+    ) -> dict[str, Any]:
+        schedule_rows = rows_by_schedule.get(schedule, [])
+        reduction = _metric_reduction(
+            schedule_rows, budget, mode=mode, uniform_c=uniform_c
+        )
+        if reduction is None:
+            observed = lower = upper = ""
+            n_method = n_independent = ""
+            mean_method = mean_independent = ""
+        else:
+            observed, lower, upper = reduction
+            independent = _row_at_budget(schedule_rows, budget, mode="fixed_N")
+            method = _row_at_budget(
+                schedule_rows, budget, mode=mode, uniform_c=uniform_c
+            )
+            assert independent is not None and method is not None
+            n_method = method.n
+            n_independent = independent.n
+            mean_method = method.mean
+            mean_independent = independent.mean
+        return {
+            "split_points": len(schedule),
+            "allocation": allocation,
+            "B": budget,
+            "metric": model["metric"],
+            "mean_method": mean_method,
+            "mean_independent": mean_independent,
+            "reduction_percent": observed,
+            "reduction_ci_lower_percent": lower,
+            "reduction_ci_upper_percent": upper,
+            "n_method": n_method,
+            "n_independent": n_independent,
+        }
+
     rows: list[dict[str, Any]] = []
     for schedule, _ in SCHEDULES:
-        schedule_rows = rows_by_schedule.get(schedule, [])
         for budget in model["budgets"]:
-            reduction = _metric_reduction(
-                schedule_rows,
-                budget,
-                mode="adaptive",
-            )
-            if reduction is None:
-                observed = lower = upper = ""
-                n_method = n_independent = ""
-                mean_method = mean_independent = ""
-            else:
-                observed, lower, upper = reduction
-                independent = _row_at_budget(
-                    schedule_rows,
-                    budget,
-                    mode="fixed_N",
-                )
-                method = _row_at_budget(
-                    schedule_rows,
-                    budget,
-                    mode="adaptive",
-                )
-                assert independent is not None and method is not None
-                n_method = method.n
-                n_independent = independent.n
-                mean_method = method.mean
-                mean_independent = independent.mean
             rows.append(
-                {
-                    "split_points": len(schedule),
-                    "allocation": "learned",
-                    "B": budget,
-                    "metric": model["metric"],
-                    "mean_method": mean_method,
-                    "mean_independent": mean_independent,
-                    "reduction_percent": observed,
-                    "reduction_ci_lower_percent": lower,
-                    "reduction_ci_upper_percent": upper,
-                    "n_method": n_method,
-                    "n_independent": n_independent,
-                }
+                result_row(schedule, budget, allocation="learned", mode="adaptive")
+            )
+            rows.extend(
+                result_row(
+                    schedule,
+                    budget,
+                    allocation=f"uniform_{c:g}",
+                    mode="uniform_c",
+                    uniform_c=c,
+                )
+                for c in _expected_uniform_c(model, schedule)
             )
     fieldnames = [
         "split_points",
@@ -262,10 +284,7 @@ def _ou_oracle_rows(
                 f"shared fixed_N mean_ks={shared_fixed_mean}, "
                 f"oracle mean_ks={oracle_mean}, learned mean_ks={learned_mean}"
             )
-        if any(
-            value is None
-            for value in (shared_independent, oracle, learned)
-        ):
+        if any(value is None for value in (shared_independent, oracle, learned)):
             oracle_reduction = learned_reduction = oracle_captured = ""
             oracle_lower = oracle_upper = learned_lower = learned_upper = ""
         else:

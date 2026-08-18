@@ -5,8 +5,8 @@ This directory contains the scripts that turn completed experiment results in th
 From `code/`, run:
 
 ```bash
-uv run python paper/paper_plots.py --outputs-root ../outputs_paper_final --output-dir ../plots
-uv run python paper/paper_tables.py --outputs-root ../outputs_paper_final --output-dir ../tables
+uv run python paper/paper_plots.py --outputs-root ../outputs_test --output-dir ../plots
+uv run python paper/paper_tables.py --outputs-root ../outputs_test --output-dir ../tables
 ```
 
 The plot script writes publication PNGs to the repository-root `plots/`. The table script writes CSVs to the repository-root `tables/`. Normal runs validate that the expected results and run counts are complete; do not weaken validation or use `--debug` for final paper artifacts.

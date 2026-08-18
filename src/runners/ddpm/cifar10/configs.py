@@ -34,6 +34,7 @@ _SAMPLING_BASE = {
     ],
     "baselines": [
         "fixed_N",
+        # "uniform_c",
         # "ddim_40_eta0",
         # "ddim_100_eta0",
     ],

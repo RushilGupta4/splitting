@@ -1,5 +1,6 @@
 import logging
 import math
+import time
 from concurrent.futures import ThreadPoolExecutor
 from threading import Lock
 from typing import Any, Dict, List, Mapping, Sequence, Tuple
@@ -9,7 +10,15 @@ import torch
 from tqdm import tqdm
 from numba import njit
 
+try:
+    import triton
+    import triton.language as tl
+except ImportError:  # CPU-only PyTorch installations do not ship Triton.
+    triton = None
+    tl = None
+
 from runners.splitting import (
+    InsufficientSplitBudgetError,
     apply_to_run_batches,
     append_by_counts as _append_by_counts,
     max_floor_split_roots_for_budget,
@@ -27,6 +36,7 @@ from trials import (
 
 log = logging.getLogger(__name__)
 
+CROSSFIT_Q_DEFAULT_FOLDS = 1
 CROSSFIT_Q_DEFAULT_MLP_HIDDEN_DIMS = [128, 64]
 CROSSFIT_Q_DEFAULT_MLP_ACTIVATION = "silu"
 CROSSFIT_Q_DEFAULT_MLP_EPOCHS = 5
@@ -63,13 +73,24 @@ _DEFAULT_QUERY_PARAMS: Dict[str, Any] = {
 
 _CROSSFIT_Q_MLP_INIT_LOCK = Lock()
 _CROSSFIT_Q_FEATURE_CACHE_CHUNK_SIZE = 262_144
+_FAST_FW_RELATIVE_TOL = 3e-4
+_FAST_FW_MAX_ITERS = 2_000
+_FAST_FW_LINE_SEARCH_ITERS = 6
+_QUERY_LABEL_MAX_TEMPORARY_BYTES = 512 * 1024 * 1024
 _MONOTONE_CVAR95_ALPHA = 0.95
 SUPPORTED_OPTIMIZATION_MODES = {"monotone", "monotone_cvar95"}
+_INFEASIBLE_ALLOCATION_RETRY_SEED_OFFSET = 1 << 40
 
 
 def _debug(enabled: bool, message: str):
     if enabled:
         log.debug(message)
+
+
+def _synchronize_runner_device(runner):
+    device = torch.device(runner.device)
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
 
 
 def _sample_prior_by_run_batches(
@@ -183,7 +204,192 @@ def _weighted_pava_non_decreasing(values: np.ndarray, weights: np.ndarray):
 
 if njit is not None:
 
-    @njit
+    @njit(cache=True, nogil=True)
+    def _weighted_pava_non_decreasing_numba(values, weights):
+        count = values.size
+        starts = np.empty(count, dtype=np.int64)
+        ends = np.empty(count, dtype=np.int64)
+        block_weights = np.empty(count, dtype=np.float64)
+        block_sums = np.empty(count, dtype=np.float64)
+        blocks = 0
+        for index in range(count):
+            starts[blocks] = index
+            ends[blocks] = index + 1
+            block_weights[blocks] = weights[index]
+            block_sums[blocks] = weights[index] * values[index]
+            blocks += 1
+            while blocks >= 2:
+                left = blocks - 2
+                right = blocks - 1
+                if (
+                    block_sums[left] / block_weights[left]
+                    <= block_sums[right] / block_weights[right]
+                ):
+                    break
+                ends[left] = ends[right]
+                block_weights[left] += block_weights[right]
+                block_sums[left] += block_sums[right]
+                blocks -= 1
+
+        projected = np.empty_like(values)
+        for block in range(blocks):
+            level = block_sums[block] / block_weights[block]
+            for index in range(starts[block], ends[block]):
+                projected[index] = level
+        return projected
+
+    @njit(cache=True, nogil=True)
+    def _monotone_dual_numba(profile, cost_w):
+        pooled = _weighted_pava_non_decreasing_numba(profile / cost_w, cost_w)
+        raw = np.sqrt(np.maximum(pooled, 0.0))
+        maximum = 0.0
+        valid = True
+        for level in range(raw.size):
+            valid = valid and np.isfinite(raw[level])
+            maximum = max(maximum, raw[level])
+        if not valid or maximum <= 0.0:
+            raw[:] = 1.0
+        raw = np.maximum(raw, 1e-12)
+
+        normalizer = 0.0
+        for level in range(raw.size):
+            normalizer += cost_w[level] * raw[level]
+        simplex = np.empty_like(raw)
+        value = 0.0
+        for level in range(raw.size):
+            simplex[level] = cost_w[level] * raw[level] / normalizer
+            value += profile[level] * cost_w[level] / simplex[level]
+        return value, simplex
+
+    @njit(cache=True, nogil=True)
+    def _monotone_losses_numba(weighted_M, simplex):
+        losses = np.empty(weighted_M.shape[0], dtype=np.float64)
+        inverse = 1.0 / simplex
+        for row in range(weighted_M.shape[0]):
+            value = 0.0
+            for level in range(weighted_M.shape[1]):
+                value += weighted_M[row, level] * inverse[level]
+            losses[row] = value
+        return losses
+
+    @njit(cache=True, nogil=True)
+    def _monotone_directional_derivative(profile, target, cost_w, simplex):
+        value = 0.0
+        for level in range(profile.size):
+            value += (
+                (target[level] - profile[level])
+                * cost_w[level]
+                / simplex[level]
+            )
+        return value
+
+    @njit(cache=True, nogil=True)
+    def _monotone_derivative_line_search_numba(
+        profile, target, cost_w, line_search_iters
+    ):
+        base_value, base_simplex = _monotone_dual_numba(profile, cost_w)
+        if np.array_equal(profile, target):
+            return 0.0, base_value
+        if (
+            _monotone_directional_derivative(
+                profile, target, cost_w, base_simplex
+            )
+            <= 0.0
+        ):
+            return 0.0, base_value
+
+        target_value, target_simplex = _monotone_dual_numba(target, cost_w)
+        if (
+            _monotone_directional_derivative(
+                profile, target, cost_w, target_simplex
+            )
+            >= 0.0
+        ):
+            return 1.0, target_value
+
+        left = 0.0
+        right = 1.0
+        best_gamma = 0.0
+        best_value = base_value
+        if target_value > best_value:
+            best_gamma = 1.0
+            best_value = target_value
+        for _ in range(line_search_iters):
+            midpoint = 0.5 * (left + right)
+            candidate = (1.0 - midpoint) * profile + midpoint * target
+            value, simplex = _monotone_dual_numba(candidate, cost_w)
+            derivative = _monotone_directional_derivative(
+                profile, target, cost_w, simplex
+            )
+            if value > best_value:
+                best_gamma = midpoint
+                best_value = value
+            if derivative > 0.0:
+                left = midpoint
+            else:
+                right = midpoint
+        return best_gamma, best_value
+
+    @njit(cache=True, nogil=True)
+    def _solve_frank_wolfe_monotone_allocation_numba(
+        M, cost_w, relative_tol, max_iters, line_search_iters
+    ):
+        weighted_M = M * cost_w.reshape(1, -1)
+        best_row = 0
+        best_score = -1.0
+        for row in range(M.shape[0]):
+            score = 0.0
+            for level in range(M.shape[1]):
+                score += math.sqrt(max(weighted_M[row, level], 0.0))
+            if score > best_score:
+                best_score = score
+                best_row = row
+
+        profile = M[best_row].copy()
+        best_simplex = cost_w.copy()
+        best_upper = math.inf
+        best_lower = 0.0
+        converged = False
+        for iteration in range(max_iters):
+            lower, simplex = _monotone_dual_numba(profile, cost_w)
+            best_lower = max(best_lower, lower)
+            losses = _monotone_losses_numba(weighted_M, simplex)
+            worst = int(np.argmax(losses))
+            upper = losses[worst]
+            if upper < best_upper:
+                best_upper = upper
+                best_simplex = simplex.copy()
+            gap = max(best_upper - best_lower, 0.0) / max(
+                abs(best_upper), np.finfo(np.float64).tiny
+            )
+            if gap <= relative_tol:
+                converged = True
+                break
+
+            target = M[worst]
+            gamma, candidate_lower = _monotone_derivative_line_search_numba(
+                profile, target, cost_w, line_search_iters
+            )
+            if gamma <= 0.0 or candidate_lower <= lower + 1e-14:
+                gamma = 2.0 / float(iteration + 3.0)
+            profile = (1.0 - gamma) * profile + gamma * target
+
+        if not converged:
+            lower, simplex = _monotone_dual_numba(profile, cost_w)
+            best_lower = max(best_lower, lower)
+            losses = _monotone_losses_numba(weighted_M, simplex)
+            upper = float(np.max(losses))
+            if upper < best_upper:
+                best_upper = upper
+                best_simplex = simplex.copy()
+            converged = (
+                max(best_upper - best_lower, 0.0)
+                / max(abs(best_upper), np.finfo(np.float64).tiny)
+                <= relative_tol
+            )
+        return best_simplex, best_upper, best_lower, converged
+
+    @njit(cache=True, nogil=True)
     def _crossfit_q_project_sequences_numba(Q_raw, F_hat):
         num_times, obs_dim = Q_raw.shape
         Q_proj = np.empty_like(Q_raw)
@@ -251,7 +457,9 @@ if njit is not None:
         return Q_proj
 
 else:
+    _weighted_pava_non_decreasing_numba = None
     _crossfit_q_project_sequences_numba = None
+    _solve_frank_wolfe_monotone_allocation_numba = None
 
 
 def _monotone_simplex_from_profile(
@@ -260,9 +468,15 @@ def _monotone_simplex_from_profile(
     *,
     allocation_floor=1e-12,
 ):
-    profile = np.maximum(np.asarray(profile, dtype=float), 0.0)
-    cost_w = np.asarray(cost_w, dtype=float)
-    h = _weighted_pava_non_decreasing(profile / cost_w, cost_w)
+    profile = np.maximum(np.asarray(profile, dtype=np.float64), 0.0)
+    cost_w = np.asarray(cost_w, dtype=np.float64)
+    values = np.ascontiguousarray(profile / cost_w)
+    weights = np.ascontiguousarray(cost_w)
+    h = (
+        _weighted_pava_non_decreasing_numba(values, weights)
+        if _weighted_pava_non_decreasing_numba is not None
+        else _weighted_pava_non_decreasing(values, weights)
+    )
     raw = np.sqrt(np.maximum(h, 0.0))
     if not np.isfinite(raw).all() or float(np.max(raw)) <= 0.0:
         raw = np.ones_like(cost_w, dtype=float)
@@ -325,49 +539,40 @@ def _solve_frank_wolfe_monotone_allocation(
     M: np.ndarray,
     *,
     cost_w: np.ndarray,
-    relative_tol: float = 1e-5,
-    max_iters: int = 1000,
+    relative_tol: float = _FAST_FW_RELATIVE_TOL,
+    max_iters: int = _FAST_FW_MAX_ITERS,
 ):
-    M = np.asarray(M, dtype=float)
+    M = np.ascontiguousarray(M, dtype=np.float64)
+    cost_w = np.ascontiguousarray(cost_w, dtype=np.float64)
     num_points, num_levels = M.shape
     if num_points == 0 or num_levels == 0:
         raise ValueError("M must be non-empty")
+    if cost_w.shape != (num_levels,) or np.any(cost_w <= 0.0):
+        raise ValueError("cost_w must be positive and match M columns")
+    if not np.isfinite(M).all() or not np.isfinite(cost_w).all():
+        raise ValueError("optimizer inputs must be finite")
+    M = np.maximum(M, 0.0)
 
-    weighted_M = M * cost_w[None, :]
-    row_scores = np.sqrt(np.maximum(weighted_M, 0.0)).sum(axis=1)
-    profile = np.maximum(M[int(np.argmax(row_scores))].copy(), 0.0)
-
-    best_y = np.asarray(cost_w, dtype=float).copy()
-    best_upper = math.inf
-    for iter_idx in range(max_iters):
-        dual_lower, y = _monotone_dual_value_and_simplex(profile, cost_w)
-        full_values = _objective_values(weighted_M, y)
-        full_upper = float(np.max(full_values))
-        if full_upper < best_upper:
-            best_upper = full_upper
-            best_y = y.copy()
-        gap = max(full_upper - dual_lower, 0.0) / max(abs(full_upper), 1.0)
-        if gap <= relative_tol:
-            return y
-
-        worst_idx = int(np.argmax(full_values))
-        target_profile = np.maximum(M[worst_idx], 0.0)
-        gamma, candidate_lower, candidate_y = _monotone_line_search(
-            profile, target_profile, cost_w
+    if _solve_frank_wolfe_monotone_allocation_numba is None:
+        raise RuntimeError("the monotone optimizer requires numba")
+    simplex, upper, lower, converged = (
+        _solve_frank_wolfe_monotone_allocation_numba(
+            M,
+            cost_w,
+            float(relative_tol),
+            int(max_iters),
+            int(_FAST_FW_LINE_SEARCH_ITERS),
         )
-        if gamma <= 0.0 or candidate_lower <= dual_lower + 1e-14:
-            step = 2.0 / float(iter_idx + 3.0)
-            profile = (1.0 - step) * profile + step * target_profile
-        else:
-            profile = (1.0 - gamma) * profile + gamma * target_profile
-            if candidate_lower > dual_lower:
-                candidate_values = _objective_values(weighted_M, candidate_y)
-                candidate_upper = float(np.max(candidate_values))
-                if candidate_upper < best_upper:
-                    best_upper = candidate_upper
-                    best_y = candidate_y.copy()
-
-    return best_y
+    )
+    if not converged:
+        gap = max(float(upper) - float(lower), 0.0) / max(
+            abs(float(upper)), np.finfo(np.float64).tiny
+        )
+        raise RuntimeError(
+            f"monotone optimizer did not certify tolerance {relative_tol:g}; "
+            f"final relative gap was {gap:.6g}"
+        )
+    return simplex
 
 
 def _cvar_profile(M: np.ndarray, losses: np.ndarray, *, alpha: float):
@@ -832,19 +1037,17 @@ def _crossfit_q_mlp_predict_all_levels_impl(
     train_targets = y_train.unsqueeze(0).expand(num_levels, -1, -1).reshape(-1, 1)
     del x_train
 
-    if seed is None:
-        with _CROSSFIT_Q_MLP_INIT_LOCK:
-            model = _crossfit_q_build_mlp(input_dim, 1, params).to(device=device)
-    else:
-        fork_devices = (
-            list(range(torch.cuda.device_count())) if device.type == "cuda" else []
-        )
-        with _CROSSFIT_Q_MLP_INIT_LOCK:
-            with torch.random.fork_rng(devices=fork_devices):
+    # Module parameters are initialized on CPU. Serialize that short section so
+    # concurrent fits cannot race through PyTorch's process-global CPU RNG; no
+    # CUDA RNG snapshot is needed before moving the initialized model.
+    with _CROSSFIT_Q_MLP_INIT_LOCK:
+        if seed is None:
+            model = _crossfit_q_build_mlp(input_dim, 1, params)
+        else:
+            with torch.random.fork_rng(devices=[]):
                 torch.manual_seed(int(seed))
-                if device.type == "cuda":
-                    torch.cuda.manual_seed_all(int(seed))
-                model = _crossfit_q_build_mlp(input_dim, 1, params).to(device=device)
+                model = _crossfit_q_build_mlp(input_dim, 1, params)
+    model = model.to(device=device)
     optimizer_params = {
         "lr": float(params["lr"]),
         "weight_decay": float(params["weight_decay"]),
@@ -899,9 +1102,29 @@ def _crossfit_q_mlp_predict_all_levels_impl(
     return predictions_flat.reshape(num_levels, test_paths, num_queries)
 
 
+def _crossfit_q_fold_indices(num_paths: int, n_folds: int):
+    num_paths = int(num_paths)
+    n_folds = int(n_folds)
+    if n_folds < 1:
+        raise ValueError("crossfit_q_folds must be at least 1")
+    if n_folds > num_paths:
+        raise ValueError(
+            f"crossfit_q_folds={n_folds} exceeds the {num_paths} pilot paths"
+        )
+    if n_folds == 1:
+        all_idx = np.arange(num_paths, dtype=np.int64)
+        return [(all_idx, all_idx)]
+    fold_ids = np.arange(num_paths, dtype=np.int64) % n_folds
+    return [
+        (np.flatnonzero(fold_ids != fold_idx), np.flatnonzero(fold_ids == fold_idx))
+        for fold_idx in range(n_folds)
+    ]
+
+
 def _crossfit_q_predict_all_levels(
     states_by_level: np.ndarray,
     labels: np.ndarray,
+    fold_indices,
     *,
     query_conditioning,
     level_times: np.ndarray,
@@ -910,30 +1133,38 @@ def _crossfit_q_predict_all_levels(
     seed: int | None,
     manage_mlp_num_threads: bool = True,
 ):
-    """Fit Q on all pilot paths and predict on the same paths.
+    """Fit one MLP per fold and assemble predictions in pilot-path order.
 
-    The fit is in-sample. `Q_raw = mean(2*p*y - p^2)` equals `E[Q^2]` minus the
-    regressor's mean-squared error for any `p`, so a restricted regressor biases
-    it downward while an in-sample fit biases it upward; the projection in
-    `_crossfit_q_project_sequences` re-imposes the structure the martingale
-    guarantees.
+    With one fold, the sole training and test sets both contain every path,
+    exactly reproducing the in-sample estimator. With multiple folds, every
+    path is predicted by a model whose training set excluded that path.
     """
-    predictions = _crossfit_q_mlp_predict_all_levels(
-        states_by_level,
-        labels,
-        states_by_level,
-        query_conditioning,
-        level_times,
-        params=mlp_params,
-        runner_device=mlp_device,
-        seed=seed,
-        manage_num_threads=manage_mlp_num_threads,
+    num_levels, num_paths, obs_dim = (
+        int(states_by_level.shape[0]),
+        int(labels.shape[0]),
+        int(labels.shape[1]),
     )
-    finite = np.isfinite(predictions)
-    if not finite.all():
-        fallback = np.broadcast_to(labels.mean(axis=0), predictions.shape)
-        predictions = np.where(finite, predictions, fallback)
-    return np.clip(predictions, 0.0, 1.0)
+    predictions_by_level = np.empty((num_levels, num_paths, obs_dim), dtype=float)
+    for fold_idx, (train_idx, test_idx) in enumerate(fold_indices):
+        train_labels = labels[train_idx]
+        fold_seed = None if seed is None else int(seed) + int(fold_idx)
+        predictions = _crossfit_q_mlp_predict_all_levels(
+            states_by_level[:, train_idx, :],
+            train_labels,
+            states_by_level[:, test_idx, :],
+            query_conditioning,
+            level_times,
+            params=mlp_params,
+            runner_device=mlp_device,
+            seed=fold_seed,
+            manage_num_threads=manage_mlp_num_threads,
+        )
+        finite = np.isfinite(predictions)
+        if not finite.all():
+            fallback = np.broadcast_to(train_labels.mean(axis=0), predictions.shape)
+            predictions = np.where(finite, predictions, fallback)
+        predictions_by_level[:, test_idx, :] = np.clip(predictions, 0.0, 1.0)
+    return predictions_by_level
 
 
 def _crossfit_q_project_sequences_reference(Q_raw: np.ndarray, F_hat: np.ndarray):
@@ -982,6 +1213,7 @@ def _estimate_crossfit_q_variance_payload(
     *,
     query_spec,
     level_times,
+    n_folds: int = CROSSFIT_Q_DEFAULT_FOLDS,
     mlp_params: Mapping[str, Any] | None = None,
     mlp_device: str | None = None,
     seed: int | None = None,
@@ -1001,6 +1233,7 @@ def _estimate_crossfit_q_variance_payload(
     if level_times.shape != (num_levels,):
         raise ValueError(f"level_times shape {level_times.shape} != ({num_levels},)")
 
+    fold_indices = _crossfit_q_fold_indices(num_paths, int(n_folds))
     mlp_params_normalized = _crossfit_q_normalize_mlp_params(mlp_params)
 
     F_hat = labels.mean(axis=0)
@@ -1008,6 +1241,7 @@ def _estimate_crossfit_q_variance_payload(
     predictions_by_level = _crossfit_q_predict_all_levels(
         states_by_level,
         labels,
+        fold_indices,
         query_conditioning=query_conditioning,
         level_times=level_times,
         mlp_params=mlp_params_normalized,
@@ -1071,9 +1305,138 @@ def _mass_grid(count: int, mass_min: float, mass_max: float):
     )
 
 
+def _draw_grid_free_query_design(dim, query_params, *, seed, run_index):
+    """Draw a query design without waiting for the pilot simulation."""
+    query_params = _normalize_query_params(query_params)
+    dim = int(dim)
+    total = int(query_params["num_queries"])
+    k_max = min(dim, int(query_params["k_max"]))
+    rng = np.random.default_rng(
+        np.random.SeedSequence([int(seed or 0), int(run_index), dim])
+    )
+    sizes = rng.integers(1, k_max + 1, size=total).astype(np.int64)
+    masses = _mass_grid(
+        total, float(query_params["mass_min"]), float(query_params["mass_max"])
+    )
+    width = int(sizes.max())
+    active = np.arange(width)[None, :] < sizes[:, None]
+
+    keys = rng.random((total, dim))
+    active_dims = np.full((total, width), -1, dtype=np.int64)
+    if dim == 2 and width == 2:
+        first = (keys[:, 1] < keys[:, 0]).astype(np.int64)
+        selected = np.stack((first, 1 - first), axis=1)
+        selected = np.where(active, selected, dim)
+        selected.sort(axis=1)
+        active_dims[:] = np.where(active, selected, -1)
+    elif width < dim:
+        for size in np.unique(sizes):
+            rows = np.flatnonzero(sizes == int(size))
+            selected = np.argpartition(keys[rows], int(size) - 1, axis=1)[
+                :, : int(size)
+            ]
+            selected.sort(axis=1)
+            active_dims[rows, : int(size)] = selected
+    else:
+        selected = np.argsort(keys, axis=1)[:, :width]
+        selected = np.where(active, selected, dim)
+        selected.sort(axis=1)
+        active_dims[:] = np.where(active, selected, -1)
+
+    exponentials = rng.exponential(size=(total, width)) * active
+    weights = exponentials / exponentials.sum(axis=1, keepdims=True)
+    ranks = np.full((total, width), np.nan, dtype=float)
+    ranks[active] = np.exp(weights[active] * np.repeat(np.log(masses), sizes))
+    return {
+        "ambient_dim": dim,
+        "active_dims": active_dims,
+        "active_sizes": sizes,
+        "target_mass": masses,
+        "ranks": ranks,
+    }
+
+
+def _query_spec_from_design(design, thresholds):
+    return {
+        "kind": "sparse_subset_lower_orthant",
+        **design,
+        "thresholds": thresholds,
+    }
+
+
+def _finish_grid_free_query_design(samples, design):
+    samples_np = coerce_samples_np(samples)
+    if samples_np.shape[0] < 1:
+        raise ValueError("phase 1 needs at least one terminal sample")
+    if samples_np.shape[1] != int(design["ambient_dim"]):
+        raise ValueError("sample and query-design dimensions differ")
+    active_dims = np.asarray(design["active_dims"], dtype=np.int64)
+    ranks = np.asarray(design["ranks"], dtype=float)
+    active = active_dims >= 0
+    rows, positions = np.nonzero(active)
+    dims = active_dims[rows, positions]
+    virtual = (int(samples_np.shape[0]) - 1) * ranks[rows, positions]
+    lower = np.floor(virtual).astype(np.int64)
+    upper = np.ceil(virtual).astype(np.int64)
+    weight = virtual - lower
+    ordered = np.sort(samples_np, axis=0)
+    left = ordered[lower, dims]
+    right = ordered[upper, dims]
+    delta = right - left
+    interpolated = np.where(
+        weight < 0.5,
+        left + delta * weight,
+        right - delta * (1.0 - weight),
+    )
+    thresholds = np.full(active_dims.shape, np.nan, dtype=float)
+    thresholds[rows, positions] = interpolated
+    return _query_spec_from_design(design, thresholds)
+
+
+def _finish_grid_free_query_designs_cuda(samples_by_run, designs):
+    """Finish all exact marginal quantiles in one native-dtype GPU sort."""
+    values = samples_by_run.reshape(len(designs), samples_by_run.shape[1], -1)
+    if not values.is_cuda:
+        raise ValueError("CUDA query completion requires CUDA samples")
+    widths = [int(np.asarray(design["active_dims"]).shape[1]) for design in designs]
+    width = max(widths)
+    queries = int(np.asarray(designs[0]["active_dims"]).shape[0])
+    dims_np = np.full((len(designs), queries, width), -1, dtype=np.int64)
+    ranks_np = np.full((len(designs), queries, width), np.nan, dtype=float)
+    for run, design in enumerate(designs):
+        dims_np[run, :, : widths[run]] = design["active_dims"]
+        ranks_np[run, :, : widths[run]] = design["ranks"]
+
+    dims = torch.as_tensor(dims_np, device=values.device, dtype=torch.long)
+    ranks = torch.as_tensor(ranks_np, device=values.device, dtype=torch.float64)
+    active = dims >= 0
+    safe_dims = dims.clamp_min(0)
+    virtual = (int(values.shape[1]) - 1) * torch.where(
+        active, ranks, torch.zeros_like(ranks)
+    )
+    lower = torch.floor(virtual).to(torch.long)
+    upper = torch.ceil(virtual).to(torch.long)
+    weight = virtual - lower
+    ordered = torch.sort(values, dim=1).values
+    run_ids = torch.arange(len(designs), device=values.device)[:, None, None]
+    left = ordered[run_ids, lower, safe_dims].to(torch.float64)
+    right = ordered[run_ids, upper, safe_dims].to(torch.float64)
+    delta = right - left
+    thresholds = torch.where(
+        weight < 0.5,
+        left + delta * weight,
+        right - delta * (1.0 - weight),
+    )
+    thresholds = torch.where(active, thresholds, torch.full_like(thresholds, torch.nan))
+    thresholds_np = thresholds.cpu().numpy()
+    return [
+        _query_spec_from_design(design, thresholds_np[run, :, : widths[run]])
+        for run, design in enumerate(designs)
+    ]
+
+
 def _generate_grid_free_queries(samples, query_params, *, seed, run_index):
-    """Sparse lower-orthant queries: a random coordinate subset per query, with
-    the corner at per-coordinate empirical quantiles of the pilot samples.
+    """Sparse lower-orthant queries at pilot empirical marginal quantiles.
 
     For each query draw a size ``k`` uniform on {1..min(D, k_max)}, a random
     subset ``S`` of ``k`` coordinates, a mass ``m`` from an even grid over
@@ -1093,83 +1456,150 @@ def _generate_grid_free_queries(samples, query_params, *, seed, run_index):
     runs never share a design and re-running with a new seed draws new ones --
     the estimator is never conditioned on one arbitrary query design.
     """
-    query_params = _normalize_query_params(query_params)
-    samples_np = coerce_samples_np(samples)
-    if samples_np.shape[0] < 1:
-        raise ValueError("phase 1 needs at least one terminal sample")
-    dim = int(samples_np.shape[1])
-    total = int(query_params["num_queries"])
-    k_max = min(dim, int(query_params["k_max"]))
-    rng = np.random.default_rng(
-        np.random.SeedSequence([int(seed or 0), int(run_index), dim])
+    values = samples if isinstance(samples, torch.Tensor) else torch.as_tensor(samples)
+    dim = int(values.reshape(values.shape[0], -1).shape[1])
+    design = _draw_grid_free_query_design(
+        dim, query_params, seed=seed, run_index=run_index
+    )
+    if values.is_cuda:
+        return _finish_grid_free_query_designs_cuda(
+            values.reshape(1, values.shape[0], -1), [design]
+        )[0]
+    return _finish_grid_free_query_design(samples, design)
+
+
+if triton is not None:
+
+    @triton.jit
+    def _lower_orthant_labels_kernel(
+        values_ptr,
+        dims_ptr,
+        thresholds_ptr,
+        output_ptr,
+        pair_count: tl.constexpr,
+        paths: tl.constexpr,
+        dimension: tl.constexpr,
+        queries: tl.constexpr,
+        width: tl.constexpr,
+        BLOCK_PAIRS: tl.constexpr,
+        BLOCK_WIDTH: tl.constexpr,
+    ):
+        pairs = tl.program_id(0) * BLOCK_PAIRS + tl.arange(0, BLOCK_PAIRS)
+        pair_mask = pairs < pair_count
+        query = pairs % queries
+        remainder = pairs // queries
+        path = remainder % paths
+        run = remainder // paths
+        positions = tl.arange(0, BLOCK_WIDTH)
+        position_mask = positions[None, :] < width
+        spec_offsets = (
+            (run[:, None] * queries + query[:, None]) * width + positions[None, :]
+        )
+        load_mask = pair_mask[:, None] & position_mask
+        dims = tl.load(dims_ptr + spec_offsets, mask=load_mask, other=-1)
+        active = (dims >= 0) & position_mask
+        sample_offsets = (
+            (run[:, None] * paths + path[:, None]) * dimension
+            + tl.maximum(dims, 0)
+        )
+        values = tl.load(
+            values_ptr + sample_offsets, mask=load_mask & active, other=0.0
+        )
+        thresholds = tl.load(
+            thresholds_ptr + spec_offsets, mask=load_mask & active, other=0.0
+        )
+        failures = active & (values > thresholds)
+        matches = tl.sum(failures.to(tl.int32), axis=1) == 0
+        tl.store(output_ptr + pairs, matches, mask=pair_mask)
+
+else:
+    _lower_orthant_labels_kernel = None
+
+
+def _stack_query_specs(query_points, *, device, dtype):
+    queries = int(np.asarray(query_points[0]["active_dims"]).shape[0])
+    width = max(np.asarray(spec["active_dims"]).shape[1] for spec in query_points)
+    dims = np.full((len(query_points), queries, width), -1, dtype=np.int32)
+    thresholds = np.full((len(query_points), queries, width), np.nan, dtype=float)
+    for run, spec in enumerate(query_points):
+        active_dims = np.asarray(spec["active_dims"], dtype=np.int32)
+        query_thresholds = np.asarray(spec["thresholds"], dtype=float)
+        if active_dims.shape != query_thresholds.shape:
+            raise ValueError("query active_dims and thresholds must match")
+        if active_dims.shape[0] != queries:
+            raise ValueError("all runs must use the same number of queries")
+        dims[run, :, : active_dims.shape[1]] = active_dims
+        thresholds[run, :, : active_dims.shape[1]] = query_thresholds
+    return (
+        torch.as_tensor(dims, device=device, dtype=torch.int32).contiguous(),
+        torch.as_tensor(thresholds, device=device, dtype=dtype).contiguous(),
     )
 
-    sizes = rng.integers(1, k_max + 1, size=total).astype(np.int64)
-    masses = _mass_grid(
-        total, float(query_params["mass_min"]), float(query_params["mass_max"])
+
+def _lower_orthant_labels_batched(samples_by_run, query_points):
+    values = samples_by_run.reshape(
+        len(query_points), samples_by_run.shape[1], -1
+    ).contiguous()
+    dimension = int(values.shape[2])
+    for spec in query_points:
+        if not isinstance(spec, Mapping) or spec.get("kind") != "sparse_subset_lower_orthant":
+            raise ValueError("grid-free phase 1 requires sparse lower-orthant specs")
+        if int(spec.get("ambient_dim", dimension)) != dimension:
+            raise ValueError("query ambient dimension does not match samples")
+        if np.any(np.asarray(spec["active_dims"]) >= dimension):
+            raise ValueError("query active dimension exceeds sample dimension")
+    dims, thresholds = _stack_query_specs(
+        query_points, device=values.device, dtype=values.dtype
     )
+    runs, paths, _ = values.shape
+    queries, width = int(dims.shape[1]), int(dims.shape[2])
+    output = torch.empty((runs, paths, queries), device=values.device, dtype=torch.bool)
 
-    width = int(sizes.max())
-    active_dims = np.full((total, width), -1, dtype=np.int64)
-    thresholds = np.full((total, width), np.nan, dtype=float)
-    ranks_used = np.full((total, width), np.nan, dtype=float)
+    if values.is_cuda and _lower_orthant_labels_kernel is not None:
+        block_pairs = 1024 if width <= 4 and paths >= 1000 else (512 if width <= 4 else 64)
+        pair_count = int(output.numel())
+        _lower_orthant_labels_kernel[(triton.cdiv(pair_count, block_pairs),)](
+            values,
+            dims,
+            thresholds,
+            output,
+            pair_count=pair_count,
+            paths=paths,
+            dimension=dimension,
+            queries=queries,
+            width=width,
+            BLOCK_PAIRS=block_pairs,
+            BLOCK_WIDTH=triton.next_power_of_2(width),
+            num_warps=4,
+        )
+        return output
 
-    for query_idx in range(total):
-        k = int(sizes[query_idx])
-        mass = float(masses[query_idx])
-        dims = np.sort(rng.choice(dim, size=k, replace=False))
-        ranks = np.exp(rng.dirichlet(np.ones(k)) * math.log(mass))
-        active_dims[query_idx, :k] = dims
-        ranks_used[query_idx, :k] = ranks
-        for pos, dim_idx in enumerate(dims):
-            thresholds[query_idx, pos] = np.quantile(samples_np[:, dim_idx], ranks[pos])
-
-    return {
-        "kind": "sparse_subset_lower_orthant",
-        "ambient_dim": int(dim),
-        "thresholds": thresholds,
-        "active_dims": active_dims,
-        "active_sizes": sizes,
-        "target_mass": masses,
-        "ranks": ranks_used,
-    }
+    active = dims >= 0
+    safe_dims = dims.clamp_min(0).to(torch.long)
+    block = max(
+        1,
+        min(
+            queries,
+            _QUERY_LABEL_MAX_TEMPORARY_BYTES
+            // max(1, runs * paths * width * values.element_size() * 2),
+        ),
+    )
+    for start in range(0, queries, block):
+        end = min(queries, start + block)
+        source = values[:, :, None, :].expand(-1, -1, end - start, -1)
+        indices = safe_dims[:, None, start:end, :].expand(-1, paths, -1, -1)
+        comparisons = torch.gather(source, 3, indices) <= thresholds[
+            :, None, start:end, :
+        ]
+        comparisons |= ~active[:, None, start:end, :]
+        output[:, :, start:end] = comparisons.all(dim=-1)
+    return output
 
 
 def _lower_orthant_labels(samples, query_points):
     values = samples if isinstance(samples, torch.Tensor) else torch.as_tensor(samples)
-    values = values.reshape(-1, values.shape[-1])
-    if not isinstance(query_points, Mapping):
-        raise ValueError("grid-free phase 1 requires sparse subset query specs")
-    if query_points.get("kind") != "sparse_subset_lower_orthant":
-        raise ValueError(f"unknown query spec kind {query_points.get('kind')!r}")
-    active_dims_np = np.asarray(query_points["active_dims"], dtype=np.int64)
-    thresholds_np = np.asarray(query_points["thresholds"], dtype=float)
-    if active_dims_np.shape != thresholds_np.shape:
-        raise ValueError("query active_dims and thresholds must have matching shapes")
-    if int(query_points.get("ambient_dim", values.shape[1])) != int(values.shape[1]):
-        raise ValueError("query ambient dimension does not match samples")
-    if np.any(active_dims_np >= int(values.shape[1])):
-        raise ValueError("query active dimension exceeds sample dimension")
-    result = torch.ones(
-        (values.shape[0], active_dims_np.shape[0]),
-        device=values.device,
-        dtype=torch.bool,
-    )
-    active_dims = torch.as_tensor(
-        active_dims_np, device=values.device, dtype=torch.long
-    )
-    thresholds = torch.as_tensor(
-        thresholds_np, device=values.device, dtype=values.dtype
-    )
-    for pos in range(active_dims.shape[1]):
-        dims = active_dims[:, pos]
-        active = dims >= 0
-        if not bool(active.any()):
-            continue
-        query_cols = torch.nonzero(active, as_tuple=False).flatten()
-        selected = values[:, dims[active]] <= thresholds[active, pos].reshape(1, -1)
-        result[:, query_cols] &= selected
-    return result
+    values = values.reshape(1, values.shape[0], -1)
+    return _lower_orthant_labels_batched(values, [query_points])[0]
 
 
 def _simulate_crossfit_q_trajectories(
@@ -1229,6 +1659,7 @@ def _estimate_crossfit_q_variance_for_run(
     spec: Mapping[str, Any],
     *,
     level_times,
+    n_folds: int,
     mlp_params: Mapping[str, Any],
     mlp_device: str | None,
     seed: int | None,
@@ -1239,6 +1670,7 @@ def _estimate_crossfit_q_variance_for_run(
         spec["labels"],
         query_spec=spec["query_spec"],
         level_times=level_times,
+        n_folds=int(n_folds),
         mlp_params=mlp_params,
         mlp_device=mlp_device,
         seed=seed,
@@ -1254,7 +1686,8 @@ def _run_crossfit_q_phase1_sampling_batch(
     *,
     B1,
     split_percentages,
-    crossfit_q_mlp_run_parallelism=1,
+    crossfit_q_folds=CROSSFIT_Q_DEFAULT_FOLDS,
+    crossfit_q_mlp_run_parallelism=CROSSFIT_Q_DEFAULT_MLP_RUN_PARALLELISM,
     crossfit_q_mlp_params=None,
     query_params=None,
     seed=None,
@@ -1270,6 +1703,9 @@ def _run_crossfit_q_phase1_sampling_batch(
     mlp_run_parallelism = _crossfit_q_normalize_mlp_run_parallelism(
         crossfit_q_mlp_run_parallelism
     )
+    effective_folds = int(crossfit_q_folds)
+    if effective_folds < 1:
+        raise ValueError("crossfit_q_folds must be at least 1")
     mlp_device = _crossfit_q_mlp_device(mlp_params_normalized, str(runner.device))
 
     _, split_points = runner.resolve_split_percentages(split_percentages)
@@ -1284,83 +1720,147 @@ def _run_crossfit_q_phase1_sampling_batch(
             f"B1={B1} is too small for crossfit_q; need at least "
             f"{2 * full_path_cost} for two unsplit pilot paths"
         )
+    if effective_folds > paths_per_run:
+        raise ValueError(
+            f"crossfit_q_folds={effective_folds} exceeds the {paths_per_run} "
+            "pilot paths available per run"
+        )
     used_B1 = int(paths_per_run * full_path_cost)
     _debug(
         debug,
         f"Phase 1 crossfit_q: chunk={chunk_size} paths_per_run={paths_per_run} "
+        f"folds={effective_folds} "
         f"mlp_workers={min(mlp_run_parallelism, int(chunk_size))} "
         f"mlp_device={mlp_device} mlp_num_threads={mlp_params_normalized.get('num_threads')}",
     )
 
-    states_by_run, x0 = _simulate_crossfit_q_trajectories(
-        runner,
-        chunk_size=chunk_size,
-        paths_per_run=paths_per_run,
-        split_points=split_points,
-        max_sampling_batch_size=max_sampling_batch_size,
-        generator=generator,
-    )
+    run_indices = [
+        int(run_index_offset) + run_idx for run_idx in range(int(chunk_size))
+    ]
+
+    def draw_designs():
+        started = time.perf_counter()
+        designs = [
+            _draw_grid_free_query_design(
+                runner.input_dim,
+                query_params,
+                seed=seed,
+                run_index=run_index,
+            )
+            for run_index in run_indices
+        ]
+        return designs, time.perf_counter() - started
+
+    # Query designs do not depend on pilot samples, so hide their CPU work
+    # behind the Phase-1 simulation without introducing another user option.
+    with ThreadPoolExecutor(max_workers=1) as query_executor:
+        design_future = query_executor.submit(draw_designs)
+        _synchronize_runner_device(runner)
+        simulation_started = time.perf_counter()
+        states_by_run, x0 = _simulate_crossfit_q_trajectories(
+            runner,
+            chunk_size=chunk_size,
+            paths_per_run=paths_per_run,
+            split_points=split_points,
+            max_sampling_batch_size=max_sampling_batch_size,
+            generator=generator,
+        )
+        _synchronize_runner_device(runner)
+        simulation_seconds = time.perf_counter() - simulation_started
+        designs, design_seconds = design_future.result()
     phase1_x0_by_run: List[Any] = [None] * chunk_size
     x0_by_run = list(torch.split(x0, int(paths_per_run)))
     if reuse_phase1_samples:
         x0_np = coerce_samples_np(x0).reshape(int(chunk_size), int(paths_per_run), -1)
         phase1_x0_by_run = [x0_np[idx] for idx in range(int(chunk_size))]
 
-    run_specs = []
-    for run_idx in range(chunk_size):
-        query_spec, labels_tensor = _grid_free_query_payload(
-            x0_by_run[run_idx],
-            query_params,
-            seed=seed,
-            run_index=int(run_index_offset) + int(run_idx),
-        )
-        labels = labels_tensor.detach().cpu().numpy().astype(np.bool_, copy=False)
-        run_specs.append({"query_spec": query_spec, "labels": labels})
+    _synchronize_runner_device(runner)
+    query_started = time.perf_counter()
+    if x0.is_cuda:
+        samples_by_run = x0.reshape(int(chunk_size), int(paths_per_run), -1)
+        query_specs = _finish_grid_free_query_designs_cuda(samples_by_run, designs)
+        labels_by_run = _lower_orthant_labels_batched(samples_by_run, query_specs)
+        run_specs = [
+            {
+                "query_spec": query_specs[run_idx],
+                "labels": labels_by_run[run_idx]
+                .cpu()
+                .numpy()
+                .astype(np.bool_, copy=False),
+            }
+            for run_idx in range(int(chunk_size))
+        ]
+    else:
+        def finish_run(run_idx):
+            query_spec = _finish_grid_free_query_design(
+                x0_by_run[run_idx], designs[run_idx]
+            )
+            labels = _lower_orthant_labels(x0_by_run[run_idx], query_spec)
+            return {
+                "query_spec": query_spec,
+                "labels": labels.numpy().astype(np.bool_, copy=False),
+            }
+
+        query_workers = min(int(chunk_size), 4)
+        with ThreadPoolExecutor(max_workers=query_workers) as query_executor:
+            run_specs = list(query_executor.map(finish_run, range(int(chunk_size))))
+    _synchronize_runner_device(runner)
+    query_seconds = design_seconds + (time.perf_counter() - query_started)
 
     estimates_by_run: List[Any] = [None] * int(chunk_size)
+    estimation_seconds_by_run = np.zeros(int(chunk_size), dtype=float)
     effective_mlp_workers = min(int(mlp_run_parallelism), int(chunk_size))
     if effective_mlp_workers <= 1:
         for run_idx, spec in enumerate(run_specs):
+            _synchronize_runner_device(runner)
+            estimation_started = time.perf_counter()
             _, estimates_by_run[run_idx] = _estimate_crossfit_q_variance_for_run(
                 run_idx,
                 states_by_run[:, run_idx, :, :],
                 spec,
                 level_times=level_times,
+                n_folds=effective_folds,
                 mlp_params=mlp_params_normalized,
                 mlp_device=str(runner.device),
                 seed=7919 + int(run_idx),
                 manage_mlp_num_threads=True,
             )
+            _synchronize_runner_device(runner)
+            estimation_seconds_by_run[run_idx] = (
+                time.perf_counter() - estimation_started
+            )
     else:
         _debug(
             debug,
-            f"Phase 1 crossfit_q MLP run parallelism enabled: "
+            "Phase 1 crossfit_q MLP run parallelism enabled: "
             f"workers={effective_mlp_workers} chunk={chunk_size}",
         )
+        _synchronize_runner_device(runner)
+        estimation_started = time.perf_counter()
         with _TorchNumThreadsContext(
             mlp_params_normalized.get("num_threads"), mlp_device.type == "cpu"
         ):
             with ThreadPoolExecutor(max_workers=effective_mlp_workers) as mlp_executor:
-                futures = []
-                for run_idx, spec in enumerate(run_specs):
-                    futures.append(
-                        (
-                            run_idx,
-                            mlp_executor.submit(
-                                _estimate_crossfit_q_variance_for_run,
-                                run_idx,
-                                states_by_run[:, run_idx, :, :],
-                                spec,
-                                level_times=level_times,
-                                mlp_params=mlp_params_normalized,
-                                mlp_device=str(runner.device),
-                                seed=7919 + int(run_idx),
-                                manage_mlp_num_threads=False,
-                            ),
-                        )
+                futures = [
+                    mlp_executor.submit(
+                        _estimate_crossfit_q_variance_for_run,
+                        run_idx,
+                        states_by_run[:, run_idx, :, :],
+                        spec,
+                        level_times=level_times,
+                        n_folds=effective_folds,
+                        mlp_params=mlp_params_normalized,
+                        mlp_device=str(runner.device),
+                        seed=7919 + int(run_idx),
+                        manage_mlp_num_threads=False,
                     )
-                for run_idx, future in futures:
+                    for run_idx, spec in enumerate(run_specs)
+                ]
+                for run_idx, future in enumerate(futures):
                     _, estimates_by_run[run_idx] = future.result()
+        _synchronize_runner_device(runner)
+        amortized_seconds = (time.perf_counter() - estimation_started) / int(chunk_size)
+        estimation_seconds_by_run.fill(amortized_seconds)
 
     payloads = []
     for run_idx, spec in enumerate(run_specs):
@@ -1372,6 +1872,9 @@ def _run_crossfit_q_phase1_sampling_batch(
                 "tau2": tau2,
                 "used_B1": int(used_B1),
                 "phase1_x0_samples": phase1_x0_by_run[run_idx],
+                "phase1_simulation_seconds": simulation_seconds / int(chunk_size),
+                "query_seconds": query_seconds / int(chunk_size),
+                "estimation_seconds": float(estimation_seconds_by_run[run_idx]),
             }
         )
     return payloads
@@ -1387,6 +1890,7 @@ def _solve_phase1_allocation(
     B,
     optimization_mode="monotone",
 ):
+    optimization_started = time.perf_counter()
     split_points = payload["split_points"]
     seg_costs = runner.segment_costs(split_points)
     total = float(np.sum(seg_costs))
@@ -1409,13 +1913,18 @@ def _solve_phase1_allocation(
         budget=B2,
         expected_cost_per_root=cost_per_root,
     )
-    return {
+    result = {
         "split_points": split_points,
         "N_i": split_factors,
         "n0": int(n0),
         "used_B1": int(payload["used_B1"]),
         "phase1_x0_samples": payload.get("phase1_x0_samples"),
+        "phase1_simulation_seconds": float(payload["phase1_simulation_seconds"]),
+        "query_seconds": float(payload["query_seconds"]),
+        "estimation_seconds": float(payload["estimation_seconds"]),
     }
+    result["optimization_seconds"] = time.perf_counter() - optimization_started
+    return result
 
 
 def run_estimate_and_sample(
@@ -1430,6 +1939,7 @@ def run_estimate_and_sample(
     reuse_phase1_samples: bool,
     n_runs: int,
     seed: int | None,
+    crossfit_q_folds: int = CROSSFIT_Q_DEFAULT_FOLDS,
     crossfit_q_mlp_run_parallelism: int = CROSSFIT_Q_DEFAULT_MLP_RUN_PARALLELISM,
     crossfit_q_mlp_params: Mapping[str, Any] | None = None,
     query_params: Mapping[str, Any] | None = None,
@@ -1442,13 +1952,18 @@ def run_estimate_and_sample(
 ):
     if not 0 <= B1 < B:
         raise ValueError("require 0 <= B1 < B")
+    if int(crossfit_q_folds) < 1:
+        raise ValueError("crossfit_q_folds must be at least 1")
     if optimization_mode not in SUPPORTED_OPTIMIZATION_MODES:
         raise ValueError(f"unknown optimization_mode '{optimization_mode}'")
 
     phase1_extra = {
         "query_params": dict(_normalize_query_params(query_params)),
+        "crossfit_q_folds": int(crossfit_q_folds),
         "crossfit_q_mlp_run_parallelism": int(
-            _crossfit_q_normalize_mlp_run_parallelism(crossfit_q_mlp_run_parallelism)
+            _crossfit_q_normalize_mlp_run_parallelism(
+                crossfit_q_mlp_run_parallelism
+            )
         ),
         "crossfit_q_mlp_params": dict(
             _crossfit_q_normalize_mlp_params(crossfit_q_mlp_params)
@@ -1461,47 +1976,94 @@ def run_estimate_and_sample(
         f"optimizer={optimization_mode}",
     )
 
-    chunks = list(iter_run_chunks(n_runs, n_parallel))
-    trial_results: List[Any] = [None] * n_runs
+    trial_results: List[Any] = []
     workers = max(1, min(n_runs, n_parallel))
+    additional_attempts = 0
+    discarded_attempts = 0
+    first_round = True
+    last_budget_error: InsufficientSplitBudgetError | None = None
 
     with ThreadPoolExecutor(max_workers=workers) as alloc_executor:
-        allocation_futures = []
-        for start, end in tqdm(chunks, desc="Phase 1", leave=False):
-            chunk_size = end - start
-            run_seed = None if seed is None else seed + run_offset + start
-            payloads = _run_crossfit_q_phase1_sampling_batch(
-                runner,
-                B1=B1,
-                seed=seed,
-                run_index_offset=run_offset + start,
-                split_percentages=split_percentages,
-                reuse_phase1_samples=reuse_phase1_samples,
-                chunk_size=chunk_size,
-                debug=debug,
-                max_sampling_batch_size=max_sampling_batch_size,
-                generator=make_torch_generator(run_seed, runner.device),
-                **phase1_extra,
-            )
-            for local_idx, payload in enumerate(payloads):
-                run_idx = start + local_idx
-                future = alloc_executor.submit(
-                    _solve_phase1_allocation,
-                    payload,
-                    runner,
-                    B=B,
-                    optimization_mode=optimization_mode,
+        while len(trial_results) < n_runs:
+            missing = n_runs - len(trial_results)
+            if first_round:
+                attempt_count = missing
+                attempt_seed = seed
+                attempt_offset = run_offset
+                progress_label = "Phase 1"
+                first_round = False
+            else:
+                remaining_retry_budget = n_runs - additional_attempts
+                if remaining_retry_budget <= 0:
+                    raise RuntimeError(
+                        f"Could not produce {n_runs} feasible allocations after "
+                        f"{n_runs + additional_attempts} attempts; discarded "
+                        f"{discarded_attempts} allocations"
+                    ) from last_budget_error
+                attempt_count = min(missing, remaining_retry_budget)
+                attempt_seed = (
+                    None
+                    if seed is None
+                    else seed + _INFEASIBLE_ALLOCATION_RETRY_SEED_OFFSET
                 )
-                allocation_futures.append((run_idx, future))
+                attempt_offset = run_offset + additional_attempts
+                additional_attempts += attempt_count
+                progress_label = "Phase 1 replacements"
 
-        for run_idx, future in tqdm(
-            allocation_futures, desc="Optimize N_i", leave=False
-        ):
-            trial_results[run_idx] = future.result()
+            allocation_futures = []
+            attempt_chunks = list(iter_run_chunks(attempt_count, n_parallel))
+            for start, end in tqdm(
+                attempt_chunks, desc=progress_label, leave=False
+            ):
+                chunk_size = end - start
+                run_seed = (
+                    None
+                    if attempt_seed is None
+                    else attempt_seed + attempt_offset + start
+                )
+                payloads = _run_crossfit_q_phase1_sampling_batch(
+                    runner,
+                    B1=B1,
+                    seed=attempt_seed,
+                    run_index_offset=attempt_offset + start,
+                    split_percentages=split_percentages,
+                    reuse_phase1_samples=reuse_phase1_samples,
+                    chunk_size=chunk_size,
+                    debug=debug,
+                    max_sampling_batch_size=max_sampling_batch_size,
+                    generator=make_torch_generator(run_seed, runner.device),
+                    **phase1_extra,
+                )
+                for payload in payloads:
+                    allocation_futures.append(
+                        alloc_executor.submit(
+                            _solve_phase1_allocation,
+                            payload,
+                            runner,
+                            B=B,
+                            optimization_mode=optimization_mode,
+                        )
+                    )
 
-    if any(t is None for t in trial_results):
-        raise RuntimeError("Phase 1 allocation did not produce all trial results")
+            for future in tqdm(
+                allocation_futures, desc="Optimize N_i", leave=False
+            ):
+                try:
+                    trial_results.append(future.result())
+                except InsufficientSplitBudgetError as exc:
+                    discarded_attempts += 1
+                    last_budget_error = exc
 
+    if discarded_attempts:
+        log.warning(
+            "Discarded %d infeasible allocation attempts at B=%d, B1=%d; "
+            "generated replacements",
+            discarded_attempts,
+            B,
+            B1,
+        )
+
+    chunks = list(iter_run_chunks(n_runs, n_parallel))
     metric_workers = max(1, min(int(n_parallel), n_runs))
     metric_futures: List[Tuple[int, Any]] = []
     with ThreadPoolExecutor(max_workers=metric_workers) as metric_executor:
@@ -1510,6 +2072,8 @@ def run_estimate_and_sample(
             run_seed = (
                 None if seed is None else seed + PHASE2_SEED_OFFSET + run_offset + start
             )
+            _synchronize_runner_device(runner)
+            phase2_started = time.perf_counter()
             samples_by_run, _, _ = runner.run_split_batch(
                 n0_by_run=[int(t["n0"]) for t in chunk],
                 split_points=chunk[0]["split_points"],
@@ -1517,6 +2081,17 @@ def run_estimate_and_sample(
                 generator=make_torch_generator(run_seed, runner.device),
                 max_sampling_batch_size=max_sampling_batch_size,
             )
+            _synchronize_runner_device(runner)
+            phase2_seconds = (time.perf_counter() - phase2_started) / len(chunk)
+            for trial in chunk:
+                trial["phase2_seconds"] = float(phase2_seconds)
+                trial["total_seconds"] = float(
+                    trial["phase1_simulation_seconds"]
+                    + trial["query_seconds"]
+                    + trial["estimation_seconds"]
+                    + trial["optimization_seconds"]
+                    + trial["phase2_seconds"]
+                )
             submit_sampling_trial_result_futures(
                 executor=metric_executor,
                 futures=metric_futures,

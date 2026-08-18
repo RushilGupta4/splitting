@@ -14,6 +14,7 @@ import torch
 from tqdm import tqdm
 
 from adaptive import (
+    CROSSFIT_Q_DEFAULT_FOLDS,
     CROSSFIT_Q_DEFAULT_MLP_RUN_PARALLELISM,
     SUPPORTED_OPTIMIZATION_MODES,
     _crossfit_q_normalize_mlp_params,
@@ -43,6 +44,7 @@ from runners.base import (
     step_schedules_for_sampler,
     steps_for_budget,
 )
+from runners.common_configs import uniform_c_values
 from runners.registry import get_runner_class, names
 from runners.splitting import normalize_max_sampling_batch_size
 from trials import mean_vector, std_vector
@@ -51,6 +53,17 @@ from utils import validate_split_percentages
 log = logging.getLogger("compare")
 
 _FILE_IDENTITY_CACHE: Dict[str, Dict[str, Any]] = {}
+_ADAPTIVE_IMPLEMENTATION_VERSION = 2
+_CROSSFIT_SEED_PAIRING_VERSION = "folds_to_k1_v1"
+
+TIMING_FIELDS = (
+    "phase1_simulation_seconds",
+    "query_seconds",
+    "estimation_seconds",
+    "optimization_seconds",
+    "phase2_seconds",
+    "total_seconds",
+)
 
 CSV_FIELDS = [
     "mode",
@@ -61,6 +74,7 @@ CSV_FIELDS = [
     "B",
     "B1",
     "B1_spec",
+    "crossfit_q_folds",
     "crossfit_q_mlp_loss",
     "reuse",
     "optimizer",
@@ -78,6 +92,9 @@ CSV_FIELDS = [
     "n_valid_ks",
     "N_i",
     "N_i_std",
+    *[f"mean_{field}" for field in TIMING_FIELDS],
+    *[f"std_{field}" for field in TIMING_FIELDS],
+    "n_valid_timing",
 ]
 
 
@@ -90,7 +107,9 @@ def parse_args():
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--n_runs", type=int, default=None)
     parser.add_argument("--n_parallel", type=int, default=None)
+    parser.add_argument("--crossfit_q_folds", type=int, default=None)
     parser.add_argument("--crossfit_q_mlp_run_parallelism", type=int, default=None)
+    parser.add_argument("--crossfit_q_num_queries", type=int, default=None)
     parser.add_argument(
         "--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu"
     )
@@ -297,14 +316,21 @@ def _validate_config(cfg: dict, *, runner, config_name: str):
                 "CIFAR-10 training set"
             )
     cfg["query_params"] = _normalize_query_params(cfg.get("query_params"))
+    cfg["crossfit_q_folds"] = int(
+        cfg.get("crossfit_q_folds", CROSSFIT_Q_DEFAULT_FOLDS)
+    )
+    if cfg["crossfit_q_folds"] < 1:
+        raise ValueError("crossfit_q_folds must be at least 1")
+    cfg["crossfit_q_mlp_run_parallelism"] = (
+        _crossfit_q_normalize_mlp_run_parallelism(
+            cfg.get("crossfit_q_mlp_run_parallelism")
+        )
+    )
     cfg["crossfit_q_mlp_params"] = _crossfit_q_normalize_mlp_params(
         cfg.get("crossfit_q_mlp_params")
     )
     cfg["crossfit_q_mlp_losses"] = _normalize_crossfit_q_mlp_losses(
         cfg.get("crossfit_q_mlp_losses"), cfg["crossfit_q_mlp_params"]
-    )
-    cfg["crossfit_q_mlp_run_parallelism"] = _crossfit_q_normalize_mlp_run_parallelism(
-        cfg.get("crossfit_q_mlp_run_parallelism")
     )
     optimization_modes = _normalize_optimization_modes(
         cfg.get("optimization_modes", ["monotone"])
@@ -385,10 +411,16 @@ def _apply_overrides(cfg: dict, args):
         cfg["n_parallel"] = int(args.n_parallel)
     else:
         cfg["n_parallel"] = int(cfg.get("n_parallel", 1))
+    if args.crossfit_q_folds is not None:
+        cfg["crossfit_q_folds"] = int(args.crossfit_q_folds)
     if args.crossfit_q_mlp_run_parallelism is not None:
         cfg["crossfit_q_mlp_run_parallelism"] = int(
             args.crossfit_q_mlp_run_parallelism
         )
+    if args.crossfit_q_num_queries is not None:
+        query_params = dict(cfg.get("query_params") or {})
+        query_params["num_queries"] = int(args.crossfit_q_num_queries)
+        cfg["query_params"] = query_params
     return cfg
 
 
@@ -433,11 +465,29 @@ def _crossfit_q_loss_options(cfg):
     )
 
 
-def _build_trial_specs(cfg, baselines):
+def _uniform_c_specs(baseline_spec, split_percentages):
+    """One spec per constant branching factor admitted by this split count."""
+    values = uniform_c_values(len(split_percentages))
+    if not values:
+        log.info(
+            "Skipping uniform_c baseline: no c configured for %d splits",
+            len(split_percentages),
+        )
+    return [{**baseline_spec, "uniform_c": float(c)} for c in values]
+
+
+def _build_trial_specs(cfg, baselines, split_percentages):
     specs: List[Dict[str, Any]] = []
     optimization_modes = cfg.get("optimization_modes", ["monotone"])
     reuse_flags = cfg.get("reuse_flags", [True])
-    schedule_baselines = [b for b in baselines if b["mode"] != "solver_baseline"]
+    schedule_baselines = [
+        expanded
+        for b in baselines
+        if b["mode"] != "solver_baseline"
+        for expanded in (
+            _uniform_c_specs(b, split_percentages) if b["mode"] == "uniform_c" else [b]
+        )
+    ]
     solver_baselines = [b for b in baselines if b["mode"] == "solver_baseline"]
 
     def make(B, B1, B1_spec, resolved, *, reuse, optimizer, mlp_loss):
@@ -450,6 +500,9 @@ def _build_trial_specs(cfg, baselines):
             "step_schedule": str(resolved.step_schedule),
             "optimization_mode": str(optimizer),
             "reuse_phase1_samples": bool(reuse),
+            "crossfit_q_folds": int(
+                cfg.get("crossfit_q_folds", CROSSFIT_Q_DEFAULT_FOLDS)
+            ),
             "crossfit_q_mlp_loss": str(mlp_loss),
         }
 
@@ -538,6 +591,14 @@ def _run_trial(
             split_percentages=[],
             N_i_list=[],
         )
+    if spec["mode"] == "uniform_c":
+        return run_fixed_N_sampling(
+            **common,
+            split_percentages=split_percentages,
+            N_i_list=[float(spec["uniform_c"])] * len(split_percentages),
+            result_mode="uniform_c",
+            include_allocation=True,
+        )
     if spec["mode"] == "ou_oracle":
         oracle = spec.get("oracle_definition") or runner.oracle_definition(
             split_percentages
@@ -555,6 +616,9 @@ def _run_trial(
         **common,
         B1=int(spec["B1"]),
         split_percentages=split_percentages,
+        crossfit_q_folds=int(
+            spec.get("crossfit_q_folds", CROSSFIT_Q_DEFAULT_FOLDS)
+        ),
         crossfit_q_mlp_run_parallelism=int(
             cfg.get(
                 "crossfit_q_mlp_run_parallelism",
@@ -652,6 +716,9 @@ def _method_display(row: Mapping[str, Any]) -> str:
     mode = row.get("mode")
     if mode == "fixed_N":
         return "fixed_N"
+    if mode == "uniform_c":
+        factors = row.get("N_i") or []
+        return f"uniform c={float(factors[0]):g}" if factors else "uniform_c"
     if mode == "ou_oracle":
         return "ou_oracle"
     if mode == "solver_baseline":
@@ -663,6 +730,8 @@ def _method_display(row: Mapping[str, Any]) -> str:
             label += f" {params}"
         return label
     label = f"{'reuse' if row.get('reuse') else 'fresh'}"
+    if row.get("crossfit_q_folds") not in (None, ""):
+        label += f" K={int(row['crossfit_q_folds'])}"
     if row.get("crossfit_q_mlp_loss"):
         label += f" loss={row['crossfit_q_mlp_loss']}"
     optimizer = str(row.get("optimizer") or "")
@@ -709,6 +778,10 @@ def _canonical_spec_for_cache(spec: Mapping[str, Any], *, runner, split_percenta
         return key
 
     key["split_percentages"] = [float(x) for x in split_percentages]
+
+    if mode == "uniform_c":
+        key["uniform_c"] = float(spec["uniform_c"])
+        return key
 
     if mode == "estimate_and_sample":
         key["B1"] = int(spec["B1"])
@@ -760,6 +833,16 @@ def _config_cache_key(
             reference_samples_path_for_key(reference_runner.checkpoint_path, ref_key)
         )
     if spec["mode"] == "estimate_and_sample":
+        key["adaptive_implementation_version"] = _ADAPTIVE_IMPLEMENTATION_VERSION
+        crossfit_folds = int(
+            spec.get("crossfit_q_folds", CROSSFIT_Q_DEFAULT_FOLDS)
+        )
+        key["crossfit_q_folds"] = crossfit_folds
+        if crossfit_folds > 1:
+            # K>1 configurations live in fresh cache directories and share the
+            # corresponding K=1 trial stream.  The marker keeps legacy unpaired
+            # crossfit caches intact while preventing them from being resumed.
+            key["crossfit_seed_pairing"] = _CROSSFIT_SEED_PAIRING_VERSION
         key["query_params"] = _json_safe(_normalize_query_params(cfg["query_params"]))
         mlp_params = dict(cfg["crossfit_q_mlp_params"])
         mlp_params["loss"] = str(spec["crossfit_q_mlp_loss"])
@@ -775,6 +858,21 @@ def _config_hash(cache_key):
             _json_safe(cache_key), sort_keys=True, separators=(",", ":")
         ).encode()
     ).hexdigest()
+
+
+def _trial_seed(cache_key, config_id):
+    """Return a reproducible trial seed, paired across crossfit fold counts."""
+    if (
+        cache_key.get("crossfit_seed_pairing")
+        == _CROSSFIT_SEED_PAIRING_VERSION
+    ):
+        seed_key = dict(cache_key)
+        seed_key.pop("crossfit_seed_pairing", None)
+        seed_key["crossfit_q_folds"] = 1
+        seed_digest = _config_hash(seed_key)
+    else:
+        seed_digest = config_id
+    return int(seed_digest[:16], 16) % (2**63 - 1)
 
 
 def _write_json_atomic(path, payload):
@@ -802,11 +900,14 @@ def _trial_to_cache_record(spec, trial):
         record["ks_distance"] = float(metrics["ks"])
     if trial.get("metric_payloads"):
         record["metric_payloads"] = trial["metric_payloads"]
-    if spec["mode"] in {"estimate_and_sample", "ou_oracle"}:
+    if spec["mode"] in {"estimate_and_sample", "ou_oracle", "uniform_c"}:
         record["N_i"] = [float(x) for x in trial["N_i"]]
         record["n0"] = int(trial["n0"])
     if spec["mode"] == "estimate_and_sample":
         record["used_B1"] = int(trial["used_B1"])
+        for field in TIMING_FIELDS:
+            if field in trial:
+                record[field] = float(trial[field])
     return record
 
 
@@ -976,8 +1077,26 @@ def _aggregate_cached_runs(spec, trials, *, base_runner, split_percentages, cfg)
         "N_i": [],
         "N_i_std": [],
     }
+    timing_counts = []
+    for field in TIMING_FIELDS:
+        values = [float(trial[field]) for trial in trials if field in trial]
+        base[f"mean_{field}"] = float(np.mean(values)) if values else ""
+        base[f"std_{field}"] = (
+            float(np.std(values, ddof=1)) if len(values) > 1 else (0.0 if values else "")
+        )
+        timing_counts.append(len(values))
+    base["n_valid_timing"] = min(timing_counts) if timing_counts else 0
     if spec["mode"] == "fixed_N":
         return base
+    if spec["mode"] == "uniform_c":
+        factors = [float(spec["uniform_c"])] * len(split_percentages)
+        return {
+            **base,
+            "n0": int(trials[0]["n0"]) if trials else "",
+            "optimizer": "uniform",
+            "N_i": factors,
+            "N_i_std": [0.0] * len(factors),
+        }
     if spec["mode"] == "ou_oracle":
         oracle = spec.get("oracle_definition") or runner.oracle_definition(
             split_percentages
@@ -997,6 +1116,9 @@ def _aggregate_cached_runs(spec, trials, *, base_runner, split_percentages, cfg)
         **base,
         "B1": int(spec["B1"]),
         "B1_spec": str(spec["B1_spec"]),
+        "crossfit_q_folds": int(
+            spec.get("crossfit_q_folds", CROSSFIT_Q_DEFAULT_FOLDS)
+        ),
         "crossfit_q_mlp_loss": str(spec.get("crossfit_q_mlp_loss") or ""),
         "reuse": bool(spec["reuse_phase1_samples"]),
         "optimizer": str(spec.get("optimization_mode", "monotone")),
@@ -1024,6 +1146,7 @@ def _sort_key(row):
         value if valid else 0.0,
         str(row.get("B1_spec", "")),
         int(row["B1"] or 0),
+        int(row.get("crossfit_q_folds") or 0),
         str(row.get("crossfit_q_mlp_loss", "")),
         str(row.get("reuse", "")),
         str(row.get("optimizer", "")),
@@ -1052,7 +1175,7 @@ def _write_summary_csv(path, rows):
 
 def _run_split(args, cfg, base_runner, baselines, split_percentages):
     split_percentages = [float(x) for x in split_percentages]
-    specs = _build_trial_specs(cfg, baselines)
+    specs = _build_trial_specs(cfg, baselines, split_percentages)
     runs_dir = _runs_dir(args.output_dir)
     entries: List[Dict[str, Any]] = []
     total_remaining = 0
@@ -1090,7 +1213,7 @@ def _run_split(args, cfg, base_runner, baselines, split_percentages):
         )
         digest = _config_hash(cache_key)
         config_id = digest[:16]
-        seed = int(config_id, 16) % (2**63 - 1)
+        seed = _trial_seed(cache_key, config_id)
         config_dir = os.path.join(runs_dir, config_id)
         cached = _load_cached_runs(config_dir, target_runs)
         completed_runs = min(len(cached), target_runs)
