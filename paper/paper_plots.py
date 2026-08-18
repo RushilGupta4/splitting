@@ -28,6 +28,24 @@ from matplotlib.ticker import FuncFormatter
 Z_975 = 1.96
 OUTPUT_SCALE = 1.5
 
+# Shared styling for the three four-model, 2x2 publication figures.  Keeping
+# these values in one place prevents small visual differences between panels
+# that are intended to be read as a set.
+FOUR_MODEL_FIGSIZE = (64.0 / 9.0, 4.0)
+# Full-HD output for the standardized 16:9 figures.
+FOUR_MODEL_OUTPUT_WIDTH = 1_920
+FOUR_MODEL_DPI = FOUR_MODEL_OUTPUT_WIDTH / FOUR_MODEL_FIGSIZE[0]
+OU_ORACLE_DPI = 276.225
+DATA_LINEWIDTH = 1.5
+REFERENCE_LINEWIDTH = 0.8
+GRID_LINEWIDTH = 0.55
+INTERVAL_ALPHA = 0.14
+FOUR_MODEL_LAYOUT = {
+    "rect": (0.0, 0.0, 1.0, 0.92),
+    "h_pad": 1.15,
+    "w_pad": 1.0,
+}
+
 FOUR = (0.8, 0.6, 0.4, 0.2)
 NINE = (0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1)
 SINGLE_01 = (0.1,)
@@ -941,14 +959,53 @@ def _style() -> None:
     )
 
 
-def _save_figure(fig: plt.Figure, output_dir: Path, stem: str) -> None:
+def _four_model_style() -> None:
+    """Use slightly larger type for the standardized 2x2 figures."""
+    _style()
+    plt.rcParams.update(
+        {
+            "font.size": 11.0,
+            "axes.titlesize": 11.5,
+            "axes.labelsize": 11.0,
+            "xtick.labelsize": 10.0,
+            "ytick.labelsize": 10.0,
+            "legend.fontsize": 10.0,
+        }
+    )
+
+
+def _save_figure(
+    fig: plt.Figure,
+    output_dir: Path,
+    stem: str,
+    *,
+    tight: bool = True,
+    dpi: float | None = None,
+) -> None:
     fig.savefig(
         output_dir / f"{stem}.png",
-        dpi=round(240 * OUTPUT_SCALE),
-        bbox_inches="tight",
+        dpi=dpi if dpi is not None else round(240 * OUTPUT_SCALE),
+        bbox_inches="tight" if tight else None,
         metadata={"Software": "paper_plots.py"},
     )
     plt.close(fig)
+
+
+def _finish_four_model_figure(
+    fig: plt.Figure,
+    legend_handles: list[Any],
+    legend_labels: list[str],
+) -> None:
+    """Apply the common legend, spacing, and exact-size export layout."""
+    fig.legend(
+        legend_handles,
+        legend_labels,
+        loc="upper center",
+        ncol=len(legend_labels),
+        frameon=False,
+        bbox_to_anchor=(0.5, 0.995),
+    )
+    fig.tight_layout(**FOUR_MODEL_LAYOUT)
 
 
 def _plot_splitting_diagram(output_dir: Path) -> None:
@@ -958,7 +1015,8 @@ def _plot_splitting_diagram(output_dir: Path) -> None:
             "mathtext.fontset": "cm",
         }
     )
-    fig, ax = plt.subplots(figsize=(15, 7), constrained_layout=True)
+    fig, ax = plt.subplots(figsize=(15, 7))
+    fig.subplots_adjust(left=0.035, right=0.965, bottom=0.07, top=0.97)
     path_color = "#2b2b2b"
     guide_color = "#c7c7c7"
     text_color = "#111111"
@@ -1097,13 +1155,11 @@ def _plot_splitting_diagram(output_dir: Path) -> None:
         color=text_color,
     )
     ax.set_xlim(-0.4, 8.4)
-    ax.set_ylim(-5.95, 4.15)
+    ax.set_ylim(-6.40, 4.30)
     ax.axis("off")
     fig.savefig(
         output_dir / "splitting_diagram.png",
-        dpi=round(300 * OUTPUT_SCALE),
-        bbox_inches="tight",
-        pad_inches=0.18,
+        dpi=128,
         metadata={"Software": "paper_plots.py"},
     )
     plt.close(fig)
@@ -1114,8 +1170,8 @@ def _plot_reductions(
     reductions: dict[tuple[str, tuple[float, ...], int], tuple[float, float, float]],
     output_dir: Path,
 ) -> None:
-    _style()
-    fig, axes = plt.subplots(2, 2, figsize=(7.15, 4.25), sharey=True)
+    _four_model_style()
+    fig, axes = plt.subplots(2, 2, figsize=FOUR_MODEL_FIGSIZE, sharey=True)
     interval_extrema: list[float] = []
     legend_handles: list[Any] = []
     legend_labels: list[str] = []
@@ -1147,7 +1203,7 @@ def _plot_reductions(
                     upper,
                     where=finite,
                     color=SCHEDULE_COLORS[schedule],
-                    alpha=0.14,
+                    alpha=INTERVAL_ALPHA,
                     linewidth=0,
                 )
             ax.plot(
@@ -1155,13 +1211,15 @@ def _plot_reductions(
                 observed,
                 color=SCHEDULE_COLORS[schedule],
                 linestyle="-",
-                linewidth=1.6,
+                linewidth=DATA_LINEWIDTH,
                 label=label,
             )
-        ax.axhline(0.0, color="#555555", linewidth=0.8, linestyle=":")
+        ax.axhline(
+            0.0, color="#555555", linewidth=REFERENCE_LINEWIDTH, linestyle=":"
+        )
         ax.set_xscale("log")
         ax.set_title(model["plot_title"])
-        ax.grid(axis="y", color="#D8D8D8", linewidth=0.55)
+        ax.grid(axis="y", color="#D8D8D8", linewidth=GRID_LINEWIDTH)
         ax.xaxis.set_major_formatter(FuncFormatter(_budget_tick))
         ax.tick_params(axis="x", which="minor", bottom=False)
         axis_handles, axis_labels = ax.get_legend_handles_labels()
@@ -1179,24 +1237,22 @@ def _plot_reductions(
         ax.set_ylabel("Mean Metric Reduction (%)")
     for ax in axes[-1, :]:
         ax.set_xlabel("Budget $B$")
-    fig.legend(
-        legend_handles,
-        legend_labels,
-        loc="upper center",
-        ncol=len(SCHEDULES),
-        frameon=False,
-        bbox_to_anchor=(0.5, 1.01),
+    _finish_four_model_figure(fig, legend_handles, legend_labels)
+    _save_figure(
+        fig,
+        output_dir,
+        "experiment_metric_gain",
+        tight=False,
+        dpi=FOUR_MODEL_DPI,
     )
-    fig.tight_layout(rect=(0, 0, 1, 0.95), h_pad=1.15, w_pad=1.0)
-    _save_figure(fig, output_dir, "experiment_metric_gain")
 
 
 def _plot_absolute_metrics(
     all_rows: dict[str, dict[tuple[float, ...], list[ResultRow]]],
     output_dir: Path,
 ) -> None:
-    _style()
-    fig, axes = plt.subplots(2, 2, figsize=(7.15, 4.25))
+    _four_model_style()
+    fig, axes = plt.subplots(2, 2, figsize=FOUR_MODEL_FIGSIZE)
     legend_handles: list[Any] = []
     legend_labels: list[str] = []
 
@@ -1218,7 +1274,7 @@ def _plot_absolute_metrics(
             baseline_intervals[:, 0],
             baseline_intervals[:, 1],
             color="#333333",
-            alpha=0.12,
+            alpha=INTERVAL_ALPHA,
             linewidth=0,
         )
         ax.plot(
@@ -1226,7 +1282,7 @@ def _plot_absolute_metrics(
             baseline_means,
             color="#333333",
             linestyle="--",
-            linewidth=1.2,
+            linewidth=DATA_LINEWIDTH,
             label="Independent MC",
         )
 
@@ -1247,7 +1303,7 @@ def _plot_absolute_metrics(
                 intervals[:, 0],
                 intervals[:, 1],
                 color=SCHEDULE_COLORS[schedule],
-                alpha=0.14,
+                alpha=INTERVAL_ALPHA,
                 linewidth=0,
             )
             ax.plot(
@@ -1255,14 +1311,16 @@ def _plot_absolute_metrics(
                 means,
                 color=SCHEDULE_COLORS[schedule],
                 linestyle="-",
-                linewidth=1.1,
+                linewidth=DATA_LINEWIDTH,
                 label=label,
             )
 
         ax.set_xscale("log")
         ax.set_yscale("log")
         ax.set_title(model["plot_title"])
-        ax.grid(axis="y", which="both", color="#D8D8D8", linewidth=0.55)
+        ax.grid(
+            axis="y", which="both", color="#D8D8D8", linewidth=GRID_LINEWIDTH
+        )
         ax.xaxis.set_major_formatter(FuncFormatter(_budget_tick))
         ax.tick_params(axis="x", which="minor", bottom=False)
         axis_handles, axis_labels = ax.get_legend_handles_labels()
@@ -1271,20 +1329,18 @@ def _plot_absolute_metrics(
                 legend_handles.append(handle)
                 legend_labels.append(label)
 
-    for ax in axes.flat:
+    for ax in axes[:, 0]:
         ax.set_ylabel("Mean Error Metric")
     for ax in axes[-1, :]:
         ax.set_xlabel("Budget $B$")
-    fig.legend(
-        legend_handles,
-        legend_labels,
-        loc="upper center",
-        ncol=1 + len(SCHEDULES),
-        frameon=False,
-        bbox_to_anchor=(0.5, 1.01),
+    _finish_four_model_figure(fig, legend_handles, legend_labels)
+    _save_figure(
+        fig,
+        output_dir,
+        "experiment_metric_absolute",
+        tight=False,
+        dpi=FOUR_MODEL_DPI,
     )
-    fig.tight_layout(rect=(0, 0, 1, 0.95), h_pad=1.15, w_pad=1.0)
-    _save_figure(fig, output_dir, "experiment_metric_absolute")
 
 
 def _allocation_curve(
@@ -1395,14 +1451,14 @@ def _plot_ou_oracle_allocations(
         bbox_to_anchor=(0.5, 1.03),
     )
     fig.tight_layout(rect=(0, 0, 1, 0.88), w_pad=1.0)
-    _save_figure(fig, output_dir, "ou_oracle_allocations")
+    _save_figure(fig, output_dir, "ou_oracle_allocations", dpi=OU_ORACLE_DPI)
 
 
 def _plot_allocations(
     all_rows: dict[str, dict[tuple[float, ...], list[ResultRow]]], output_dir: Path
 ) -> None:
-    _style()
-    fig, axes = plt.subplots(2, 2, figsize=(7.15, 4.65))
+    _four_model_style()
+    fig, axes = plt.subplots(2, 2, figsize=FOUR_MODEL_FIGSIZE)
     legend_handles: list[Any] = []
     legend_labels: list[str] = []
 
@@ -1450,18 +1506,22 @@ def _plot_allocations(
                 where="post",
                 color=SCHEDULE_COLORS[schedule],
                 linestyle="-",
-                linewidth=1.5,
+                linewidth=DATA_LINEWIDTH,
                 label=label,
                 zorder=3,
             )
-        ax.axhline(1.0, color="#555555", linewidth=0.8, linestyle=":")
+        ax.axhline(
+            1.0, color="#555555", linewidth=REFERENCE_LINEWIDTH, linestyle=":"
+        )
         ax.set_title(model["plot_title"].rsplit(" (", 1)[0])
         ax.set_xlim(0.0, 1.0)
         ax.set_yscale("log", base=2)
         ax.set_ylim(bottom=0.95)
         ax.yaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value:g}"))
         ax.tick_params(axis="y", which="minor", left=False)
-        ax.grid(axis="y", which="major", color="#D8D8D8", linewidth=0.55)
+        ax.grid(
+            axis="y", which="major", color="#D8D8D8", linewidth=GRID_LINEWIDTH
+        )
         axis_handles, axis_labels = ax.get_legend_handles_labels()
         for handle, label in zip(axis_handles, axis_labels):
             if label not in legend_labels:
@@ -1478,16 +1538,14 @@ def _plot_allocations(
     )
     legend_handles = [handle for handle, _ in ordered_legend]
     legend_labels = [label for _, label in ordered_legend]
-    fig.legend(
-        legend_handles,
-        legend_labels,
-        loc="upper center",
-        ncol=len(SCHEDULES),
-        frameon=False,
-        bbox_to_anchor=(0.5, 1.01),
+    _finish_four_model_figure(fig, legend_handles, legend_labels)
+    _save_figure(
+        fig,
+        output_dir,
+        "experiment_allocations_four_models",
+        tight=False,
+        dpi=FOUR_MODEL_DPI,
     )
-    fig.tight_layout(rect=(0, 0, 1, 0.95), h_pad=1.15, w_pad=1.0)
-    _save_figure(fig, output_dir, "experiment_allocations_four_models")
 
 
 def main() -> None:
