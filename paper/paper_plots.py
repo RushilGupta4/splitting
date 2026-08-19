@@ -26,7 +26,8 @@ import numpy as np
 from matplotlib.lines import Line2D
 from matplotlib.ticker import FuncFormatter
 
-Z_975 = 1.96
+# Two-sided 90% normal confidence interval: Phi^-1(0.95).
+Z_95 = 1.6448536269514722
 OUTPUT_SCALE = 1.5
 
 # Shared styling for the three four-model, 2x2 publication figures.  Keeping
@@ -305,7 +306,7 @@ class ResultRow:
     def mean_ci(self) -> tuple[float, float]:
         if self.n < 2 or not math.isfinite(self.std):
             return self.mean, self.mean
-        half = Z_975 * self.std / math.sqrt(self.n)
+        half = Z_95 * self.std / math.sqrt(self.n)
         return self.mean - half, self.mean + half
 
 
@@ -1082,7 +1083,7 @@ def _normal_reduction(
     )
     if not math.isfinite(variance) or variance < 0.0:
         raise RuntimeError("Invalid delta-method variance for metric reduction")
-    half = Z_975 * math.sqrt(variance)
+    half = Z_95 * math.sqrt(variance)
     return observed, observed - half, observed + half
 
 
@@ -1416,18 +1417,20 @@ def _reduction_legend_handles(
 ) -> list[Line2D]:
     """Colour encodes the split count; dash pattern encodes the allocation."""
     handles = [
-        Line2D([], [], color=SCHEDULE_COLORS[schedule], linewidth=1.2, label=label)
+        Line2D([], [], color=SCHEDULE_COLORS[schedule], linewidth=1.15, label=label)
         for schedule, label in SCHEDULES
         if schedule in schedules
     ]
     if include_learned:
-        handles.append(Line2D([], [], color="#555555", linewidth=1.2, label="Learned"))
+        handles.append(
+            Line2D([], [], color="#555555", linewidth=1.15, label="Learned")
+        )
     handles.extend(
         Line2D(
             [],
             [],
             color="#555555",
-            linewidth=1.0,
+            linewidth=1.05,
             linestyle=UNIFORM_C_LINESTYLES[c],
             label=rf"$c={c:g}$",
         )
@@ -1496,7 +1499,7 @@ def _plot_reductions(
                     observed,
                     color=SCHEDULE_COLORS[schedule],
                     linestyle="-",
-                    linewidth=1.2,
+                    linewidth=1.15,
                     label=label,
                     zorder=3,
                 )
@@ -1527,8 +1530,8 @@ def _plot_reductions(
                     uniform_observed,
                     color=SCHEDULE_COLORS[schedule],
                     linestyle=UNIFORM_C_LINESTYLES[c],
-                    linewidth=1.0,
-                    alpha=0.6,
+                    linewidth=1.05,
+                    alpha=0.8,
                     zorder=2,
                 )
                 panel_has_data = True
@@ -1734,8 +1737,8 @@ def _allocation_curve(
     mean_at_splits = cumulative.mean(axis=0)
     if cumulative.shape[0] > 1:
         standard_error = cumulative.std(axis=0, ddof=1) / math.sqrt(cumulative.shape[0])
-        lower_at_splits = mean_at_splits - Z_975 * standard_error
-        upper_at_splits = mean_at_splits + Z_975 * standard_error
+        lower_at_splits = mean_at_splits - Z_95 * standard_error
+        upper_at_splits = mean_at_splits + Z_95 * standard_error
     else:
         lower_at_splits = mean_at_splits
         upper_at_splits = mean_at_splits

@@ -169,6 +169,8 @@ def _metric_reduction(
 def _complete_result_rows(
     model: dict[str, Any],
     all_rows: dict[str, dict[tuple[float, ...], list[ResultRow]]],
+    *,
+    debug: bool = False,
 ) -> tuple[list[str], list[dict[str, Any]]]:
     rows_by_schedule = all_rows.get(model["directory"], {})
 
@@ -185,6 +187,11 @@ def _complete_result_rows(
             schedule_rows, budget, mode=mode, uniform_c=uniform_c
         )
         if reduction is None:
+            if not debug:
+                raise RuntimeError(
+                    f"Missing {allocation} result or fixed_N baseline for "
+                    f"{model['directory']}, {len(schedule)} splits, B={budget}"
+                )
             observed = lower = upper = ""
             n_method = n_independent = ""
             mean_method = mean_independent = ""
@@ -214,20 +221,55 @@ def _complete_result_rows(
         }
 
     rows: list[dict[str, Any]] = []
+    expected_keys: list[tuple[int, str, int]] = []
     for schedule, _ in SCHEDULES:
         for budget in model["budgets"]:
+            expected_keys.append((len(schedule), "Learned", budget))
             rows.append(
-                result_row(schedule, budget, allocation="learned", mode="adaptive")
+                result_row(schedule, budget, allocation="Learned", mode="adaptive")
             )
-            rows.extend(
-                result_row(
-                    schedule,
-                    budget,
-                    allocation=f"uniform_{c:g}",
-                    mode="uniform_c",
-                    uniform_c=c,
+            for c in _expected_uniform_c(model, schedule):
+                allocation = f"Uniform (c={c:g})"
+                expected_keys.append((len(schedule), allocation, budget))
+                rows.append(
+                    result_row(
+                        schedule,
+                        budget,
+                        allocation=allocation,
+                        mode="uniform_c",
+                        uniform_c=c,
+                    )
                 )
-                for c in _expected_uniform_c(model, schedule)
+
+    actual_keys = [
+        (int(row["split_points"]), str(row["allocation"]), int(row["B"]))
+        for row in rows
+    ]
+    if actual_keys != expected_keys or len(set(actual_keys)) != len(actual_keys):
+        raise RuntimeError(
+            f"Unexpected complete-result row order or duplicate key for "
+            f"{model['directory']}"
+        )
+
+    independent_means: dict[tuple[int, int], Any] = {}
+    for row in rows:
+        if row["mean_independent"] == "":
+            continue
+        key = (int(row["split_points"]), int(row["B"]))
+        previous = independent_means.setdefault(key, row["mean_independent"])
+        if previous != row["mean_independent"]:
+            raise RuntimeError(
+                f"Methods do not share the fixed_N baseline for "
+                f"{model['directory']}, {key[0]} splits, B={key[1]}"
+            )
+        if not (
+            row["reduction_ci_lower_percent"]
+            <= row["reduction_percent"]
+            <= row["reduction_ci_upper_percent"]
+        ):
+            raise RuntimeError(
+                f"Invalid reduction confidence interval for {model['directory']}, "
+                f"{key[0]} splits, B={key[1]}, {row['allocation']}"
             )
     fieldnames = [
         "split_points",
@@ -261,7 +303,9 @@ def _ou_oracle_rows(
         }
         if not common_budgets:
             if not debug:
-                raise RuntimeError("OU learned and oracle results have no common budget")
+                raise RuntimeError(
+                    "OU learned and oracle results have no common budget"
+                )
             rows.append(
                 {
                     "split_points": len(schedule),
@@ -358,7 +402,7 @@ def main() -> None:
     written.append(_write_csv(output_dir, "ou_oracle_reductions", fieldnames, rows))
 
     for model in MODELS:
-        fieldnames, rows = _complete_result_rows(model, all_rows)
+        fieldnames, rows = _complete_result_rows(model, all_rows, debug=args.debug)
         written.append(
             _write_csv(
                 output_dir,
