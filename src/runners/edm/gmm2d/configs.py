@@ -56,11 +56,11 @@ _SAMPLING_BASE = {
         5_000_000,
     ],
     "B1_list": [
-        "5,0.66",
+        "10,0.66",
     ],
     "baselines": [
         "fixed_N",
-        # "uniform_c",
+        "uniform_c",
         # "edm_stochastic_churn0",
         # "dpmpp_2s_churn2.5",
     ],

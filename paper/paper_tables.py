@@ -260,7 +260,22 @@ def _ou_oracle_rows(
             row.budget for row in learned_rows
         }
         if not common_budgets:
-            raise RuntimeError("OU learned and oracle results have no common budget")
+            if not debug:
+                raise RuntimeError("OU learned and oracle results have no common budget")
+            rows.append(
+                {
+                    "split_points": len(schedule),
+                    "B": "",
+                    "oracle_ks_reduction_percent": "",
+                    "oracle_ks_reduction_ci_lower_percent": "",
+                    "oracle_ks_reduction_ci_upper_percent": "",
+                    "learned_ks_reduction_percent": "",
+                    "learned_ks_reduction_ci_lower_percent": "",
+                    "learned_ks_reduction_ci_upper_percent": "",
+                    "learned_to_oracle_reduction_ratio_percent": "",
+                }
+            )
+            continue
         display_budget = max(common_budgets)
         oracle = _row_at_budget(oracle_rows, display_budget, mode="ou_oracle")
         shared_independent = _row_at_budget(

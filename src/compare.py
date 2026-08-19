@@ -54,7 +54,6 @@ log = logging.getLogger("compare")
 
 _FILE_IDENTITY_CACHE: Dict[str, Dict[str, Any]] = {}
 _ADAPTIVE_IMPLEMENTATION_VERSION = 2
-_CROSSFIT_SEED_PAIRING_VERSION = "folds_to_k1_v1"
 
 TIMING_FIELDS = (
     "phase1_simulation_seconds",
@@ -838,11 +837,6 @@ def _config_cache_key(
             spec.get("crossfit_q_folds", CROSSFIT_Q_DEFAULT_FOLDS)
         )
         key["crossfit_q_folds"] = crossfit_folds
-        if crossfit_folds > 1:
-            # K>1 configurations live in fresh cache directories and share the
-            # corresponding K=1 trial stream.  The marker keeps legacy unpaired
-            # crossfit caches intact while preventing them from being resumed.
-            key["crossfit_seed_pairing"] = _CROSSFIT_SEED_PAIRING_VERSION
         key["query_params"] = _json_safe(_normalize_query_params(cfg["query_params"]))
         mlp_params = dict(cfg["crossfit_q_mlp_params"])
         mlp_params["loss"] = str(spec["crossfit_q_mlp_loss"])
@@ -862,12 +856,8 @@ def _config_hash(cache_key):
 
 def _trial_seed(cache_key, config_id):
     """Return a reproducible trial seed, paired across crossfit fold counts."""
-    if (
-        cache_key.get("crossfit_seed_pairing")
-        == _CROSSFIT_SEED_PAIRING_VERSION
-    ):
+    if int(cache_key.get("crossfit_q_folds", 1)) > 1:
         seed_key = dict(cache_key)
-        seed_key.pop("crossfit_seed_pairing", None)
         seed_key["crossfit_q_folds"] = 1
         seed_digest = _config_hash(seed_key)
     else:

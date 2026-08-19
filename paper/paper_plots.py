@@ -42,9 +42,9 @@ REFERENCE_LINEWIDTH = 0.8
 GRID_LINEWIDTH = 0.55
 INTERVAL_ALPHA = 0.14
 FOUR_MODEL_LAYOUT = {
-    "rect": (0.0, 0.0, 1.0, 0.92),
-    "h_pad": 1.15,
-    "w_pad": 1.0,
+    "rect": (0.025, 0.055, 0.99, 0.92),
+    "h_pad": 0.5,
+    "w_pad": 0.8,
 }
 
 FOUR = (0.8, 0.6, 0.4, 0.2)
@@ -91,7 +91,6 @@ EXPECTED_MLP_PARAMS = {
     "num_threads": 2,
 }
 EXPECTED_QUERY_PARAMS = {
-    "num_queries": 1_024,
     "k_max": 64,
     "mass_min": 0.05,
     "mass_max": 0.95,
@@ -162,7 +161,8 @@ MODELS = (
         "title": "OU Process",
         "plot_title": "OU Process (KS)",
         "metric": "ks",
-        "n_runs": 5_000,
+        "n_runs": 2_500,
+        "num_queries": 1_024,
         "pilot_coefficient": 5.0,
         "pilot_exponent": 0.66,
         "budgets": (100_000, 200_000, 500_000, 1_000_000, 2_000_000, 5_000_000),
@@ -184,7 +184,8 @@ MODELS = (
         "title": "Overdamped Langevin",
         "plot_title": "Overdamped Langevin (KS)",
         "metric": "ks",
-        "n_runs": 5_000,
+        "n_runs": 2_500,
+        "num_queries": 1_024,
         "pilot_coefficient": 5.0,
         "pilot_exponent": 0.66,
         "budgets": (100_000, 200_000, 500_000, 1_000_000, 2_000_000, 5_000_000),
@@ -206,8 +207,9 @@ MODELS = (
         "title": "EDM Gaussian mixture",
         "plot_title": "EDM Gaussian mixture (KS)",
         "metric": "ks",
-        "n_runs": 5_000,
-        "pilot_coefficient": 5.0,
+        "n_runs": 2_500,
+        "num_queries": 1_024,
+        "pilot_coefficient": 10.0,
         "pilot_exponent": 0.66,
         "budgets": (
             100_000,
@@ -231,6 +233,7 @@ MODELS = (
         "plot_title": "CIFAR-10 DDPM (MMD)",
         "metric": "mmd",
         "n_runs": 50,
+        "num_queries": 1_024,
         "pilot_coefficient": 10.0,
         "pilot_exponent": 0.66,
         "budgets": (50_000, 100_000, 200_000, 500_000, 1_000_000),
@@ -853,7 +856,8 @@ def _config_matches(row: ResultRow, config: dict[str, Any]) -> bool:
         and spec.get("B1") == row.pilot_budget
         and spec.get("optimization_mode") == row.optimizer
         and spec.get("reuse_phase1_samples") == row.reuse
-        and key.get("query_params") == EXPECTED_QUERY_PARAMS
+        and key.get("query_params")
+        == {"num_queries": row.model["num_queries"], **EXPECTED_QUERY_PARAMS}
         and key.get("crossfit_q_mlp_params") == EXPECTED_MLP_PARAMS
     )
 
@@ -1140,18 +1144,31 @@ def _style() -> None:
 
 
 def _four_model_style() -> None:
-    """Use slightly larger type for the standardized 2x2 figures."""
+    """Use compact, publication-readable type for the standardized 2x2 figures."""
     _style()
     plt.rcParams.update(
         {
-            "font.size": 11.0,
-            "axes.titlesize": 11.5,
-            "axes.labelsize": 11.0,
-            "xtick.labelsize": 10.0,
-            "ytick.labelsize": 10.0,
-            "legend.fontsize": 10.0,
+            "font.size": 9.5,
+            "axes.titlesize": 10.0,
+            "axes.labelsize": 9.5,
+            "xtick.labelsize": 8.5,
+            "ytick.labelsize": 8.5,
+            "legend.fontsize": 8.5,
         }
     )
+
+
+def _four_model_title(
+    model: dict[str, Any], *, include_metric: bool = True
+) -> str:
+    """Return a concise panel title, optionally retaining the metric identifier."""
+    title = {
+        "simple_ou": "OU",
+        "coupled_double_well_langevin": "Langevin",
+        "edm_default": "EDM-GMM",
+        "ddpm_cifar10_hf_mmd": "CIFAR-10",
+    }[model["directory"]]
+    return f"{title} ({model['metric'].upper()})" if include_metric else title
 
 
 def _label_visible_grid(axes: np.ndarray, *, xlabel: str, ylabel: str) -> None:
@@ -1171,6 +1188,28 @@ def _label_visible_grid(axes: np.ndarray, *, xlabel: str, ylabel: str) -> None:
         ]
         if visible:
             visible[0].set_ylabel(ylabel)
+
+
+def _hide_repeated_x_ticklabels(axes: np.ndarray) -> None:
+    """Show x tick labels only on the lowest visible panel in each column."""
+    for column in range(axes.shape[1]):
+        visible = [
+            axes[row, column]
+            for row in range(axes.shape[0])
+            if axes[row, column].get_visible()
+        ]
+        for ax in visible[:-1]:
+            ax.tick_params(axis="x", which="both", labelbottom=False)
+
+
+def _set_shared_axis_labels(
+    fig: plt.Figure, *, xlabel: str, ylabel: str
+) -> None:
+    """Place shared labels close to the axes without double-counting their margins."""
+    x_label = fig.supxlabel(xlabel, x=0.52, y=0.025)
+    y_label = fig.supylabel(ylabel, x=0.015, y=0.49)
+    x_label.set_in_layout(False)
+    y_label.set_in_layout(False)
 
 
 def _save_figure(
@@ -1206,6 +1245,8 @@ def _finish_four_model_figure(
         ncol=legend_ncol if legend_ncol is not None else len(legend_labels),
         frameon=False,
         bbox_to_anchor=(0.5, 0.995),
+        columnspacing=1.4,
+        handletextpad=0.5,
     )
     fig.tight_layout(**(layout if layout is not None else FOUR_MODEL_LAYOUT))
 
@@ -1375,20 +1416,20 @@ def _reduction_legend_handles(
 ) -> list[Line2D]:
     """Colour encodes the split count; dash pattern encodes the allocation."""
     handles = [
-        Line2D([], [], color=SCHEDULE_COLORS[schedule], linewidth=1.6, label=label)
+        Line2D([], [], color=SCHEDULE_COLORS[schedule], linewidth=1.2, label=label)
         for schedule, label in SCHEDULES
         if schedule in schedules
     ]
     if include_learned:
-        handles.append(Line2D([], [], color="#555555", linewidth=1.6, label="learned"))
+        handles.append(Line2D([], [], color="#555555", linewidth=1.2, label="Learned"))
     handles.extend(
         Line2D(
             [],
             [],
             color="#555555",
-            linewidth=1.1,
+            linewidth=1.0,
             linestyle=UNIFORM_C_LINESTYLES[c],
-            label=rf"uniform $c={c:g}$",
+            label=rf"$c={c:g}$",
         )
         for c in UNIFORM_C_VALUES
         if c in uniform_c_values
@@ -1455,7 +1496,7 @@ def _plot_reductions(
                     observed,
                     color=SCHEDULE_COLORS[schedule],
                     linestyle="-",
-                    linewidth=DATA_LINEWIDTH,
+                    linewidth=1.2,
                     label=label,
                     zorder=3,
                 )
@@ -1486,8 +1527,8 @@ def _plot_reductions(
                     uniform_observed,
                     color=SCHEDULE_COLORS[schedule],
                     linestyle=UNIFORM_C_LINESTYLES[c],
-                    linewidth=1.1,
-                    alpha=0.85,
+                    linewidth=1.0,
+                    alpha=0.6,
                     zorder=2,
                 )
                 panel_has_data = True
@@ -1498,7 +1539,7 @@ def _plot_reductions(
             continue
         ax.axhline(0.0, color="#555555", linewidth=REFERENCE_LINEWIDTH, linestyle=":")
         ax.set_xscale("log")
-        ax.set_title(model["plot_title"])
+        ax.set_title(_four_model_title(model))
         ax.grid(axis="y", color="#D8D8D8", linewidth=GRID_LINEWIDTH)
         ax.xaxis.set_major_formatter(FuncFormatter(_budget_tick))
         ax.tick_params(axis="x", which="minor", bottom=False)
@@ -1520,8 +1561,13 @@ def _plot_reductions(
         any(ax.get_visible() for ax in axes[row, :]) for row in range(axes.shape[0])
     )
     if visible_row_count > 1:
-        _label_visible_grid(axes, xlabel="Budget $B$", ylabel="")
-        fig.supylabel("Mean Metric Reduction (%)", x=0.01)
+        _label_visible_grid(axes, xlabel="", ylabel="")
+        _hide_repeated_x_ticklabels(axes)
+        _set_shared_axis_labels(
+            fig,
+            xlabel="Budget $B$",
+            ylabel="Mean Metric Reduction (%)",
+        )
     else:
         _label_visible_grid(
             axes, xlabel="Budget $B$", ylabel="Mean Metric Reduction (%)"
@@ -1532,21 +1578,11 @@ def _plot_reductions(
         uniform_c_values=plotted_uniform_c,
     )
     legend_labels = [handle.get_label() for handle in legend_handles]
-    wrap_legend = len(legend_labels) > 4
     _finish_four_model_figure(
         fig,
         legend_handles,
         legend_labels,
-        legend_ncol=4 if wrap_legend else len(legend_labels),
-        layout=(
-            {
-                **FOUR_MODEL_LAYOUT,
-                "rect": (0.0, 0.0, 1.0, 0.84),
-                "h_pad": 2.4,
-            }
-            if wrap_legend
-            else FOUR_MODEL_LAYOUT
-        ),
+        legend_ncol=len(legend_labels),
     )
     _save_figure(
         fig,
@@ -1646,7 +1682,7 @@ def _plot_absolute_metrics(
 
         ax.set_xscale("log")
         ax.set_yscale("log")
-        ax.set_title(model["plot_title"])
+        ax.set_title(_four_model_title(model))
         ax.grid(axis="y", which="both", color="#D8D8D8", linewidth=GRID_LINEWIDTH)
         ax.xaxis.set_major_formatter(FuncFormatter(_budget_tick))
         ax.tick_params(axis="x", which="minor", bottom=False)
@@ -1664,8 +1700,19 @@ def _plot_absolute_metrics(
             stacklevel=2,
         )
         return False
-    _label_visible_grid(axes, xlabel="Budget $B$", ylabel="Mean Error Metric")
-    _finish_four_model_figure(fig, legend_handles, legend_labels)
+    _label_visible_grid(axes, xlabel="", ylabel="")
+    _hide_repeated_x_ticklabels(axes)
+    _set_shared_axis_labels(
+        fig,
+        xlabel="Budget $B$",
+        ylabel="Mean Error Metric",
+    )
+    _finish_four_model_figure(
+        fig,
+        legend_handles,
+        legend_labels,
+        layout={**FOUR_MODEL_LAYOUT, "w_pad": 1.8},
+    )
     _save_figure(
         fig,
         output_dir,
@@ -1865,7 +1912,7 @@ def _plot_allocations(
                 zorder=3,
             )
         ax.axhline(1.0, color="#555555", linewidth=REFERENCE_LINEWIDTH, linestyle=":")
-        ax.set_title(model["plot_title"].rsplit(" (", 1)[0])
+        ax.set_title(_four_model_title(model, include_metric=False))
         ax.set_xlim(0.0, 1.0)
         ax.set_yscale("log", base=2)
         ax.set_ylim(bottom=0.95)
@@ -1885,8 +1932,10 @@ def _plot_allocations(
             stacklevel=2,
         )
         return False
-    _label_visible_grid(
-        axes,
+    _label_visible_grid(axes, xlabel="", ylabel="")
+    _hide_repeated_x_ticklabels(axes)
+    _set_shared_axis_labels(
+        fig,
         xlabel="Elapsed fraction of trajectory",
         ylabel=r"Learned $R_i$",
     )
@@ -1897,7 +1946,12 @@ def _plot_allocations(
     )
     legend_handles = [handle for handle, _ in ordered_legend]
     legend_labels = [label for _, label in ordered_legend]
-    _finish_four_model_figure(fig, legend_handles, legend_labels)
+    _finish_four_model_figure(
+        fig,
+        legend_handles,
+        legend_labels,
+        layout={**FOUR_MODEL_LAYOUT, "w_pad": 1.4},
+    )
     _save_figure(
         fig,
         output_dir,

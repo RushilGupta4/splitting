@@ -5,23 +5,25 @@ SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
 BASE_DIRS=(outputs_paper_final)
-BASE_DIRS=(outputs_pf)
+# BASE_DIRS=(outputs_pf)
+# BASE_DIRS=(outputs_paper_final_2)
 
 CONFIGS=(
     "edm_default|edm_gmm2d|default|cuda:0|50000|1024|25"
-    "simple_ou|simple_ou|default|cuda:1|1000000|1024|25"
+    "simple_ou|simple_ou|default|cuda:0|1000000|1024|25"
     "coupled_double_well_langevin|coupled_double_well_langevin|default|cuda:0|1000000|1024|25"
 
     # "simple_ou_mmd|simple_ou|mmd|cuda:0|1000000|1024|25"
     # "coupled_double_well_langevin_mmd|coupled_double_well_langevin|mmd|cuda:1|1000000|1024|25"
-    # "ddpm_cifar10_hf_mmd|ddpm_cifar10_hf|mmd|cuda:1|5000|4096|1"
+    # "ddpm_cifar10_hf_mmd|ddpm_cifar10_hf|mmd|cuda:1|5000|1024|1"
 )
 N_PARALLEL=100
-N_RUNS=5000
-N_RUNS=500
+N_RUNS=2500
+# N_PARALLEL=1
+# N_RUNS=50
 CI_LEVEL=0.95
 DEBUG=0
-K=5
+K=1
 
 for base_dir in "${BASE_DIRS[@]}"
 do
