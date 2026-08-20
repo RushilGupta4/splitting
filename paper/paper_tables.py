@@ -25,8 +25,6 @@ RESULT_TABLE_STEMS = {
     "edm_default": "complete_edm",
     "ddpm_cifar10_hf_mmd": "complete_ddpm",
 }
-
-
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -403,14 +401,8 @@ def main() -> None:
 
     for model in MODELS:
         fieldnames, rows = _complete_result_rows(model, all_rows, debug=args.debug)
-        written.append(
-            _write_csv(
-                output_dir,
-                RESULT_TABLE_STEMS[model["directory"]],
-                fieldnames,
-                rows,
-            )
-        )
+        stem = RESULT_TABLE_STEMS[model["directory"]]
+        written.append(_write_csv(output_dir, stem, fieldnames, rows))
 
     print(
         f"Validated publication records; wrote {len(written)} CSV tables "

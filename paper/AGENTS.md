@@ -26,6 +26,6 @@ Tables are not imported automatically. Treat the generated CSVs as the source of
 - `ou_oracle_reductions.csv` -> `tab:ou-oracle-reductions`
 - `numerical_schedules.csv` and `reference_samples.csv` -> their corresponding setup tables
 
-For complete-result tables, arrange `reduction_percent` with split counts as rows and budgets as columns. Use the largest available budget whenever the manuscript displays only one budget. Keep the existing rounding style unless precision matters to a claim.
+For complete-result tables, copy the mean reduction and its two-sided 90% confidence interval into each cell. Arrange split counts as rows and budgets as columns. Use the largest available budget whenever the manuscript displays only one budget. Keep the existing rounding style unless precision matters to a claim.
 
 After updating a table or figure, also update its caption and nearby prose. Search `main.tex` for stale numbers, `TO BE UPDATED`, old budget claims, and descriptions that no longer match the CSV semantics—especially whether OU-oracle values are measured KS reductions or variance-proxy reductions. Preserve existing labels unless references are intentionally changed, then compile and visually inspect the PDF.

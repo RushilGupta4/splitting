@@ -26,18 +26,15 @@ import numpy as np
 from matplotlib.lines import Line2D
 from matplotlib.ticker import FuncFormatter
 
-# Two-sided 90% normal confidence interval: Phi^-1(0.95).
-Z_95 = 1.6448536269514722
-OUTPUT_SCALE = 1.5
+# A two-sided 90% interval leaves 5% in each tail, hence Phi^-1(0.95).
+Z_TWO_SIDED_90 = 1.6448536269514722
+FIGURE_DPI = 300
 
 # Shared styling for the three four-model, 2x2 publication figures.  Keeping
 # these values in one place prevents small visual differences between panels
 # that are intended to be read as a set.
-FOUR_MODEL_FIGSIZE = (64.0 / 9.0, 4.0)
-# Full-HD output for the standardized 16:9 figures.
-FOUR_MODEL_OUTPUT_WIDTH = 1_920
-FOUR_MODEL_DPI = FOUR_MODEL_OUTPUT_WIDTH / FOUR_MODEL_FIGSIZE[0]
-OU_ORACLE_DPI = 276.225
+FOUR_MODEL_FIGSIZE = (8.4, 4.0)
+# 2520x1200 output for the standardized 2.1:1 figures at 300 DPI.
 DATA_LINEWIDTH = 1.5
 REFERENCE_LINEWIDTH = 0.8
 GRID_LINEWIDTH = 0.55
@@ -306,7 +303,7 @@ class ResultRow:
     def mean_ci(self) -> tuple[float, float]:
         if self.n < 2 or not math.isfinite(self.std):
             return self.mean, self.mean
-        half = Z_95 * self.std / math.sqrt(self.n)
+        half = Z_TWO_SIDED_90 * self.std / math.sqrt(self.n)
         return self.mean - half, self.mean + half
 
 
@@ -1083,7 +1080,7 @@ def _normal_reduction(
     )
     if not math.isfinite(variance) or variance < 0.0:
         raise RuntimeError("Invalid delta-method variance for metric reduction")
-    half = Z_95 * math.sqrt(variance)
+    half = Z_TWO_SIDED_90 * math.sqrt(variance)
     return observed, observed - half, observed + half
 
 
@@ -1223,7 +1220,7 @@ def _save_figure(
 ) -> None:
     fig.savefig(
         output_dir / f"{stem}.png",
-        dpi=dpi if dpi is not None else round(240 * OUTPUT_SCALE),
+        dpi=dpi if dpi is not None else FIGURE_DPI,
         bbox_inches="tight" if tight else None,
         metadata={"Software": "paper_plots.py"},
     )
@@ -1403,7 +1400,7 @@ def _plot_splitting_diagram(output_dir: Path) -> None:
     ax.axis("off")
     fig.savefig(
         output_dir / "splitting_diagram.png",
-        dpi=128,
+        dpi=FIGURE_DPI,
         metadata={"Software": "paper_plots.py"},
     )
     plt.close(fig)
@@ -1592,7 +1589,7 @@ def _plot_reductions(
         output_dir,
         "experiment_metric_gain",
         tight=False,
-        dpi=FOUR_MODEL_DPI,
+        dpi=FIGURE_DPI,
     )
     return True
 
@@ -1721,7 +1718,7 @@ def _plot_absolute_metrics(
         output_dir,
         "experiment_metric_absolute",
         tight=False,
-        dpi=FOUR_MODEL_DPI,
+        dpi=FIGURE_DPI,
     )
     return True
 
@@ -1737,8 +1734,8 @@ def _allocation_curve(
     mean_at_splits = cumulative.mean(axis=0)
     if cumulative.shape[0] > 1:
         standard_error = cumulative.std(axis=0, ddof=1) / math.sqrt(cumulative.shape[0])
-        lower_at_splits = mean_at_splits - Z_95 * standard_error
-        upper_at_splits = mean_at_splits + Z_95 * standard_error
+        lower_at_splits = mean_at_splits - Z_TWO_SIDED_90 * standard_error
+        upper_at_splits = mean_at_splits + Z_TWO_SIDED_90 * standard_error
     else:
         lower_at_splits = mean_at_splits
         upper_at_splits = mean_at_splits
@@ -1846,7 +1843,7 @@ def _plot_ou_oracle_allocations(
         bbox_to_anchor=(0.5, 1.03),
     )
     fig.tight_layout(rect=(0, 0, 1, 0.88), w_pad=1.0)
-    _save_figure(fig, output_dir, "ou_oracle_allocations", dpi=OU_ORACLE_DPI)
+    _save_figure(fig, output_dir, "ou_oracle_allocations", dpi=FIGURE_DPI)
     return True
 
 
@@ -1960,7 +1957,7 @@ def _plot_allocations(
         output_dir,
         "experiment_allocations_four_models",
         tight=False,
-        dpi=FOUR_MODEL_DPI,
+        dpi=FIGURE_DPI,
     )
     return True
 
