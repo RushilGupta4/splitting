@@ -241,8 +241,8 @@ MODELS = (
         "plot_title": "CIFAR-10 DDPM (MMD)",
         "metric": "mmd",
         "n_runs": 50,
-        "num_queries": 4_096,
-        "k_max": 512,
+        "num_queries": 1_024,
+        "k_max": 64,
         "pilot_coefficient": 10.0,
         "pilot_exponent": 0.66,
         "budgets": (50_000, 100_000, 200_000, 500_000, 1_000_000),
@@ -1179,9 +1179,7 @@ def _four_model_style() -> None:
     )
 
 
-def _four_model_title(
-    model: dict[str, Any], *, include_metric: bool = True
-) -> str:
+def _four_model_title(model: dict[str, Any], *, include_metric: bool = True) -> str:
     """Return a concise panel title, optionally retaining the metric identifier."""
     title = {
         "simple_ou": "OU",
@@ -1223,9 +1221,7 @@ def _hide_repeated_x_ticklabels(axes: np.ndarray) -> None:
             ax.tick_params(axis="x", which="both", labelbottom=False)
 
 
-def _set_shared_axis_labels(
-    fig: plt.Figure, *, xlabel: str, ylabel: str
-) -> None:
+def _set_shared_axis_labels(fig: plt.Figure, *, xlabel: str, ylabel: str) -> None:
     """Place shared labels close to the axes without double-counting their margins."""
     x_label = fig.supxlabel(xlabel, x=0.52, y=0.025)
     y_label = fig.supylabel(ylabel, x=0.015, y=0.49)
@@ -1442,9 +1438,7 @@ def _reduction_legend_handles(
         if schedule in schedules
     ]
     if include_learned:
-        handles.append(
-            Line2D([], [], color="#555555", linewidth=1.15, label="Learned")
-        )
+        handles.append(Line2D([], [], color="#555555", linewidth=1.15, label="Learned"))
     handles.extend(
         Line2D(
             [],
