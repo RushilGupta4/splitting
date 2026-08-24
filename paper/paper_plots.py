@@ -8,6 +8,7 @@ import csv
 import json
 import math
 import os
+import sys
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,6 +17,10 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent.parent
 
 os.environ.setdefault("MPLCONFIGDIR", str(ROOT / ".mplconfig"))
+
+sys.path.insert(0, str(ROOT / "src"))
+
+from runners.common_configs import UNIFORM_C_BY_SPLIT_COUNT
 
 import matplotlib
 
@@ -64,12 +69,14 @@ SCHEDULE_COLORS = {
 }
 
 # Colour encodes the split count, dash pattern the allocation: learned stays solid.
-UNIFORM_C_BY_SPLIT_COUNT = {4: (1.1, 1.25, 1.5), 9: (1.1, 1.25), 19: (1.1,)}
 UNIFORM_C_LINESTYLES = {
     1.1: (0, (1, 1.2)),
+    1.15: (0, (1, 1.2, 3, 1.2)),
     1.25: (0, (4, 1.5)),
     1.5: (0, (6, 1.5, 1, 1.5)),
+    2.0: (0, (8, 1.5)),
 }
+UNIFORM_C_PLOTTED_PER_SPLIT = 2
 UNIFORM_C_VALUES = tuple(
     sorted({value for values in UNIFORM_C_BY_SPLIT_COUNT.values() for value in values})
 )
@@ -88,8 +95,8 @@ EXPECTED_MLP_PARAMS = {
     "device": "runner",
     "num_threads": 2,
 }
+# num_queries and k_max are per-model (see MODELS); the rest are sweep-wide.
 EXPECTED_QUERY_PARAMS = {
-    "k_max": 64,
     "mass_min": 0.05,
     "mass_max": 0.95,
 }
@@ -161,6 +168,7 @@ MODELS = (
         "metric": "ks",
         "n_runs": 2_500,
         "num_queries": 1_024,
+        "k_max": 64,
         "pilot_coefficient": 5.0,
         "pilot_exponent": 0.66,
         "budgets": (100_000, 200_000, 500_000, 1_000_000, 2_000_000, 5_000_000),
@@ -184,6 +192,7 @@ MODELS = (
         "metric": "ks",
         "n_runs": 2_500,
         "num_queries": 1_024,
+        "k_max": 64,
         "pilot_coefficient": 5.0,
         "pilot_exponent": 0.66,
         "budgets": (100_000, 200_000, 500_000, 1_000_000, 2_000_000, 5_000_000),
@@ -207,6 +216,7 @@ MODELS = (
         "metric": "ks",
         "n_runs": 2_500,
         "num_queries": 1_024,
+        "k_max": 64,
         "pilot_coefficient": 10.0,
         "pilot_exponent": 0.66,
         "budgets": (
@@ -231,7 +241,8 @@ MODELS = (
         "plot_title": "CIFAR-10 DDPM (MMD)",
         "metric": "mmd",
         "n_runs": 50,
-        "num_queries": 1_024,
+        "num_queries": 4_096,
+        "k_max": 512,
         "pilot_coefficient": 10.0,
         "pilot_exponent": 0.66,
         "budgets": (50_000, 100_000, 200_000, 500_000, 1_000_000),
@@ -363,6 +374,14 @@ def _expected_uniform_c(
     if model["directory"] not in UNIFORM_C_DIRECTORIES:
         return ()
     return UNIFORM_C_BY_SPLIT_COUNT[len(schedule)]
+
+
+def _plotted_uniform_c(
+    model: dict[str, Any], schedule: tuple[float, ...]
+) -> tuple[float, ...]:
+    """The largest few c; tables keep every value, panels would be unreadable."""
+    ordered = tuple(sorted(_expected_uniform_c(model, schedule)))
+    return ordered[-UNIFORM_C_PLOTTED_PER_SPLIT:]
 
 
 def _uniform_c_factor(
@@ -855,7 +874,11 @@ def _config_matches(row: ResultRow, config: dict[str, Any]) -> bool:
         and spec.get("optimization_mode") == row.optimizer
         and spec.get("reuse_phase1_samples") == row.reuse
         and key.get("query_params")
-        == {"num_queries": row.model["num_queries"], **EXPECTED_QUERY_PARAMS}
+        == {
+            "num_queries": row.model["num_queries"],
+            "k_max": row.model["k_max"],
+            **EXPECTED_QUERY_PARAMS,
+        }
         and key.get("crossfit_q_mlp_params") == EXPECTED_MLP_PARAMS
     )
 
@@ -1503,7 +1526,7 @@ def _plot_reductions(
                 panel_has_data = True
                 plotted_schedules.add(schedule)
                 plotted_learned = True
-            for c in _expected_uniform_c(model, schedule):
+            for c in _plotted_uniform_c(model, schedule):
                 uniform = [
                     (
                         budget,
@@ -1520,8 +1543,12 @@ def _plot_reductions(
                     continue
                 uniform_budgets = [budget for budget, _ in uniform]
                 uniform_observed = [value[0] for _, value in uniform]
+                # A constant-c baseline that is worse than independent paths on
+                # average carries no visual information; tables keep every row.
+                if float(np.mean(uniform_observed)) < 0.0:
+                    continue
                 interval_extrema.extend(uniform_observed)
-                # No band: nine curves per panel with bands would be unreadable.
+                # No band: several curves per panel with bands would be unreadable.
                 ax.plot(
                     uniform_budgets,
                     uniform_observed,

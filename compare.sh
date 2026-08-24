@@ -8,14 +8,15 @@ BASE_DIRS=(outputs_paper_final)
 # BASE_DIRS=(outputs_pf)
 # BASE_DIRS=(outputs_paper_final_2)
 
+# name|runner|config|device|reference_batch|num_queries|k_max|mlp_workers
 CONFIGS=(
-    "edm_default|edm_gmm2d|default|cuda:1|50000|1024|25"
-    "simple_ou|simple_ou|default|cuda:0|1000000|1024|25"
-    "coupled_double_well_langevin|coupled_double_well_langevin|default|cuda:0|1000000|1024|25"
+    # "edm_default|edm_gmm2d|default|cuda:1|50000|1024|64|25"
+    # "simple_ou|simple_ou|default|cuda:1|1000000|1024|64|25"
+    "coupled_double_well_langevin|coupled_double_well_langevin|default|cuda:1|1000000|1024|64|25"
 
-    # "simple_ou_mmd|simple_ou|mmd|cuda:0|1000000|1024|25"
-    # "coupled_double_well_langevin_mmd|coupled_double_well_langevin|mmd|cuda:1|1000000|1024|25"
-    # "ddpm_cifar10_hf_mmd|ddpm_cifar10_hf|mmd|cuda:1|5000|1024|1"
+    # "simple_ou_mmd|simple_ou|mmd|cuda:0|1000000|1024|64|25"
+    # "coupled_double_well_langevin_mmd|coupled_double_well_langevin|mmd|cuda:1|1000000|1024|64|25"
+    # "ddpm_cifar10_hf_mmd|ddpm_cifar10_hf|mmd|cuda:1|5000|4096|512|1"
 )
 N_PARALLEL=100
 N_RUNS=2500
@@ -30,7 +31,7 @@ do
     for config in "${CONFIGS[@]}"
     do
         (
-            IFS='|' read -r output_name runner config_name device reference_sample_batch_size num_queries mlp_workers <<< "$config"
+            IFS='|' read -r output_name runner config_name device reference_sample_batch_size num_queries k_max mlp_workers <<< "$config"
             output_dir="$base_dir/$output_name"
             mkdir -p "$output_dir"
             debug_flag=""
@@ -38,7 +39,7 @@ do
                 debug_flag="--debug"
             fi
             uv run python src/ensure_samples.py --runner "$runner" --config "$config_name" --batch_size "$reference_sample_batch_size" --device "$device" $debug_flag || exit 1
-            uv run python src/compare.py --runner "$runner" --config "$config_name" --output_dir "$output_dir" --device "$device" --n_parallel $N_PARALLEL --n_runs $N_RUNS --crossfit_q_folds "$K" --crossfit_q_num_queries "$num_queries" --crossfit_q_mlp_run_parallelism "$mlp_workers" $debug_flag || exit 1
+            uv run python src/compare.py --runner "$runner" --config "$config_name" --output_dir "$output_dir" --device "$device" --n_parallel $N_PARALLEL --n_runs $N_RUNS --crossfit_q_folds "$K" --crossfit_q_num_queries "$num_queries" --crossfit_q_k_max "$k_max" --crossfit_q_mlp_run_parallelism "$mlp_workers" $debug_flag || exit 1
             manifest="$output_dir/compare_outputs.json"
             while IFS= read -r csv; do
                 uv run python src/plots.py "$csv" --ci "$CI_LEVEL" || exit 1

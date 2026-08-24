@@ -6,7 +6,11 @@ OPTIMIZATION_MODES = ["monotone", "monotone_cvar95"]
 OPTIMIZATION_MODES = ["monotone"]
 
 # N_i = c everywhere. Cost grows like c^j, so dense schedules only admit c near 1.
-UNIFORM_C_BY_SPLIT_COUNT = {4: (1.1, 1.25, 1.5), 9: (1.1, 1.25), 19: (1.1,)}
+UNIFORM_C_BY_SPLIT_COUNT = {
+    4: (1.1, 1.15, 1.25, 1.5, 2.0),
+    9: (1.1, 1.15, 1.25, 1.5),
+    19: (1.1, 1.15),
+}
 
 
 def uniform_c_values(num_splits: int) -> tuple[float, ...]:

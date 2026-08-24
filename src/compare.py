@@ -109,6 +109,7 @@ def parse_args():
     parser.add_argument("--crossfit_q_folds", type=int, default=None)
     parser.add_argument("--crossfit_q_mlp_run_parallelism", type=int, default=None)
     parser.add_argument("--crossfit_q_num_queries", type=int, default=None)
+    parser.add_argument("--crossfit_q_k_max", type=int, default=None)
     parser.add_argument(
         "--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu"
     )
@@ -416,9 +417,12 @@ def _apply_overrides(cfg: dict, args):
         cfg["crossfit_q_mlp_run_parallelism"] = int(
             args.crossfit_q_mlp_run_parallelism
         )
-    if args.crossfit_q_num_queries is not None:
+    if args.crossfit_q_num_queries is not None or args.crossfit_q_k_max is not None:
         query_params = dict(cfg.get("query_params") or {})
-        query_params["num_queries"] = int(args.crossfit_q_num_queries)
+        if args.crossfit_q_num_queries is not None:
+            query_params["num_queries"] = int(args.crossfit_q_num_queries)
+        if args.crossfit_q_k_max is not None:
+            query_params["k_max"] = int(args.crossfit_q_k_max)
         cfg["query_params"] = query_params
     return cfg
 
