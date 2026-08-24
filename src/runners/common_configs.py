@@ -4,6 +4,7 @@ _BASE_SPLIT_SCHDULES = []
 SPLIT_COUNTS = [4, 9, 19]
 OPTIMIZATION_MODES = ["monotone", "monotone_cvar95"]
 OPTIMIZATION_MODES = ["monotone"]
+OPTIMIZATION_MODES_WITH_LEARNED_C = ["monotone", "learned_c"]
 
 # N_i = c everywhere. Cost grows like c^j, so dense schedules only admit c near 1.
 UNIFORM_C_BY_SPLIT_COUNT = {
@@ -52,6 +53,7 @@ def crossfit_q_config(
 
 __all__ = [
     "OPTIMIZATION_MODES",
+    "OPTIMIZATION_MODES_WITH_LEARNED_C",
     "SPLIT_COUNTS",
     "UNIFORM_C_BY_SPLIT_COUNT",
     "crossfit_q_config",

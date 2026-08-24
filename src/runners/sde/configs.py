@@ -7,7 +7,10 @@ reference-generation settings are standard across every SDE case and live here.
 
 from copy import deepcopy
 
-from runners.common_configs import OPTIMIZATION_MODES, split_schedules
+from runners.common_configs import (
+    OPTIMIZATION_MODES_WITH_LEARNED_C,
+    split_schedules,
+)
 
 SDE_SPLITS = split_schedules()
 
@@ -60,7 +63,7 @@ _SAMPLING_BASE = {
 
 _METADATA_BASE = {
     "split_percentages_list": [list(split) for split in SDE_SPLITS],
-    "optimization_modes": OPTIMIZATION_MODES,
+    "optimization_modes": OPTIMIZATION_MODES_WITH_LEARNED_C,
     "crossfit_q_mlp_losses": ["mse"],
     "num_base_samples": 2_500_000,
     "n_runs": 25,

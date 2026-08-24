@@ -1,5 +1,5 @@
 from runners.common_configs import (
-    OPTIMIZATION_MODES,
+    OPTIMIZATION_MODES_WITH_LEARNED_C,
     crossfit_q_config,
     split_schedules,
 )
@@ -75,7 +75,7 @@ _DEFAULT_CONFIG = {
         "method": "target_samples",
     },
     "split_percentages_list": split_schedules(),
-    "optimization_modes": OPTIMIZATION_MODES,
+    "optimization_modes": OPTIMIZATION_MODES_WITH_LEARNED_C,
     "crossfit_q_mlp_losses": ["mse"],
     "num_base_samples": 5_000_000,
     "n_runs": 50,

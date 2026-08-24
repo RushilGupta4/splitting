@@ -25,6 +25,7 @@ from runners.splitting import (
     normalize_max_sampling_batch_size,
     split_counts_by_run_batches,
 )
+from uniform_c import max_feasible_c, solve_uniform_c
 from metrics.utils import coerce_samples_np
 from trials import (
     PHASE2_SEED_OFFSET,
@@ -78,7 +79,7 @@ _FAST_FW_MAX_ITERS = 2_000
 _FAST_FW_LINE_SEARCH_ITERS = 6
 _QUERY_LABEL_MAX_TEMPORARY_BYTES = 512 * 1024 * 1024
 _MONOTONE_CVAR95_ALPHA = 0.95
-SUPPORTED_OPTIMIZATION_MODES = {"monotone", "monotone_cvar95"}
+SUPPORTED_OPTIMIZATION_MODES = {"monotone", "monotone_cvar95", "learned_c"}
 _INFEASIBLE_ALLOCATION_RETRY_SEED_OFFSET = 1 << 40
 
 
@@ -655,11 +656,16 @@ def _solve_optimal_split_factors(
     tau2: np.ndarray,
     cost_weights: Sequence[float],
     optimization_mode: str = "monotone",
+    c_max: float | None = None,
 ) -> List[float]:
     """Cost-optimal monotone split factors from the per-level variance grids.
 
     `monotone` minimises the worst query's `sum_l c_l M[q,l] / y_l`;
-    `monotone_cvar95` minimises the 95% CVaR over queries instead.
+    `monotone_cvar95` minimises the 95% CVaR over queries instead;
+    `learned_c` minimises the same worst-query objective restricted to one
+    branching factor repeated at every split, which is convex in `log c` (see
+    `uniform_c`).  That mode requires `c_max`, which `_solve_phase1_allocation`
+    derives from the phase-2 budget.
     """
     if optimization_mode not in SUPPORTED_OPTIMIZATION_MODES:
         raise ValueError(f"unknown optimization_mode '{optimization_mode}'")
@@ -683,6 +689,11 @@ def _solve_optimal_split_factors(
 
     M = np.maximum(variance2_per_level, 0.0).T.copy()
     M[:, 0] += np.maximum(tau2, 0.0)
+    if optimization_mode == "learned_c":
+        if c_max is None:
+            raise ValueError("learned_c requires c_max")
+        factor = float(solve_uniform_c(M, cost_w, c_min=1.0, c_max=float(c_max))["c"])
+        return [factor] * (num_levels - 1)
     if optimization_mode == "monotone":
         simplex = _solve_frank_wolfe_monotone_allocation(M, cost_w=cost_w)
     else:
@@ -1898,14 +1909,23 @@ def _solve_phase1_allocation(
         raise ValueError("segment costs must sum to a positive value")
     cost_weights = [c / total for c in seg_costs]
 
+    B2 = B - int(payload["used_B1"])
+    # One branching factor grows the path count like c^L, so the search needs a
+    # budget-aware ceiling; the free allocation is bounded by the monotone
+    # simplex instead and needs none.
+    c_max = (
+        max_feasible_c(runner, split_points, budget=B2)
+        if optimization_mode == "learned_c"
+        else None
+    )
     split_factors = _solve_optimal_split_factors(
         payload["variance2_per_level"],
         payload["tau2"],
         cost_weights,
         optimization_mode=optimization_mode,
+        c_max=c_max,
     )
     cost_per_root = runner.expected_cost_per_root(split_points, split_factors)
-    B2 = B - int(payload["used_B1"])
     n0 = max_floor_split_roots_for_budget(
         runner,
         split_points,

@@ -41,6 +41,10 @@ FIGURE_DPI = 300
 FOUR_MODEL_FIGSIZE = (8.4, 4.0)
 # 2520x1200 output for the standardized 2.1:1 figures at 300 DPI.
 DATA_LINEWIDTH = 1.5
+LEARNED_LINEWIDTH = 1.25
+LEARNED_C_LINEWIDTH = 1.15
+UNIFORM_C_LINEWIDTH = 1.05
+UNIFORM_C_ALPHA = 0.8
 REFERENCE_LINEWIDTH = 0.8
 GRID_LINEWIDTH = 0.55
 INTERVAL_ALPHA = 0.14
@@ -69,17 +73,16 @@ SCHEDULE_COLORS = {
 }
 
 # Colour encodes the split count, dash pattern the allocation: learned stays solid.
-UNIFORM_C_LINESTYLES = {
-    1.1: (0, (1, 1.2)),
-    1.15: (0, (1, 1.2, 3, 1.2)),
-    1.25: (0, (4, 1.5)),
-    1.5: (0, (6, 1.5, 1, 1.5)),
-    2.0: (0, (8, 1.5)),
-}
-UNIFORM_C_PLOTTED_PER_SPLIT = 2
-UNIFORM_C_VALUES = tuple(
-    sorted({value for values in UNIFORM_C_BY_SPLIT_COUNT.values() for value in values})
-)
+# The metric-gain panels carry one dash pattern per allocation family, not per c;
+# the tables keep every constant-c row.
+UNIFORM_C_LINESTYLE = (0, (2, 1.4))
+# The optimizer that restricts the allocation to a single branching factor.
+# Its rows share mode "adaptive" with the free-allocation rows, so every lookup
+# that wants one of them must say which.
+LEARNED_C_OPTIMIZER = "learned_c"
+LEARNED_C_LINESTYLE = (0, (5, 1.6))
+LEARNED_C_LABEL = r"Learned $c$"
+
 UNIFORM_C_DIRECTORIES = frozenset(
     {"simple_ou", "coupled_double_well_langevin", "edm_default"}
 )
@@ -300,6 +303,16 @@ class ResultRow:
         return self.mode == "adaptive"
 
     @property
+    def is_free_allocation(self) -> bool:
+        """Adaptive with L free monotone split factors (the default optimizer)."""
+        return self.mode == "adaptive" and self.optimizer == "monotone"
+
+    @property
+    def is_learned_c(self) -> bool:
+        """Adaptive restricted to one learned branching factor for every split."""
+        return self.mode == "adaptive" and self.optimizer == LEARNED_C_OPTIMIZER
+
+    @property
     def is_independent(self) -> bool:
         return self.mode == "fixed_N"
 
@@ -374,14 +387,6 @@ def _expected_uniform_c(
     if model["directory"] not in UNIFORM_C_DIRECTORIES:
         return ()
     return UNIFORM_C_BY_SPLIT_COUNT[len(schedule)]
-
-
-def _plotted_uniform_c(
-    model: dict[str, Any], schedule: tuple[float, ...]
-) -> tuple[float, ...]:
-    """The largest few c; tables keep every value, panels would be unreadable."""
-    ordered = tuple(sorted(_expected_uniform_c(model, schedule)))
-    return ordered[-UNIFORM_C_PLOTTED_PER_SPLIT:]
 
 
 def _uniform_c_factor(
@@ -510,9 +515,25 @@ def _load_manifest_rows(
             expected_steps = dict(zip(model["budgets"], model["steps"]))
             for budget in sorted(budgets):
                 group = [row for row in rows if row.budget == budget]
-                adaptive_rows = [row for row in group if row.is_adaptive]
+                adaptive_rows = [row for row in group if row.is_free_allocation]
+                learned_c_rows = [row for row in group if row.is_learned_c]
                 independent_rows = [row for row in group if row.is_independent]
-                if len(adaptive_rows) > 1 or len(independent_rows) > 1:
+                unknown_adaptive = [
+                    row
+                    for row in group
+                    if row.is_adaptive
+                    and not (row.is_free_allocation or row.is_learned_c)
+                ]
+                if unknown_adaptive:
+                    raise RuntimeError(
+                        f"Unexpected adaptive optimizer at B={budget}: "
+                        f"{sorted({row.optimizer for row in unknown_adaptive})}"
+                    )
+                if (
+                    len(adaptive_rows) > 1
+                    or len(learned_c_rows) > 1
+                    or len(independent_rows) > 1
+                ):
                     raise RuntimeError(f"Duplicate method row at B={budget}")
                 if not allow_partial_runs and (
                     len(adaptive_rows) != 1 or len(independent_rows) != 1
@@ -543,12 +564,10 @@ def _load_manifest_rows(
                 expected_rule = (
                     f"power:{model['pilot_coefficient']:g},{model['pilot_exponent']:g}"
                 )
-                if adaptive_rows:
-                    splitting = adaptive_rows[0]
+                for splitting in adaptive_rows + learned_c_rows:
                     if (
                         splitting.pilot_rule != expected_rule
                         or splitting.pilot_budget != expected_pilot
-                        or splitting.optimizer != "monotone"
                         or splitting.loss != "mse"
                         or splitting.reuse is not True
                     ):
@@ -1035,8 +1054,25 @@ def _load_and_verify_rows(
     return all_rows
 
 
-def _row_at_budget(rows: list[ResultRow], budget: int, mode: str) -> ResultRow | None:
-    matches = [row for row in rows if row.budget == budget and row.mode == mode]
+def _row_at_budget(
+    rows: list[ResultRow],
+    budget: int,
+    mode: str,
+    optimizer: str | None = None,
+) -> ResultRow | None:
+    """One row for a (budget, mode), optionally narrowed to one optimizer.
+
+    Adaptive rows share a mode across optimizers, so an "adaptive" lookup must
+    name the optimizer or it will see the free-allocation and learned-c rows as
+    duplicates.
+    """
+    matches = [
+        row
+        for row in rows
+        if row.budget == budget
+        and row.mode == mode
+        and (optimizer is None or row.optimizer == optimizer)
+    ]
     if len(matches) > 1:
         raise RuntimeError(f"Duplicate {mode} result at B={budget}")
     return matches[0] if matches else None
@@ -1110,7 +1146,11 @@ def _normal_reduction(
 def _compute_reductions(
     all_rows: dict[str, dict[tuple[float, ...], list[ResultRow]]],
 ) -> dict[tuple[str, tuple[float, ...], int, Any], tuple[float, float, float]]:
-    """Reductions against the shared fixed_N row, keyed by ``"learned"``/``("uniform", c)``."""
+    """Reductions against the shared fixed_N row.
+
+    Keyed by ``"learned"`` (free allocation), ``"learned_c"`` (one learned
+    branching factor) or ``("uniform", c)`` (a fixed factor).
+    """
     reductions: dict[
         tuple[str, tuple[float, ...], int, Any], tuple[float, float, float]
     ] = {}
@@ -1126,10 +1166,17 @@ def _compute_reductions(
                 if independent is None:
                     continue
                 key = (model["directory"], schedule, budget)
-                splitting = _row_at_budget(rows, budget, "adaptive")
+                splitting = _row_at_budget(rows, budget, "adaptive", "monotone")
                 if splitting is not None:
                     reductions[(*key, "learned")] = _normal_reduction(
                         independent, splitting
+                    )
+                learned_c = _row_at_budget(
+                    rows, budget, "adaptive", LEARNED_C_OPTIMIZER
+                )
+                if learned_c is not None:
+                    reductions[(*key, "learned_c")] = _normal_reduction(
+                        independent, learned_c
                     )
                 for c, row in _uniform_rows_at_budget(rows, budget).items():
                     reductions[(*key, ("uniform", c))] = _normal_reduction(
@@ -1429,28 +1476,47 @@ def _reduction_legend_handles(
     schedules: set[tuple[float, ...]],
     *,
     include_learned: bool,
-    uniform_c_values: set[float],
+    include_uniform_c: bool,
+    include_learned_c: bool = False,
 ) -> list[Line2D]:
     """Colour encodes the split count; dash pattern encodes the allocation."""
     handles = [
-        Line2D([], [], color=SCHEDULE_COLORS[schedule], linewidth=1.15, label=label)
+        Line2D(
+            [],
+            [],
+            color=SCHEDULE_COLORS[schedule],
+            linewidth=LEARNED_LINEWIDTH,
+            label=label,
+        )
         for schedule, label in SCHEDULES
         if schedule in schedules
     ]
     if include_learned:
-        handles.append(Line2D([], [], color="#555555", linewidth=1.15, label="Learned"))
-    handles.extend(
-        Line2D(
-            [],
-            [],
-            color="#555555",
-            linewidth=1.05,
-            linestyle=UNIFORM_C_LINESTYLES[c],
-            label=rf"$c={c:g}$",
+        handles.append(
+            Line2D([], [], color="#555555", linewidth=LEARNED_LINEWIDTH, label="Learned")
         )
-        for c in UNIFORM_C_VALUES
-        if c in uniform_c_values
-    )
+    if include_learned_c:
+        handles.append(
+            Line2D(
+                [],
+                [],
+                color="#555555",
+                linewidth=LEARNED_C_LINEWIDTH,
+                linestyle=LEARNED_C_LINESTYLE,
+                label=LEARNED_C_LABEL,
+            )
+        )
+    if include_uniform_c:
+        handles.append(
+            Line2D(
+                [],
+                [],
+                color="#555555",
+                linewidth=UNIFORM_C_LINEWIDTH,
+                linestyle=UNIFORM_C_LINESTYLE,
+                label=r"Uniform $c$",
+            )
+        )
     return handles
 
 
@@ -1465,8 +1531,9 @@ def _plot_reductions(
     fig, axes = plt.subplots(2, 2, figsize=FOUR_MODEL_FIGSIZE, sharey=True)
     interval_extrema: list[float] = []
     plotted_schedules: set[tuple[float, ...]] = set()
-    plotted_uniform_c: set[float] = set()
+    plotted_uniform_c = False
     plotted_learned = False
+    plotted_learned_c = False
 
     for ax, model in zip(axes.flat, MODELS):
         if model["directory"] not in all_rows:
@@ -1513,14 +1580,46 @@ def _plot_reductions(
                     observed,
                     color=SCHEDULE_COLORS[schedule],
                     linestyle="-",
-                    linewidth=1.15,
+                    linewidth=LEARNED_LINEWIDTH,
                     label=label,
-                    zorder=3,
+                    zorder=4,
                 )
                 panel_has_data = True
                 plotted_schedules.add(schedule)
                 plotted_learned = True
-            for c in _plotted_uniform_c(model, schedule):
+            learned_c = [
+                (
+                    budget,
+                    reductions.get(
+                        (model["directory"], schedule, budget, "learned_c")
+                    ),
+                )
+                for budget in candidate_budgets
+            ]
+            learned_c = [
+                (budget, value) for budget, value in learned_c if value is not None
+            ]
+            if learned_c:
+                learned_c_budgets = [budget for budget, _ in learned_c]
+                learned_c_values = np.asarray([value for _, value in learned_c])
+                observed = learned_c_values[:, 0]
+                # No band: the learned curve carries the uncertainty, tables the rest.
+                interval_extrema.extend(observed.tolist())
+                ax.plot(
+                    learned_c_budgets,
+                    observed,
+                    color=SCHEDULE_COLORS[schedule],
+                    linestyle=LEARNED_C_LINESTYLE,
+                    linewidth=LEARNED_C_LINEWIDTH,
+                    zorder=3,
+                )
+                panel_has_data = True
+                plotted_schedules.add(schedule)
+                plotted_learned_c = True
+            # One dotted curve per schedule: the strongest constant-c baseline, so
+            # the comparison against it is conservative.  Tables keep every c.
+            uniform_curves = []
+            for c in _expected_uniform_c(model, schedule):
                 uniform = [
                     (
                         budget,
@@ -1537,24 +1636,29 @@ def _plot_reductions(
                     continue
                 uniform_budgets = [budget for budget, _ in uniform]
                 uniform_observed = [value[0] for _, value in uniform]
+                uniform_curves.append(
+                    (float(np.mean(uniform_observed)), uniform_budgets, uniform_observed)
+                )
+            if uniform_curves:
+                mean_gain, uniform_budgets, uniform_observed = max(
+                    uniform_curves, key=lambda curve: curve[0]
+                )
                 # A constant-c baseline that is worse than independent paths on
                 # average carries no visual information; tables keep every row.
-                if float(np.mean(uniform_observed)) < 0.0:
-                    continue
-                interval_extrema.extend(uniform_observed)
-                # No band: several curves per panel with bands would be unreadable.
-                ax.plot(
-                    uniform_budgets,
-                    uniform_observed,
-                    color=SCHEDULE_COLORS[schedule],
-                    linestyle=UNIFORM_C_LINESTYLES[c],
-                    linewidth=1.05,
-                    alpha=0.8,
-                    zorder=2,
-                )
-                panel_has_data = True
-                plotted_schedules.add(schedule)
-                plotted_uniform_c.add(c)
+                if mean_gain >= 0.0:
+                    interval_extrema.extend(uniform_observed)
+                    ax.plot(
+                        uniform_budgets,
+                        uniform_observed,
+                        color=SCHEDULE_COLORS[schedule],
+                        linestyle=UNIFORM_C_LINESTYLE,
+                        linewidth=UNIFORM_C_LINEWIDTH,
+                        alpha=UNIFORM_C_ALPHA,
+                        zorder=2,
+                    )
+                    panel_has_data = True
+                    plotted_schedules.add(schedule)
+                    plotted_uniform_c = True
         if not panel_has_data:
             ax.set_visible(False)
             continue
@@ -1596,7 +1700,8 @@ def _plot_reductions(
     legend_handles = _reduction_legend_handles(
         plotted_schedules,
         include_learned=plotted_learned,
-        uniform_c_values=plotted_uniform_c,
+        include_uniform_c=plotted_uniform_c,
+        include_learned_c=plotted_learned_c,
     )
     legend_labels = [handle.get_label() for handle in legend_handles]
     _finish_four_model_figure(
@@ -1624,6 +1729,7 @@ def _plot_absolute_metrics(
     legend_handles: list[Any] = []
     legend_labels: list[str] = []
     plotted_any = False
+    plotted_learned_c = False
 
     for ax, model in zip(axes.flat, MODELS):
         if model["directory"] not in all_rows:
@@ -1665,7 +1771,7 @@ def _plot_absolute_metrics(
             if schedule not in rows_by_schedule:
                 continue
             splitting_rows = sorted(
-                (row for row in rows_by_schedule[schedule] if row.is_adaptive),
+                (row for row in rows_by_schedule[schedule] if row.is_free_allocation),
                 key=lambda row: row.budget,
             )
             if not splitting_rows:
@@ -1696,6 +1802,27 @@ def _plot_absolute_metrics(
             )
             panel_has_data = True
 
+            learned_c_rows = sorted(
+                (row for row in rows_by_schedule[schedule] if row.is_learned_c),
+                key=lambda row: row.budget,
+            )
+            if learned_c_rows:
+                learned_c_budgets = [row.budget for row in learned_c_rows]
+                learned_c_means = np.asarray([row.mean for row in learned_c_rows])
+                if np.any(learned_c_means <= 0.0):
+                    raise RuntimeError(
+                        "Absolute metric plot requires positive values"
+                    )
+                # No band: it would sit on top of the free-allocation band.
+                ax.plot(
+                    learned_c_budgets,
+                    learned_c_means,
+                    color=SCHEDULE_COLORS[schedule],
+                    linestyle=LEARNED_C_LINESTYLE,
+                    linewidth=DATA_LINEWIDTH,
+                )
+                plotted_learned_c = True
+
         if not panel_has_data:
             ax.set_visible(False)
             continue
@@ -1721,6 +1848,20 @@ def _plot_absolute_metrics(
             stacklevel=2,
         )
         return False
+    if plotted_learned_c:
+        # Colour already encodes the split count, so one neutral entry explains
+        # the dash pattern for every schedule.
+        legend_handles.append(
+            Line2D(
+                [],
+                [],
+                color="#555555",
+                linewidth=DATA_LINEWIDTH,
+                linestyle=LEARNED_C_LINESTYLE,
+                label=LEARNED_C_LABEL,
+            )
+        )
+        legend_labels.append(LEARNED_C_LABEL)
     _label_visible_grid(axes, xlabel="", ylabel="")
     _hide_repeated_x_ticklabels(axes)
     _set_shared_axis_labels(
@@ -1789,14 +1930,14 @@ def _plot_ou_oracle_allocations(
     for ax, (schedule, schedule_label) in zip(axes, SCHEDULES):
         rows = rows_by_schedule.get(schedule, [])
         oracle_rows = oracle_rows_by_schedule.get(schedule, [])
-        learned_budgets = {row.budget for row in rows if row.is_adaptive}
+        learned_budgets = {row.budget for row in rows if row.is_free_allocation}
         oracle_budgets = {row.budget for row in oracle_rows if row.is_oracle}
         common_budgets = learned_budgets & oracle_budgets
         if not common_budgets:
             ax.set_visible(False)
             continue
         display_budget = max(common_budgets)
-        splitting = _row_at_budget(rows, display_budget, "adaptive")
+        splitting = _row_at_budget(rows, display_budget, "adaptive", "monotone")
         oracle_row = _row_at_budget(oracle_rows, display_budget, "ou_oracle")
         assert splitting is not None and oracle_row is not None
         if splitting.split_factors is None:
@@ -1893,7 +2034,7 @@ def _plot_allocations(
             if schedule not in all_rows[model["directory"]]:
                 continue
             rows = all_rows[model["directory"]][schedule]
-            splitting_rows = [row for row in rows if row.is_adaptive]
+            splitting_rows = [row for row in rows if row.is_free_allocation]
             if not splitting_rows:
                 continue
             splitting = max(splitting_rows, key=lambda row: row.budget)

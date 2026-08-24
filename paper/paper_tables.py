@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from paper_plots import (
+    LEARNED_C_OPTIMIZER,
     MODELS,
     SCHEDULES,
     ResultRow,
@@ -16,6 +17,19 @@ from paper_plots import (
     _load_and_verify_rows,
     _normal_reduction,
 )
+
+LEARNED_C_ALLOCATION = "Learned c"
+
+
+def _has_learned_c(rows: list[ResultRow], budget: int) -> bool:
+    """Whether this cell has a single-branching-factor row to report.
+
+    The mode is opt-in per runner config, so sweeps without it keep exactly the
+    table columns they had before.
+    """
+    return any(
+        row.budget == budget and row.optimizer == LEARNED_C_OPTIMIZER for row in rows
+    )
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_OUTPUT_DIR = ROOT / "tables"
@@ -137,13 +151,21 @@ def _row_at_budget(
     *,
     mode: str,
     uniform_c: float | None = None,
+    optimizer: str | None = None,
 ) -> ResultRow | None:
+    """One row for a (budget, mode), optionally narrowed further.
+
+    Adaptive rows share a mode across optimizers -- the free monotone
+    allocation and the single learned branching factor -- so an "adaptive"
+    lookup must name the optimizer or it will see them as duplicates.
+    """
     matches = [
         row
         for row in rows
         if row.budget == budget
         and row.mode == mode
         and (uniform_c is None or row.uniform_c == uniform_c)
+        and (optimizer is None or row.optimizer == optimizer)
     ]
     if len(matches) > 1:
         raise RuntimeError(f"Duplicate {mode} result at B={budget}")
@@ -156,9 +178,12 @@ def _metric_reduction(
     *,
     mode: str,
     uniform_c: float | None = None,
+    optimizer: str | None = None,
 ) -> tuple[float, float, float] | None:
     independent = _row_at_budget(rows, budget, mode="fixed_N")
-    method = _row_at_budget(rows, budget, mode=mode, uniform_c=uniform_c)
+    method = _row_at_budget(
+        rows, budget, mode=mode, uniform_c=uniform_c, optimizer=optimizer
+    )
     if independent is None or method is None:
         return None
     return _normal_reduction(independent, method)
@@ -179,10 +204,11 @@ def _complete_result_rows(
         allocation: str,
         mode: str,
         uniform_c: float | None = None,
+        optimizer: str | None = None,
     ) -> dict[str, Any]:
         schedule_rows = rows_by_schedule.get(schedule, [])
         reduction = _metric_reduction(
-            schedule_rows, budget, mode=mode, uniform_c=uniform_c
+            schedule_rows, budget, mode=mode, uniform_c=uniform_c, optimizer=optimizer
         )
         if reduction is None:
             if not debug:
@@ -197,7 +223,11 @@ def _complete_result_rows(
             observed, lower, upper = reduction
             independent = _row_at_budget(schedule_rows, budget, mode="fixed_N")
             method = _row_at_budget(
-                schedule_rows, budget, mode=mode, uniform_c=uniform_c
+                schedule_rows,
+                budget,
+                mode=mode,
+                uniform_c=uniform_c,
+                optimizer=optimizer,
             )
             assert independent is not None and method is not None
             n_method = method.n
@@ -224,8 +254,25 @@ def _complete_result_rows(
         for budget in model["budgets"]:
             expected_keys.append((len(schedule), "Learned", budget))
             rows.append(
-                result_row(schedule, budget, allocation="Learned", mode="adaptive")
+                result_row(
+                    schedule,
+                    budget,
+                    allocation="Learned",
+                    mode="adaptive",
+                    optimizer="monotone",
+                )
             )
+            if _has_learned_c(rows_by_schedule.get(schedule, []), budget):
+                expected_keys.append((len(schedule), LEARNED_C_ALLOCATION, budget))
+                rows.append(
+                    result_row(
+                        schedule,
+                        budget,
+                        allocation=LEARNED_C_ALLOCATION,
+                        mode="adaptive",
+                        optimizer=LEARNED_C_OPTIMIZER,
+                    )
+                )
             for c in _expected_uniform_c(model, schedule):
                 allocation = f"Uniform (c={c:g})"
                 expected_keys.append((len(schedule), allocation, budget))
@@ -327,6 +374,7 @@ def _ou_oracle_rows(
             learned_rows,
             display_budget,
             mode="adaptive",
+            optimizer="monotone",
         )
         if debug:
             shared_fixed_mean = (
