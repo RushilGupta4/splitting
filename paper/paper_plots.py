@@ -10,6 +10,7 @@ import math
 import os
 import sys
 import warnings
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -29,7 +30,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.lines import Line2D
-from matplotlib.ticker import FuncFormatter
+from matplotlib.ticker import FuncFormatter, MultipleLocator
 
 # A two-sided 90% interval leaves 5% in each tail, hence Phi^-1(0.95).
 Z_TWO_SIDED_90 = 1.6448536269514722
@@ -38,8 +39,8 @@ FIGURE_DPI = 300
 # Shared styling for the three four-model, 2x2 publication figures.  Keeping
 # these values in one place prevents small visual differences between panels
 # that are intended to be read as a set.
-FOUR_MODEL_FIGSIZE = (8.4, 4.0)
-# 2520x1200 output for the standardized 2.1:1 figures at 300 DPI.
+FOUR_MODEL_FIGSIZE = (8.4, 8.4 / 1.8)
+# 2520x1400 output for the standardized 1.8:1 figures at 300 DPI.
 DATA_LINEWIDTH = 1.5
 LEARNED_LINEWIDTH = 1.25
 LEARNED_C_LINEWIDTH = 1.15
@@ -53,6 +54,10 @@ FOUR_MODEL_LAYOUT = {
     "h_pad": 0.5,
     "w_pad": 0.8,
 }
+# Pads are in font-size units, so matching a fractional change in panel spacing
+# takes a different bump per figure.
+GAIN_LAYOUT = {**FOUR_MODEL_LAYOUT, "h_pad": 0.76, "w_pad": 0.89}
+ALLOCATION_LAYOUT = {**FOUR_MODEL_LAYOUT, "h_pad": 0.67, "w_pad": 1.65}
 
 SINGLE_01 = (0.1,)
 SINGLE_02 = (0.2,)
@@ -1243,7 +1248,7 @@ def _four_model_style() -> None:
             "font.size": 9.5,
             "axes.titlesize": 10.0,
             "axes.labelsize": 9.5,
-            "xtick.labelsize": 8.5,
+            "xtick.labelsize": 7.5,
             "ytick.labelsize": 8.5,
             "legend.fontsize": 8.5,
         }
@@ -1281,15 +1286,41 @@ def _label_visible_grid(axes: np.ndarray, *, xlabel: str, ylabel: str) -> None:
 
 
 def _hide_repeated_x_ticklabels(axes: np.ndarray) -> None:
-    """Show x tick labels only on the lowest visible panel in each column."""
+    """Drop a panel's x tick labels only when the panel below repeats them.
+
+    Panels autoscale independently, so a column whose budgets differ from row
+    to row must keep every label; otherwise the lowest panel's ticks read as
+    the whole column's and understate the wider panels.
+    """
     for column in range(axes.shape[1]):
         visible = [
             axes[row, column]
             for row in range(axes.shape[0])
             if axes[row, column].get_visible()
         ]
-        for ax in visible[:-1]:
-            ax.tick_params(axis="x", which="both", labelbottom=False)
+        for ax, below in zip(visible, visible[1:]):
+            if _x_ticks_match(ax, below):
+                ax.tick_params(axis="x", which="both", labelbottom=False)
+
+
+def _x_ticks_match(first: plt.Axes, second: plt.Axes) -> bool:
+    return np.array_equal(
+        first.get_xticks(), second.get_xticks()
+    ) and np.allclose(first.get_xlim(), second.get_xlim())
+
+
+def _plotted_x_values(ax: plt.Axes) -> list[int]:
+    return sorted({int(round(x)) for line in ax.get_lines() for x in line.get_xdata()})
+
+
+def _set_budget_ticks(ax: plt.Axes, budgets: Iterable[int]) -> None:
+    """Tick every budget that was run, since log decades skip 200k/2M/5M."""
+    ticks = sorted(set(budgets))
+    if not ticks:
+        return
+    ax.set_xticks(ticks)
+    ax.set_xticks([], minor=True)
+    ax.xaxis.set_major_formatter(FuncFormatter(_budget_tick))
 
 
 def _set_shared_axis_labels(fig: plt.Figure, *, xlabel: str, ylabel: str) -> None:
@@ -1332,7 +1363,7 @@ def _finish_four_model_figure(
         loc="upper center",
         ncol=legend_ncol if legend_ncol is not None else len(legend_labels),
         frameon=False,
-        bbox_to_anchor=(0.5, 0.995),
+        bbox_to_anchor=(0.5, 0.990),
         columnspacing=1.4,
         handletextpad=0.5,
     )
@@ -1690,11 +1721,12 @@ def _plot_reductions(
         if not panel_has_data:
             ax.set_visible(False)
             continue
+        panel_budgets = _plotted_x_values(ax)
         ax.axhline(0.0, color="#555555", linewidth=REFERENCE_LINEWIDTH, linestyle=":")
         ax.set_xscale("log")
         ax.set_title(_four_model_title(model))
         ax.grid(axis="y", color="#D8D8D8", linewidth=GRID_LINEWIDTH)
-        ax.xaxis.set_major_formatter(FuncFormatter(_budget_tick))
+        _set_budget_ticks(ax, panel_budgets)
         ax.tick_params(axis="x", which="minor", bottom=False)
 
     if not interval_extrema:
@@ -1710,6 +1742,8 @@ def _plot_reductions(
     pad = 0.08 * max(high - low, 1.0)
     for ax in axes.flat:
         ax.set_ylim(math.floor(low - pad), math.ceil(high + pad))
+        # Shorter panels make the auto locator drop to two ticks.
+        ax.yaxis.set_major_locator(MultipleLocator(5))
     visible_row_count = sum(
         any(ax.get_visible() for ax in axes[row, :]) for row in range(axes.shape[0])
     )
@@ -1737,6 +1771,7 @@ def _plot_reductions(
         legend_handles,
         legend_labels,
         legend_ncol=len(legend_labels),
+        layout=GAIN_LAYOUT,
     )
     _save_figure(
         fig,
@@ -1834,11 +1869,12 @@ def _plot_absolute_metrics(
             continue
         plotted_any = True
 
+        panel_budgets = _plotted_x_values(ax)
         ax.set_xscale("log")
         ax.set_yscale("log")
         ax.set_title(_four_model_title(model))
         ax.grid(axis="y", which="both", color="#D8D8D8", linewidth=GRID_LINEWIDTH)
-        ax.xaxis.set_major_formatter(FuncFormatter(_budget_tick))
+        _set_budget_ticks(ax, panel_budgets)
         ax.tick_params(axis="x", which="minor", bottom=False)
         axis_handles, axis_labels = ax.get_legend_handles_labels()
         for handle, label in zip(axis_handles, axis_labels):
@@ -2104,7 +2140,7 @@ def _plot_allocations(
         fig,
         legend_handles,
         legend_labels,
-        layout={**FOUR_MODEL_LAYOUT, "w_pad": 1.4},
+        layout=ALLOCATION_LAYOUT,
     )
     _save_figure(
         fig,
