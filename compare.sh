@@ -4,17 +4,16 @@ set -u
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
-BASE_DIRS=(outputs_paper_final)
-# BASE_DIRS=(outputs_pf)
-# BASE_DIRS=(outputs_paper_final_2)
+# BASE_DIRS=(outputs_paper_final)
+BASE_DIRS=(outputs_paper_final_2)
 
 # name|runner|config|device|reference_batch|num_queries|k_max|mlp_workers
 CONFIGS=(
-    # "edm_default|edm_gmm2d|default|cuda:1|50000|1024|64|25"
-    # "simple_ou|simple_ou|default|cuda:1|1000000|1024|64|25"
-    "coupled_double_well_langevin|coupled_double_well_langevin|default|cuda:1|1000000|1024|64|25"
+    # "edm_default|edm_gmm2d|default|cuda:0|50000|1024|64|25"
+    "simple_ou|simple_ou|default|cuda:0|1000000|1024|64|25"
+    # "coupled_double_well_langevin|coupled_double_well_langevin|default|cuda:1|1000000|1024|64|25"
 
-    # "simple_ou_mmd|simple_ou|mmd|cuda:0|1000000|1024|64|25"
+    # "simple_ou_mmd|simple_ou|mmd|cuda:0|1000000|1024|64|25"/gao
     # "coupled_double_well_langevin_mmd|coupled_double_well_langevin|mmd|cuda:1|1000000|1024|64|25"
     # "ddpm_cifar10_hf_mmd|ddpm_cifar10_hf|mmd|cuda:1|5000|4096|512|1"
 )
@@ -71,6 +70,6 @@ wait
 #     if [ "$DEBUG" -eq 1 ]; then
 #         debug_flag="--debug"
 #     fi
-#     uv run python src/ensure_samples.py --runner ou_oracle --config default --batch_size 1000000 --device cuda:0 $debug_flag || exit 1
-#     uv run python src/compare.py --runner ou_oracle --config default --output_dir "$output_dir" --device cuda:0 --n_parallel $N_PARALLEL --n_runs $N_RUNS $debug_flag || exit 1
+#     uv run python src/ensure_samples.py --runner ou_oracle --config default --batch_size 1000000 --device cuda:1 $debug_flag || exit 1
+#     uv run python src/compare.py --runner ou_oracle --config default --output_dir "$output_dir" --device cuda:1 --n_parallel $N_PARALLEL --n_runs $N_RUNS $debug_flag || exit 1
 # done

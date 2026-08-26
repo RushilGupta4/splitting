@@ -130,30 +130,36 @@ def prepare_metric_states(
 
 
 def compute_trial_metrics(
-    samples_tensor: torch.Tensor,
+    parts,
     runner,
     *,
     comparison_mode: str,
     metric_states: Mapping[str, Any],
     metrics: Sequence[str],
-    phase1_x0_samples=None,
+    part_weights=None,
 ):
+    """Metrics of a weighted sample.
+
+    ``parts`` is a sequence of sample blocks (one per mixture component, plus
+    the reused phase-1 pilots when there are any) and ``part_weights`` their
+    mixture weights.  ``part_weights=None`` weights every observation equally.
+    """
     values: dict[str, float] = {}
     payloads: dict[str, Any] = {}
     if "ks" in metrics:
         values["ks"] = float(
             runner.compute_ks_distance(
-                samples_tensor,
+                parts,
                 comparison_mode=comparison_mode,
                 comparison_state=metric_states.get("ks"),
-                extra_samples=phase1_x0_samples,
+                part_weights=part_weights,
             )
         )
     if "mmd" in metrics:
         mmd_value, mmd_payload = _compute_mmd_metric(
-            samples_tensor,
+            parts,
             metric_states.get("mmd"),
-            phase1_x0_samples=phase1_x0_samples,
+            part_weights=part_weights,
         )
         values["mmd"] = mmd_value
         payloads["mmd"] = mmd_payload

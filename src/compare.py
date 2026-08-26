@@ -53,7 +53,7 @@ from utils import validate_split_percentages
 log = logging.getLogger("compare")
 
 _FILE_IDENTITY_CACHE: Dict[str, Dict[str, Any]] = {}
-_ADAPTIVE_IMPLEMENTATION_VERSION = 2
+_ADAPTIVE_IMPLEMENTATION_VERSION = 3
 
 TIMING_FIELDS = (
     "phase1_simulation_seconds",
@@ -77,6 +77,7 @@ CSV_FIELDS = [
     "crossfit_q_mlp_loss",
     "reuse",
     "optimizer",
+    "uniform_c",
     "solver",
     "solver_steps",
     "solver_params",
@@ -612,6 +613,7 @@ def _run_trial(
             N_i_list=oracle["split_factors"],
             result_mode="ou_oracle",
             include_allocation=True,
+            variances=runner.oracle_variances(split_percentages),
         )
     crossfit_q_mlp_params = dict(cfg.get("crossfit_q_mlp_params") or {})
     crossfit_q_mlp_params["loss"] = str(spec["crossfit_q_mlp_loss"])
@@ -1060,6 +1062,7 @@ def _aggregate_cached_runs(spec, trials, *, base_runner, split_percentages, cfg)
         "crossfit_q_mlp_loss": "",
         "reuse": "",
         "optimizer": "",
+        "uniform_c": "",
         "solver": solver,
         "solver_steps": int(solver_steps) if solver_steps != "" else "",
         "solver_params": solver_params,
@@ -1083,13 +1086,16 @@ def _aggregate_cached_runs(spec, trials, *, base_runner, split_percentages, cfg)
     if spec["mode"] == "fixed_N":
         return base
     if spec["mode"] == "uniform_c":
-        factors = [float(spec["uniform_c"])] * len(split_percentages)
+        # `uniform_c` is the requested constant; `N_i` is what the tree mixture
+        # actually realized around it, so the column means the same thing here as
+        # it does for the adaptive rows.
         return {
             **base,
             "n0": int(trials[0]["n0"]) if trials else "",
             "optimizer": "uniform",
-            "N_i": factors,
-            "N_i_std": [0.0] * len(factors),
+            "uniform_c": float(spec["uniform_c"]),
+            "N_i": mean_vector([t["N_i"] for t in trials]),
+            "N_i_std": std_vector([t["N_i"] for t in trials]),
         }
     if spec["mode"] == "ou_oracle":
         oracle = spec.get("oracle_definition") or runner.oracle_definition(

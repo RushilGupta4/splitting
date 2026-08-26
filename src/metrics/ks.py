@@ -204,6 +204,141 @@ def _exact_two_sample_lower_orthant_ks_from_state(
     )
 
 
+@njit(cache=True, nogil=True)
+def _weighted_segment_tree_update(
+    sums: np.ndarray,
+    max_prefix: np.ndarray,
+    min_prefix: np.ndarray,
+    size: int,
+    index: int,
+    delta: float,
+):
+    pos = size + index
+    sums[pos] += delta
+    max_prefix[pos] = max(0.0, sums[pos])
+    min_prefix[pos] = min(0.0, sums[pos])
+    pos //= 2
+    while pos >= 1:
+        left = pos * 2
+        right = left + 1
+        sums[pos] = sums[left] + sums[right]
+        max_prefix[pos] = max(max_prefix[left], sums[left] + max_prefix[right])
+        min_prefix[pos] = min(min_prefix[left], sums[left] + min_prefix[right])
+        pos //= 2
+
+
+@njit(cache=True, nogil=True)
+def _weighted_lower_orthant_ks_numba(
+    x_sorted: np.ndarray,
+    y_ranks: np.ndarray,
+    weights: np.ndarray,
+    n_y: int,
+) -> float:
+    """sup over lower orthants of a signed weighted measure summing to zero.
+
+    Float64 throughout: with millions of reference points the float32 tree of
+    the unweighted kernel loses several digits.
+    """
+    size = 1
+    while size < n_y:
+        size *= 2
+    tree_len = 2 * size
+    sums = np.zeros(tree_len, dtype=np.float64)
+    max_prefix = np.zeros(tree_len, dtype=np.float64)
+    min_prefix = np.zeros(tree_len, dtype=np.float64)
+
+    total = x_sorted.shape[0]
+    best = 0.0
+    i = 0
+    while i < total:
+        current = x_sorted[i]
+        while i < total and x_sorted[i] == current:
+            _weighted_segment_tree_update(
+                sums, max_prefix, min_prefix, size, y_ranks[i], weights[i]
+            )
+            i += 1
+        if max_prefix[1] > best:
+            best = max_prefix[1]
+        if -min_prefix[1] > best:
+            best = -min_prefix[1]
+    return best
+
+
+def _normalize_parts(parts, part_weights):
+    """Coerce to a list of 2-D arrays plus weights summing to one."""
+    if not isinstance(parts, (list, tuple)):
+        parts = [parts]
+    arrays = [coerce_samples_np(part) for part in parts]
+    if any(a.shape[0] == 0 for a in arrays):
+        raise ValueError("KS parts must be non-empty")
+    if part_weights is None:
+        counts = np.array([a.shape[0] for a in arrays], dtype=float)
+        weights = counts / counts.sum()
+    else:
+        weights = np.asarray(part_weights, dtype=float).reshape(-1)
+        if weights.shape[0] != len(arrays):
+            raise ValueError("part_weights must match the number of parts")
+        if np.any(weights < 0.0) or not math.isclose(
+            float(weights.sum()), 1.0, rel_tol=0.0, abs_tol=1e-9
+        ):
+            raise ValueError("part_weights must be nonnegative and sum to one")
+    return arrays, weights
+
+
+def _weighted_two_sample_ks_1d(parts, part_weights, reference_cdf_state):
+    arrays, weights = _normalize_parts(parts, part_weights)
+    values = np.concatenate([a[:, 0] for a in arrays])
+    sample_w = np.concatenate(
+        [np.full(a.shape[0], w / a.shape[0]) for a, w in zip(arrays, weights)]
+    )
+    reference = np.asarray(reference_cdf_state["x_sorted"], dtype=np.float64)
+    if reference.shape[0] == 0:
+        raise ValueError("Cannot compute KS distance against zero reference samples")
+    all_x = np.concatenate([values, reference])
+    all_w = np.concatenate(
+        [sample_w, np.full(reference.shape[0], -1.0 / reference.shape[0])]
+    )
+    order = np.argsort(all_x, kind="mergesort")
+    all_x, all_w = all_x[order], all_w[order]
+    cumulative = np.cumsum(all_w)
+    # only the last point of each tie group is a valid evaluation point
+    last = np.empty(all_x.shape[0], dtype=bool)
+    last[:-1] = all_x[1:] != all_x[:-1]
+    last[-1] = True
+    return float(np.max(np.abs(cumulative[last])))
+
+
+def _weighted_two_sample_lower_orthant_ks(parts, part_weights, reference_cdf_state):
+    arrays, weights = _normalize_parts(parts, part_weights)
+    samples = np.concatenate(arrays, axis=0).astype(np.float32)
+    sample_w = np.concatenate(
+        [np.full(a.shape[0], w / a.shape[0]) for a, w in zip(arrays, weights)]
+    )
+    ref_count = int(reference_cdf_state["count"])
+    if ref_count == 0:
+        raise ValueError("Cannot compute KS distance against zero reference samples")
+    ref_y_values = np.asarray(reference_cdf_state["y_values"], dtype=np.float32)
+    ref_x = np.asarray(reference_cdf_state["x_sorted"], dtype=np.float32)
+    union_y = np.unique(np.concatenate([samples[:, 1], ref_y_values]))
+    ref_ranks = np.searchsorted(union_y, ref_y_values).astype(np.int64)[
+        np.asarray(reference_cdf_state["y_ranks_sorted"], dtype=np.int64) - 1
+    ]
+    sample_ranks = np.searchsorted(union_y, samples[:, 1]).astype(np.int64)
+
+    all_x = np.concatenate([samples[:, 0], ref_x])
+    all_ranks = np.concatenate([sample_ranks, ref_ranks])
+    all_w = np.concatenate([sample_w, np.full(ref_count, -1.0 / ref_count)])
+    order = np.argsort(all_x, kind="mergesort")
+    return float(
+        _weighted_lower_orthant_ks_numba(
+            np.ascontiguousarray(all_x[order], dtype=np.float32),
+            np.ascontiguousarray(all_ranks[order], dtype=np.int64),
+            np.ascontiguousarray(all_w[order], dtype=np.float64),
+            int(union_y.shape[0]),
+        )
+    )
+
+
 def _normal_cdf_np(values: np.ndarray, *, mean: float, std: float) -> np.ndarray:
     if float(std) <= 0.0:
         raise ValueError("normal CDF std must be positive")
@@ -515,12 +650,22 @@ def warm_ks_kernel_for_mode(reference_mode: str, target_spec: Dict[str, Any]):
         )
 
 
+def _warm_weighted_kernel():
+    _weighted_lower_orthant_ks_numba(
+        np.zeros(2, dtype=np.float32),
+        np.zeros(2, dtype=np.int64),
+        np.array([1.0, -1.0], dtype=np.float64),
+        1,
+    )
+
+
 def warm_reference_ks_kernel(reference_cdf_state: Dict[str, Any]):
     dimension = int(reference_cdf_state.get("dimension", 2))
     if dimension > 2:
         raise ValueError(
             f"KS supports only dimensions 1 and 2; got reference dimension {dimension}"
         )
+    _warm_weighted_kernel()
     if dimension == 1:
         return
     sample_x = reference_cdf_state["x_sorted"][0]
@@ -533,14 +678,23 @@ def warm_reference_ks_kernel(reference_cdf_state: Dict[str, Any]):
     )
 
 
-def compute_reference_ks_distance(samples, reference_cdf_state: Dict[str, Any]):
-    """Compute KS distance against empirical reference samples."""
+def compute_reference_ks_distance(
+    parts, reference_cdf_state: Dict[str, Any], part_weights=None
+):
+    """KS distance of a weighted sample against empirical reference samples.
+
+    ``parts`` is a sequence of sample blocks and ``part_weights`` the mixture
+    weight of each; a bare array with ``part_weights=None`` is the ordinary
+    unweighted estimator.
+    """
     dimension = int(reference_cdf_state.get("dimension", 2))
     if dimension == 1:
-        ks_distance = _exact_two_sample_ks_1d_from_state(samples, reference_cdf_state)
+        ks_distance = _weighted_two_sample_ks_1d(
+            parts, part_weights, reference_cdf_state
+        )
     elif dimension == 2:
-        ks_distance = _exact_two_sample_lower_orthant_ks_from_state(
-            samples, reference_cdf_state
+        ks_distance = _weighted_two_sample_lower_orthant_ks(
+            parts, part_weights, reference_cdf_state
         )
     else:
         raise ValueError(
@@ -550,9 +704,16 @@ def compute_reference_ks_distance(samples, reference_cdf_state: Dict[str, Any]):
     return ks_distance, empty, empty
 
 
-def compute_target_ks_distance(samples, target_spec: Dict[str, Any]):
-    """Compute exact KS distance against the target CDF."""
-    samples_np = coerce_samples_np(samples)
+def compute_target_ks_distance(parts, target_spec: Dict[str, Any], part_weights=None):
+    """Exact KS distance against the target CDF (equal-weight samples only)."""
+    arrays, weights = _normalize_parts(parts, part_weights)
+    counts = np.array([a.shape[0] for a in arrays], dtype=float)
+    if not np.allclose(weights, counts / counts.sum(), rtol=0.0, atol=1e-12):
+        raise NotImplementedError(
+            "weighted KS against an analytic target is not implemented; "
+            "use a reference-sample comparison mode for mixture estimators"
+        )
+    samples_np = np.concatenate(arrays, axis=0)
     target_dim = int(target_spec.get("dimension", samples_np.shape[1]))
     if target_dim == 1:
         ks_distance = _exact_empirical_target_ks_1d(samples_np, target_spec)
@@ -567,17 +728,22 @@ def compute_target_ks_distance(samples, target_spec: Dict[str, Any]):
 
 
 def compute_ks_distance(
-    samples,
+    parts,
     target_spec: Dict[str, Any],
     reference_mode: str,
     reference_cdf_state: Dict[str, Any] | None,
+    part_weights=None,
 ):
     if reference_mode in {"true_samples", "ddpm_samples"}:
         if reference_cdf_state is None:
             raise ValueError(
                 f"reference_cdf_state is required when reference_mode='{reference_mode}'"
             )
-        return compute_reference_ks_distance(samples, reference_cdf_state)
+        return compute_reference_ks_distance(
+            parts, reference_cdf_state, part_weights=part_weights
+        )
     if reference_mode == "true_dist":
-        return compute_target_ks_distance(samples, target_spec)
+        return compute_target_ks_distance(
+            parts, target_spec, part_weights=part_weights
+        )
     raise ValueError(f"Unknown reference_mode '{reference_mode}'")

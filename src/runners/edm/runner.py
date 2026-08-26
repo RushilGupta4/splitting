@@ -805,15 +805,15 @@ class EDMRunner(BaseRunner):
 
     def compute_ks_distance(
         self,
-        samples,
+        parts,
         *,
         comparison_mode: str,
         comparison_state=None,
-        extra_samples=None,
+        part_weights=None,
     ) -> float:
         return super().compute_ks_distance(
-            samples,
+            parts,
             comparison_mode=comparison_mode,
             comparison_state=comparison_state,
-            extra_samples=extra_samples,
+            part_weights=part_weights,
         )

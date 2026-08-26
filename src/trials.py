@@ -26,24 +26,24 @@ def iter_run_chunks(n_runs: int, n_parallel: int):
 
 
 def build_sampling_trial_result(
-    samples,
+    parts,
     runner,
     comparison_mode: str,
     metric_states,
     metrics,
-    phase1_x0_samples=None,
+    part_weights=None,
 ):
-    samples_tensor = (
-        samples if isinstance(samples, torch.Tensor) else torch.as_tensor(samples)
-    )
+    if not isinstance(parts, (list, tuple)):
+        parts = [parts]
+    parts = [p if isinstance(p, torch.Tensor) else torch.as_tensor(p) for p in parts]
 
     metric_values, metric_payloads = compute_trial_metrics(
-        samples_tensor,
+        parts,
         runner,
         comparison_mode=comparison_mode,
         metric_states=metric_states,
         metrics=metrics,
-        phase1_x0_samples=phase1_x0_samples,
+        part_weights=part_weights,
     )
 
     result: Dict[str, Any] = {"metrics": metric_values}
@@ -64,11 +64,11 @@ def submit_sampling_trial_result_futures(
     metric_states,
     metrics,
     *,
-    phase1_x0_samples_by_run: Sequence | None = None,
+    weights_by_run: Sequence | None = None,
 ):
     run_indices = list(run_indices)
-    if phase1_x0_samples_by_run is None:
-        phase1_x0_samples_by_run = [None] * len(samples_by_run)
+    if weights_by_run is None:
+        weights_by_run = [None] * len(samples_by_run)
     if len(samples_by_run) != len(run_indices):
         raise ValueError("run_indices must match samples_by_run length")
     for local_idx, run_idx in enumerate(run_indices):
@@ -79,7 +79,7 @@ def submit_sampling_trial_result_futures(
             comparison_mode,
             metric_states,
             metrics,
-            phase1_x0_samples_by_run[local_idx],
+            weights_by_run[local_idx],
         )
         futures.append((int(run_idx), future))
 

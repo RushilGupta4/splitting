@@ -623,20 +623,23 @@ class BaseRunner(ABC):
 
     def compute_ks_distance(
         self,
-        samples,
+        parts,
         *,
         comparison_mode: str,
         comparison_state=None,
-        extra_samples=None,
+        part_weights=None,
     ) -> float:
-        """Compute default analytic or reference-backed KS distance."""
+        """KS distance of a weighted sample.
+
+        ``parts`` is a sequence of sample blocks with mixture weights
+        ``part_weights``; a bare array with no weights is the ordinary
+        equal-weight estimator.
+        """
         mode_spec = self.comparison_mode_spec(comparison_mode)
-        samples_np = coerce_samples_np(samples)
-        if extra_samples is not None:
-            extra_np = coerce_samples_np(extra_samples)
-            if extra_np.shape[0] > 0:
-                samples_np = np.concatenate([extra_np, samples_np], axis=0)
-        if samples_np.shape[0] == 0:
+        if not isinstance(parts, (list, tuple)):
+            parts = [parts]
+        parts = [p for p in parts if coerce_samples_np(p).shape[0] > 0]
+        if not parts:
             return float("nan")
         if mode_spec.requires_reference_cache:
             if comparison_state is None:
@@ -645,10 +648,10 @@ class BaseRunner(ABC):
                     f"comparison_mode={comparison_mode!r}"
                 )
             value, _, _ = compute_reference_ks_distance(
-                samples_np, comparison_state
+                parts, comparison_state, part_weights=part_weights
             )
         else:
             value, _, _ = compute_target_ks_distance(
-                samples_np, dict(self.target_spec)
+                parts, dict(self.target_spec), part_weights=part_weights
             )
         return float(value)

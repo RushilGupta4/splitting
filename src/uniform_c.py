@@ -243,8 +243,12 @@ def max_feasible_c(
     n0_min: int = DEFAULT_N0_MIN,
     c_cap: float = DEFAULT_C_CAP,
 ) -> float:
-    """Largest uniform ``c`` whose floor-split cost still buys ``n0_min`` roots."""
-    from runners.splitting import floor_split_sampling_cost
+    """Largest uniform ``c`` whose exact tree cost still buys ``n0_min`` roots.
+
+    This bounds the *relaxed* profile. A dyadic type can cost up to twice as
+    much, and ``trees.design_mixture`` falls back to the cheapest type if the
+    ceiling turns out to be optimistic.
+    """
 
     num_splits = len(list(split_points))
     if num_splits == 0:
@@ -252,11 +256,13 @@ def max_feasible_c(
     budget = int(budget)
     n0_min = max(1, int(n0_min))
 
+    seg_costs = runner.segment_costs(split_points)
+
     def fits(c: float) -> bool:
-        return (
-            floor_split_sampling_cost(runner, split_points, [c] * num_splits, n0_min)
-            <= budget
+        cost = sum(
+            float(seg) * (c ** level) for level, seg in enumerate(seg_costs)
         )
+        return n0_min * cost <= budget
 
     if not fits(1.0):
         return 1.0

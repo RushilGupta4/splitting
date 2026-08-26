@@ -282,7 +282,28 @@ def _mmd_orthogonal_frequencies(
 def _mmd_feature_means(
     sample_parts: Sequence[torch.Tensor],
     state: Mapping[str, Any],
+    part_weights: Sequence[float] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Feature means of the sample.
+
+    With ``part_weights`` the parts are combined as a convex combination of
+    their individual means, which is what a mixture estimator needs; without
+    them every observation carries the same weight.
+    """
+    if part_weights is not None:
+        weights = [float(w) for w in part_weights]
+        if len(weights) != len(sample_parts):
+            raise ValueError("part_weights must match the number of parts")
+        frequency_count = int(state["frequencies"].shape[1])
+        cosine = torch.zeros(frequency_count, dtype=torch.float64)
+        sine = torch.zeros(frequency_count, dtype=torch.float64)
+        total = 0
+        for part, weight in zip(sample_parts, weights):
+            part_cos, part_sin, count = _mmd_feature_means([part], state)
+            cosine.add_(part_cos * weight)
+            sine.add_(part_sin * weight)
+            total += count
+        return cosine, sine, total
     frequency_count = int(state["frequencies"].shape[1])
     cosine_sum = torch.zeros(frequency_count, dtype=torch.float64)
     sine_sum = torch.zeros(frequency_count, dtype=torch.float64)
@@ -388,25 +409,18 @@ def _prepare_mmd_state(
     return state
 
 
-def _compute_mmd_metric(samples, state, *, phase1_x0_samples=None):
+def _compute_mmd_metric(parts, state, *, part_weights=None):
     if state is None:
         raise ValueError("mmd metric state is required")
     started = time.perf_counter()
     dimension = int(state["dimension"])
-    generated = _samples_to_mmd_coordinates(
-        samples,
-        expected_dimension=dimension,
-    )
-    sample_parts = []
-    if phase1_x0_samples is not None:
-        phase1 = _samples_to_mmd_coordinates(
-            phase1_x0_samples,
-            expected_dimension=dimension,
-        )
-        if int(phase1.shape[0]) > 0:
-            sample_parts.append(phase1)
-    if int(generated.shape[0]) > 0:
-        sample_parts.append(generated)
+    if not isinstance(parts, (list, tuple)):
+        parts = [parts]
+    sample_parts = [
+        _samples_to_mmd_coordinates(part, expected_dimension=dimension)
+        for part in parts
+    ]
+    sample_parts = [part for part in sample_parts if int(part.shape[0]) > 0]
     count = sum(int(part.shape[0]) for part in sample_parts)
     payload = {
         "n_samples": int(count),
@@ -429,7 +443,9 @@ def _compute_mmd_metric(samples, state, *, phase1_x0_samples=None):
         return float("nan"), payload
 
     with state["lock"], torch.inference_mode():
-        cosine_mean, sine_mean, measured_count = _mmd_feature_means(sample_parts, state)
+        cosine_mean, sine_mean, measured_count = _mmd_feature_means(
+            sample_parts, state, part_weights=part_weights
+        )
     if measured_count != count:
         raise RuntimeError("mmd generated feature count mismatch")
     cosine_delta = cosine_mean - state["reference_cosine_mean"]

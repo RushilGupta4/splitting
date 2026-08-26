@@ -1,5 +1,5 @@
 from runners.common_configs import (
-    OPTIMIZATION_MODES,
+    OPTIMIZATION_MODES_WITH_LEARNED_C,
     crossfit_q_config,
     split_schedules,
 )
@@ -60,7 +60,7 @@ _METADATA_DEFAULTS = {
         "mmd": _MMD_METRIC_PARAMS,
     },
     "split_percentages_list": _SPLITS,
-    "optimization_modes": OPTIMIZATION_MODES,
+    "optimization_modes": OPTIMIZATION_MODES_WITH_LEARNED_C,
     "crossfit_q_mlp_losses": ["mse"],
     "num_base_samples": _MODEL_REFERENCE_SAMPLE_COUNT,
     "max_sampling_batch_size": 2500,

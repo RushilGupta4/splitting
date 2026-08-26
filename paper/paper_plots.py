@@ -20,7 +20,7 @@ os.environ.setdefault("MPLCONFIGDIR", str(ROOT / ".mplconfig"))
 
 sys.path.insert(0, str(ROOT / "src"))
 
-from runners.common_configs import UNIFORM_C_BY_SPLIT_COUNT
+from runners.common_configs import UNIFORM_C_BY_SPLIT_COUNT, split_schedules
 
 import matplotlib
 
@@ -54,22 +54,23 @@ FOUR_MODEL_LAYOUT = {
     "w_pad": 0.8,
 }
 
-FOUR = (0.8, 0.6, 0.4, 0.2)
-NINE = (0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1)
 SINGLE_01 = (0.1,)
 SINGLE_02 = (0.2,)
-NINETEEN = tuple(round(value / 20, 2) for value in range(19, 0, -1))
+# Taken from the sweep configuration rather than restated: the schedules are
+# rounded to two decimals, and half-to-even ties there do not agree with plain
+# round(), so a hand-written copy silently stops matching the CSV stems.
+NINE, NINETEEN, THIRTY_NINE = (tuple(s) for s in split_schedules())
 SCHEDULES = (
-    (FOUR, "4 splits"),
     (NINE, "9 splits"),
     (NINETEEN, "19 splits"),
+    (THIRTY_NINE, "39 splits"),
 )
 SCHEDULE_COLORS = {
     SINGLE_01: "#009E73",
     SINGLE_02: "#CC79A7",
-    FOUR: "#0072B2",
     NINE: "#D55E00",
     NINETEEN: "#228833",
+    THIRTY_NINE: "#0072B2",
 }
 
 # Colour encodes the split count, dash pattern the allocation: learned stays solid.
@@ -244,8 +245,8 @@ MODELS = (
         "plot_title": "CIFAR-10 DDPM (MMD)",
         "metric": "mmd",
         "n_runs": 50,
-        "num_queries": 1_024,
-        "k_max": 64,
+        "num_queries": 4_096,
+        "k_max": 512,
         "pilot_coefficient": 10.0,
         "pilot_exponent": 0.66,
         "budgets": (50_000, 100_000, 200_000, 500_000, 1_000_000),
@@ -377,7 +378,7 @@ def _schedule_from_filename(path: Path) -> tuple[float, ...]:
     except KeyError as exc:
         raise ValueError(
             f"Unexpected split schedule in {path.name}; expected one of the "
-            "configured one-, four-, nine-, or nineteen-split schedules"
+            "configured one-, nine-, nineteen-, or thirty-nine-split schedules"
         ) from exc
 
 
@@ -392,19 +393,48 @@ def _expected_uniform_c(
 def _uniform_c_factor(
     raw: dict[str, str], schedule: tuple[float, ...], csv_path: Path
 ) -> float:
-    """Recover c from a constant-allocation row; N_i is exactly [c] * len(schedule)."""
+    """Read the requested constant c from a constant-allocation row.
+
+    `N_i` holds what the tree mixture realized, which brackets c rather than
+    equalling it, so c is carried in its own column.
+    """
     factors = [float(value) for value in raw["N_i"].split(",")]
     factor_stds = [float(value) for value in raw["N_i_std"].split(",")]
     if (
         len(factors) != len(schedule)
         or len(factor_stds) != len(schedule)
-        or any(abs(value - factors[0]) > 1e-9 for value in factors)
-        or any(value != 0.0 for value in factor_stds)
         or raw["optimizer"] != "uniform"
+        or not raw.get("uniform_c")
         or int(raw["n0"]) < 1
     ):
         raise RuntimeError(f"Invalid uniform_c row in {csv_path}")
-    return factors[0]
+    return float(raw["uniform_c"])
+
+
+def _check_uniform_c_bracket(row: ResultRow) -> None:
+    """A uniform-c run must land inside the coherent-rounding bracket of c^i.
+
+    The request c is relaxed; what runs is a mixture of exact integer trees whose
+    cumulative profiles satisfy r/2 < R <= 2r level by level, so the realized mean
+    profile inherits that bracket. The per-level factors do not -- they range over
+    roughly 0.55c to 1.82c -- which is why the check is on the profile.
+    """
+    factors = np.asarray(row.split_factors, dtype=float)
+    if np.any(factors < 1.0 - 1e-9):
+        raise RuntimeError(
+            f"uniform_c N_i below one for {row.csv_path.name}, B={row.budget}"
+        )
+    profile = np.concatenate(
+        ([1.0], np.cumprod(factors.mean(axis=0) if factors.ndim == 2 else factors))
+    )
+    target = float(row.uniform_c) ** np.arange(profile.size)
+    ratio = profile / target
+    if np.any(ratio <= 0.5 - 1e-9) or np.any(ratio > 2.0 + 1e-9):
+        raise RuntimeError(
+            f"uniform_c profile outside the (c/2, 2c] rounding bracket for "
+            f"{row.csv_path.name}, B={row.budget}: R_i / c^i in "
+            f"[{ratio.min():.4f}, {ratio.max():.4f}]"
+        )
 
 
 def _resolved_pilot_budget(model: dict[str, Any], budget: int) -> int:
@@ -980,13 +1010,7 @@ def _attach_and_verify_caches(
                 if row.is_uniform_c:
                     if row.split_factors is None:
                         raise RuntimeError("uniform_c cache is missing N_i")
-                    if not np.allclose(
-                        row.split_factors, row.uniform_c, rtol=0.0, atol=1e-9
-                    ):
-                        raise RuntimeError(
-                            f"uniform_c N_i mismatch for {row.csv_path.name}, "
-                            f"B={row.budget}"
-                        )
+                    _check_uniform_c_bracket(row)
                 if row.is_adaptive:
                     if row.split_factors is None:
                         raise RuntimeError("Adaptive cache is missing N_i")
@@ -1493,7 +1517,9 @@ def _reduction_legend_handles(
     ]
     if include_learned:
         handles.append(
-            Line2D([], [], color="#555555", linewidth=LEARNED_LINEWIDTH, label="Learned")
+            Line2D(
+                [], [], color="#555555", linewidth=LEARNED_LINEWIDTH, label="Learned"
+            )
         )
     if include_learned_c:
         handles.append(
@@ -1590,9 +1616,7 @@ def _plot_reductions(
             learned_c = [
                 (
                     budget,
-                    reductions.get(
-                        (model["directory"], schedule, budget, "learned_c")
-                    ),
+                    reductions.get((model["directory"], schedule, budget, "learned_c")),
                 )
                 for budget in candidate_budgets
             ]
@@ -1637,7 +1661,11 @@ def _plot_reductions(
                 uniform_budgets = [budget for budget, _ in uniform]
                 uniform_observed = [value[0] for _, value in uniform]
                 uniform_curves.append(
-                    (float(np.mean(uniform_observed)), uniform_budgets, uniform_observed)
+                    (
+                        float(np.mean(uniform_observed)),
+                        uniform_budgets,
+                        uniform_observed,
+                    )
                 )
             if uniform_curves:
                 mean_gain, uniform_budgets, uniform_observed = max(
@@ -1729,7 +1757,6 @@ def _plot_absolute_metrics(
     legend_handles: list[Any] = []
     legend_labels: list[str] = []
     plotted_any = False
-    plotted_learned_c = False
 
     for ax, model in zip(axes.flat, MODELS):
         if model["directory"] not in all_rows:
@@ -1802,27 +1829,6 @@ def _plot_absolute_metrics(
             )
             panel_has_data = True
 
-            learned_c_rows = sorted(
-                (row for row in rows_by_schedule[schedule] if row.is_learned_c),
-                key=lambda row: row.budget,
-            )
-            if learned_c_rows:
-                learned_c_budgets = [row.budget for row in learned_c_rows]
-                learned_c_means = np.asarray([row.mean for row in learned_c_rows])
-                if np.any(learned_c_means <= 0.0):
-                    raise RuntimeError(
-                        "Absolute metric plot requires positive values"
-                    )
-                # No band: it would sit on top of the free-allocation band.
-                ax.plot(
-                    learned_c_budgets,
-                    learned_c_means,
-                    color=SCHEDULE_COLORS[schedule],
-                    linestyle=LEARNED_C_LINESTYLE,
-                    linewidth=DATA_LINEWIDTH,
-                )
-                plotted_learned_c = True
-
         if not panel_has_data:
             ax.set_visible(False)
             continue
@@ -1848,20 +1854,6 @@ def _plot_absolute_metrics(
             stacklevel=2,
         )
         return False
-    if plotted_learned_c:
-        # Colour already encodes the split count, so one neutral entry explains
-        # the dash pattern for every schedule.
-        legend_handles.append(
-            Line2D(
-                [],
-                [],
-                color="#555555",
-                linewidth=DATA_LINEWIDTH,
-                linestyle=LEARNED_C_LINESTYLE,
-                label=LEARNED_C_LABEL,
-            )
-        )
-        legend_labels.append(LEARNED_C_LABEL)
     _label_visible_grid(axes, xlabel="", ylabel="")
     _hide_repeated_x_ticklabels(axes)
     _set_shared_axis_labels(

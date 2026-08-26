@@ -1,16 +1,15 @@
 import numpy as np
 
 _BASE_SPLIT_SCHDULES = []
-SPLIT_COUNTS = [4, 9, 19]
-OPTIMIZATION_MODES = ["monotone", "monotone_cvar95"]
-OPTIMIZATION_MODES = ["monotone"]
-OPTIMIZATION_MODES_WITH_LEARNED_C = ["monotone", "learned_c"]
+SPLIT_COUNTS = [9, 19, 39]
+OPTIMIZATION_MODES = ["monotone"]  # monotone_cvar95 is also option
+OPTIMIZATION_MODES_WITH_LEARNED_C = ["monotone", "learned_c"]  # what we sweep
 
-# N_i = c everywhere. Cost grows like c^j, so dense schedules only admit c near 1.
+# N_i = c everywhere
 UNIFORM_C_BY_SPLIT_COUNT = {
-    4: (1.1, 1.15, 1.25, 1.5, 2.0),
     9: (1.1, 1.15, 1.25, 1.5),
-    19: (1.1, 1.15),
+    19: (1.1, 1.15, 1.2),
+    39: (1.05, 1.1),
 }
 
 

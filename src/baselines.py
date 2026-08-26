@@ -4,7 +4,8 @@ from typing import Any, Callable, Mapping, Sequence
 
 from tqdm import tqdm
 
-from runners.splitting import max_floor_split_roots_for_budget
+from runners.splitting import run_mixture_batch
+from runners.trees import design_cost, design_mixture, mean_split_factors
 from trials import (
     PHASE2_SEED_OFFSET,
     collect_sampling_trial_result_futures,
@@ -28,8 +29,14 @@ def _run_phase2_loop(
     n_parallel: int,
     seed: int | None,
     run_offset: int,
+    weights=None,
 ):
-    """Run n_runs Phase-2 trials. sample_batch_fn(chunk_size, generator) -> samples_by_run."""
+    """Run n_runs Phase-2 trials.
+
+    ``sample_batch_fn(chunk_size, generator)`` returns, per run, the list of
+    sample blocks making up that run's estimator; ``weights`` are their mixture
+    weights (``None`` means equal weight per observation).
+    """
     trial_results: list = [None] * n_runs
     workers = max(1, min(int(n_parallel), n_runs))
     futures: list = []
@@ -55,6 +62,7 @@ def _run_phase2_loop(
                 comparison_mode=comparison_mode,
                 metric_states=metric_states,
                 metrics=metrics,
+                weights_by_run=[weights] * len(samples_by_run),
             )
         collect_sampling_trial_result_futures(trial_results, futures)
     return trial_results
@@ -96,7 +104,7 @@ def run_solver_baseline_sampling(
             max_sampling_batch_size=max_sampling_batch_size,
             **solver_kwargs,
         )
-        return samples
+        return [[sample] for sample in samples]
 
     trial_results = _run_phase2_loop(
         sample_batch,
@@ -135,44 +143,56 @@ def run_fixed_N_sampling(
     run_offset: int = 0,
     return_trial_results: bool = False,
     max_sampling_batch_size=None,
+    max_paths_in_flight=None,
     result_mode: str = "fixed_N",
     include_allocation: bool = False,
+    variances=None,
 ):
     if split_percentages:
         _, split_points = runner.resolve_split_percentages(split_percentages)
     else:
         split_points = []
     split_factors = [float(x) for x in N_i_list]
-    cost_per_root = (
-        runner.expected_cost_per_root(split_points, split_factors)
-        if split_points
-        else runner.segment_cost(runner.start_time, runner.end_time)
-    )
-    n0 = (
-        max_floor_split_roots_for_budget(
-            runner,
-            split_points,
+    design = None
+    if split_points:
+        # `variances` decides the weighting: the OU oracle supplies its analytic
+        # per-query matrix and gets the minimax LP; uniform_c has no variance
+        # information and falls back to the coherent-shift interval weights.
+        design = design_mixture(
             split_factors,
-            budget=int(B),
-            expected_cost_per_root=cost_per_root,
+            runner.segment_costs(split_points),
+            int(B),
+            variances=variances,
         )
-        if split_points
-        else int(B // cost_per_root)
-    )
-    if n0 < 1:
-        raise ValueError(
-            f"Budget B={B} is too small; expected cost per root is {cost_per_root:.6f}"
-        )
+        n0 = sum(tree.roots for tree in design)
+    else:
+        full_cost = runner.segment_cost(runner.start_time, runner.end_time)
+        n0 = int(B // full_cost)
+        if n0 < 1:
+            raise ValueError(
+                f"Budget B={B} is too small; one path costs {full_cost:.6f}"
+            )
 
     def sample_batch(chunk_size, generator):
-        samples, _, _ = runner.run_split_batch(
-            n0_by_run=[n0] * chunk_size,
+        if design is None:
+            samples, _, _ = runner.run_split_batch(
+                n0_by_run=[n0] * chunk_size,
+                split_points=[],
+                split_factors_by_run=[[] for _ in range(chunk_size)],
+                generator=generator,
+                max_sampling_batch_size=max_sampling_batch_size,
+            )
+            return [[sample] for sample in samples]
+        return run_mixture_batch(
+            runner,
+            designs_by_run=[design] * chunk_size,
             split_points=split_points,
-            split_factors_by_run=[split_factors] * chunk_size,
             generator=generator,
             max_sampling_batch_size=max_sampling_batch_size,
+            max_paths_in_flight=max_paths_in_flight,
         )
-        return samples
+
+    weights = None if design is None else [tree.weight for tree in design]
 
     trial_results = _run_phase2_loop(
         sample_batch,
@@ -184,10 +204,12 @@ def run_fixed_N_sampling(
         n_parallel=n_parallel,
         seed=seed,
         run_offset=run_offset,
+        weights=weights,
     )
     if include_allocation:
+        realized = mean_split_factors(design) if design else list(split_factors)
         for trial in trial_results:
-            trial["N_i"] = list(split_factors)
+            trial["N_i"] = list(realized)
             trial["n0"] = int(n0)
     result = {
         "mode": str(result_mode),

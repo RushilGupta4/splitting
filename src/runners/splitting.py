@@ -11,38 +11,6 @@ class InsufficientSplitBudgetError(ValueError):
     """Raised when even one root cannot realize a proposed split allocation."""
 
 
-def sample_branch_counts(
-    num_parents: int,
-    branching_factor: float,
-    device: str | torch.device,
-    generator: torch.Generator | None = None,
-):
-    return balanced_branch_counts(
-        num_parents,
-        branching_factor,
-        device,
-        generator=generator,
-    )
-
-
-def floor_split_total_count(num_parents: int, branching_factor: float) -> int:
-    num_parents = int(num_parents)
-    branching_factor = float(branching_factor)
-    if num_parents < 0:
-        raise ValueError("num_parents must be nonnegative")
-    if not math.isfinite(branching_factor) or branching_factor < 0.0:
-        raise ValueError("branching_factor must be finite and nonnegative")
-    if num_parents == 0 or branching_factor == 0.0:
-        return 0
-
-    target = branching_factor * num_parents
-    nearest = round(target)
-    tol = 1e-12 * max(1.0, abs(target))
-    if abs(target - nearest) <= tol:
-        return int(nearest)
-    return int(math.floor(target))
-
-
 def normalize_max_sampling_batch_size(value):
     if value in (None, "", "none", "None", "null", "Null"):
         return None
@@ -121,35 +89,37 @@ def collect_run_batches(
     return cat_parts_by_run(parts_by_run, latest_template)
 
 
+def integer_branch_factor(branching_factor: float) -> int:
+    """Validate that a split factor is a whole number of children."""
+    value = float(branching_factor)
+    nearest = round(value)
+    if not math.isfinite(value) or nearest < 1 or abs(value - nearest) > 1e-9:
+        raise ValueError(
+            "split factors must be positive integers; every tree is an exact "
+            f"regular integer tree, got {branching_factor!r}"
+        )
+    return int(nearest)
+
+
 def balanced_branch_counts(
     num_parents: int,
     branching_factor: float,
     device: str | torch.device,
     generator: torch.Generator | None = None,
 ):
+    """Every parent gets the same whole number of children."""
+    del generator
     num_parents = int(num_parents)
-    branching_factor = float(branching_factor)
     if num_parents < 0:
         raise ValueError("num_parents must be nonnegative")
-    if not math.isfinite(branching_factor) or branching_factor < 0.0:
-        raise ValueError("branching_factor must be finite and nonnegative")
     if num_parents == 0:
         return torch.empty((0,), device=device, dtype=torch.long)
-
-    base_copies = math.floor(branching_factor)
-    target_total = floor_split_total_count(num_parents, branching_factor)
-    extra_count = target_total - base_copies * num_parents
-    extra_count = min(max(int(extra_count), 0), num_parents)
-
-    counts = torch.full((num_parents,), base_copies, device=device, dtype=torch.long)
-    if extra_count > 0:
-        extra_indices = torch.randperm(
-            num_parents,
-            device=device,
-            generator=generator,
-        )[:extra_count]
-        counts[extra_indices] += 1
-    return counts
+    return torch.full(
+        (num_parents,),
+        integer_branch_factor(branching_factor),
+        device=device,
+        dtype=torch.long,
+    )
 
 
 def balanced_branch_counts_by_group(
@@ -380,6 +350,71 @@ def balanced_split_with_run_ids(
     return x.repeat_interleave(counts, dim=0), run_ids.repeat_interleave(counts, dim=0)
 
 
+def run_mixture_batch(
+    runner,
+    *,
+    designs_by_run,
+    split_points,
+    generator=None,
+    max_sampling_batch_size=None,
+    max_paths_in_flight=None,
+):
+    """Sample a mixture of exact integer trees for each run.
+
+    ``designs_by_run[j]`` is that run's list of ``TreeType``.  Every (run, type)
+    pair is one virtual root population, so they are simulated in a single
+    batched call and regrouped afterwards.
+
+    ``max_sampling_batch_size`` is a *per-run* cap, so one call feeds the model
+    the sum over virtual runs of the capped child counts.  For image models that
+    product is what sets the activation footprint; ``max_paths_in_flight`` bounds
+    it by splitting the call up.
+    """
+    flat_n0: list[int] = []
+    flat_factors: list[list[int]] = []
+    owner: list[int] = []
+    for run_idx, design in enumerate(designs_by_run):
+        for tree in design:
+            flat_n0.append(int(tree.roots))
+            flat_factors.append([int(f) for f in tree.split_factors])
+            owner.append(run_idx)
+    if not flat_n0:
+        raise ValueError("every run needs at least one tree type")
+
+    if max_paths_in_flight is None:
+        groups = [list(range(len(flat_n0)))]
+    else:
+        cap = int(max_sampling_batch_size or 10**9)
+        groups, current, load = [], [], 0
+        for index, (n0, factors) in enumerate(zip(flat_n0, flat_factors)):
+            leaves = int(n0) * int(np.prod(factors)) if factors else int(n0)
+            cost = min(leaves, cap)
+            if current and load + cost > int(max_paths_in_flight):
+                groups.append(current)
+                current, load = [], 0
+            current.append(index)
+            load += cost
+        if current:
+            groups.append(current)
+
+    flat_samples: list = [None] * len(flat_n0)
+    for group in groups:
+        samples, _, _ = runner.run_split_batch(
+            n0_by_run=[flat_n0[i] for i in group],
+            split_points=split_points,
+            split_factors_by_run=[flat_factors[i] for i in group],
+            generator=generator,
+            max_sampling_batch_size=max_sampling_batch_size,
+        )
+        for local, index in enumerate(group):
+            flat_samples[index] = samples[local]
+
+    parts_by_run: list[list] = [[] for _ in designs_by_run]
+    for sample, run_idx in zip(flat_samples, owner):
+        parts_by_run[run_idx].append(sample)
+    return parts_by_run
+
+
 def trajectory_segment_costs(runner, split_points):
     """Return segment costs for canonical runner-native split points."""
     points = list(split_points)
@@ -399,73 +434,6 @@ def trajectory_expected_cost_per_root(runner, split_points, split_factors) -> fl
         cumulative_split *= float(split_factor)
         cost += cumulative_split * float(costs[idx + 1])
     return float(cost)
-
-
-def floor_split_sampling_cost(runner, split_points, split_factors, n0: int) -> float:
-    """Return realized cost after flooring the path count at every split."""
-    n0 = int(n0)
-    if n0 < 1:
-        raise ValueError("n0 must be at least 1")
-
-    points = list(split_points)
-    factors = [float(value) for value in split_factors]
-    if len(factors) != len(points):
-        raise ValueError("split_factors must match split_points length")
-
-    costs = trajectory_segment_costs(runner, points)
-    current_count = n0
-    total_cost = current_count * int(costs[0])
-    for factor, segment_cost in zip(factors, costs[1:]):
-        current_count = floor_split_total_count(current_count, factor)
-        total_cost += current_count * int(segment_cost)
-    return float(total_cost)
-
-
-def max_floor_split_roots_for_budget(
-    runner,
-    split_points,
-    split_factors,
-    *,
-    budget: int,
-    expected_cost_per_root: float,
-) -> int:
-    """Find the largest integer root count whose realized cost fits ``budget``."""
-    budget = int(budget)
-    if budget <= 0:
-        raise ValueError("budget must be positive")
-    if expected_cost_per_root <= 0.0 or not math.isfinite(expected_cost_per_root):
-        raise ValueError("expected_cost_per_root must be finite and positive")
-
-    cost_for_one = floor_split_sampling_cost(runner, split_points, split_factors, 1)
-    if cost_for_one > budget:
-        raise InsufficientSplitBudgetError(
-            f"Budget {budget} is too small; floor split cost for one root is "
-            f"{cost_for_one:.6f}"
-        )
-
-    upper = max(1, int(budget // expected_cost_per_root))
-    while floor_split_sampling_cost(runner, split_points, split_factors, upper) > budget:
-        upper //= 2
-        if upper < 1:
-            raise InsufficientSplitBudgetError(
-                f"Budget {budget} is too small; floor split cost for one root is "
-                f"{cost_for_one:.6f}"
-            )
-
-    lower = upper
-    probe = max(upper * 2, 2)
-    while floor_split_sampling_cost(runner, split_points, split_factors, probe) <= budget:
-        lower = probe
-        probe *= 2
-
-    high = probe - 1
-    while lower < high:
-        mid = (lower + high + 1) // 2
-        if floor_split_sampling_cost(runner, split_points, split_factors, mid) <= budget:
-            lower = mid
-        else:
-            high = mid - 1
-    return int(lower)
 
 
 def run_full_trajectory_batch(
@@ -691,5 +659,3 @@ def run_split_trajectory_batch(
     samples_by_run = [x[run_ids == run_idx] for run_idx in range(num_runs)]
     return samples_by_run, realized_costs.detach().cpu().tolist(), sampling_time
 
-
-probabilistic_split_with_run_ids = balanced_split_with_run_ids

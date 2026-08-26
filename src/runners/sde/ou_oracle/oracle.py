@@ -16,7 +16,7 @@ import math
 import numpy as np
 from scipy.stats import multivariate_normal, norm
 
-REFERENCE_SCHEDULE = tuple(round(value / 20, 2) for value in range(19, 0, -1))
+REFERENCE_SCHEDULE = tuple(np.round(np.arange(39, 0, -1) / 40, 2).tolist())
 QUERY_GRID_SIZE = 100
 QUERY_PROBABILITY_MIN = 0.01
 QUERY_PROBABILITY_MAX = 0.99
@@ -344,7 +344,8 @@ def query_variance_contributions(
         columns = [column_by_step[step] for step in requested_steps]
     except KeyError as exc:
         raise ValueError(
-            "OU oracle schedules must be subsets of the 19-split reference schedule"
+            "OU oracle schedules must be subsets of the "
+            f"{len(REFERENCE_SCHEDULE)}-split reference schedule"
         ) from exc
 
     sequence = np.column_stack(

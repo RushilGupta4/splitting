@@ -21,9 +21,15 @@ from runners.splitting import (
     InsufficientSplitBudgetError,
     apply_to_run_batches,
     append_by_counts as _append_by_counts,
-    max_floor_split_roots_for_budget,
     normalize_max_sampling_batch_size,
+    run_mixture_batch,
     split_counts_by_run_batches,
+)
+from runners.trees import (
+    InsufficientTreeBudgetError,
+    design_cost,
+    design_mixture,
+    mean_split_factors,
 )
 from uniform_c import max_feasible_c, solve_uniform_c
 from metrics.utils import coerce_samples_np
@@ -78,6 +84,7 @@ _FAST_FW_RELATIVE_TOL = 3e-4
 _FAST_FW_MAX_ITERS = 2_000
 _FAST_FW_LINE_SEARCH_ITERS = 6
 _QUERY_LABEL_MAX_TEMPORARY_BYTES = 512 * 1024 * 1024
+_QUERY_LABEL_MAX_TILE_ELEMENTS = 4096
 _MONOTONE_CVAR95_ALPHA = 0.95
 SUPPORTED_OPTIMIZATION_MODES = {"monotone", "monotone_cvar95", "learned_c"}
 _INFEASIBLE_ALLOCATION_RETRY_SEED_OFFSET = 1 << 40
@@ -651,6 +658,13 @@ def _solve_cvar_monotone_allocation(
     return best_y
 
 
+def _query_variance_matrix(variance2_per_level, tau2) -> np.ndarray:
+    """``M[q, i]``: per-level variance contribution of query ``q``."""
+    M = np.maximum(np.asarray(variance2_per_level, dtype=float), 0.0).T.copy()
+    M[:, 0] += np.maximum(np.asarray(tau2, dtype=float), 0.0)
+    return M
+
+
 def _solve_optimal_split_factors(
     variance2_per_level: np.ndarray,
     tau2: np.ndarray,
@@ -687,8 +701,7 @@ def _solve_optimal_split_factors(
         raise ValueError("cost_weights must be finite and positive")
     cost_w = cost_w / float(cost_w.sum())
 
-    M = np.maximum(variance2_per_level, 0.0).T.copy()
-    M[:, 0] += np.maximum(tau2, 0.0)
+    M = _query_variance_matrix(variance2_per_level, tau2)
     if optimization_mode == "learned_c":
         if c_max is None:
             raise ValueError("learned_c requires c_max")
@@ -1567,7 +1580,11 @@ def _lower_orthant_labels_batched(samples_by_run, query_points):
     output = torch.empty((runs, paths, queries), device=values.device, dtype=torch.bool)
 
     if values.is_cuda and _lower_orthant_labels_kernel is not None:
+        block_width = triton.next_power_of_2(width)
         block_pairs = 1024 if width <= 4 and paths >= 1000 else (512 if width <= 4 else 64)
+        block_pairs = max(
+            1, min(block_pairs, _QUERY_LABEL_MAX_TILE_ELEMENTS // block_width)
+        )
         pair_count = int(output.numel())
         _lower_orthant_labels_kernel[(triton.cdiv(pair_count, block_pairs),)](
             values,
@@ -1580,7 +1597,7 @@ def _lower_orthant_labels_batched(samples_by_run, query_points):
             queries=queries,
             width=width,
             BLOCK_PAIRS=block_pairs,
-            BLOCK_WIDTH=triton.next_power_of_2(width),
+            BLOCK_WIDTH=block_width,
             num_warps=4,
         )
         return output
@@ -1925,18 +1942,22 @@ def _solve_phase1_allocation(
         optimization_mode=optimization_mode,
         c_max=c_max,
     )
-    cost_per_root = runner.expected_cost_per_root(split_points, split_factors)
-    n0 = max_floor_split_roots_for_budget(
-        runner,
-        split_points,
-        split_factors,
-        budget=B2,
-        expected_cost_per_root=cost_per_root,
+    # Every learned mode has phase-1 variances, so the mixture weights come from
+    # the finite-query minimax LP.
+    variances = _query_variance_matrix(
+        payload["variance2_per_level"], payload["tau2"]
     )
+    try:
+        design = design_mixture(
+            split_factors, seg_costs, B2, variances=variances
+        )
+    except InsufficientTreeBudgetError as exc:
+        raise InsufficientSplitBudgetError(str(exc)) from exc
     result = {
         "split_points": split_points,
-        "N_i": split_factors,
-        "n0": int(n0),
+        "design": design,
+        "N_i": mean_split_factors(design),
+        "n0": int(sum(tree.roots for tree in design)),
         "used_B1": int(payload["used_B1"]),
         "phase1_x0_samples": payload.get("phase1_x0_samples"),
         "phase1_simulation_seconds": float(payload["phase1_simulation_seconds"]),
@@ -1969,6 +1990,7 @@ def run_estimate_and_sample(
     run_offset: int = 0,
     return_trial_results: bool = False,
     max_sampling_batch_size=None,
+    max_paths_in_flight=None,
 ):
     if not 0 <= B1 < B:
         raise ValueError("require 0 <= B1 < B")
@@ -2094,12 +2116,13 @@ def run_estimate_and_sample(
             )
             _synchronize_runner_device(runner)
             phase2_started = time.perf_counter()
-            samples_by_run, _, _ = runner.run_split_batch(
-                n0_by_run=[int(t["n0"]) for t in chunk],
+            samples_by_run = run_mixture_batch(
+                runner,
+                designs_by_run=[t["design"] for t in chunk],
                 split_points=chunk[0]["split_points"],
-                split_factors_by_run=[t["N_i"] for t in chunk],
                 generator=make_torch_generator(run_seed, runner.device),
                 max_sampling_batch_size=max_sampling_batch_size,
+                max_paths_in_flight=max_paths_in_flight,
             )
             _synchronize_runner_device(runner)
             phase2_seconds = (time.perf_counter() - phase2_started) / len(chunk)
@@ -2112,16 +2135,33 @@ def run_estimate_and_sample(
                     + trial["optimization_seconds"]
                     + trial["phase2_seconds"]
                 )
+            parts_by_run = []
+            weights_by_run = []
+            for trial, parts in zip(chunk, samples_by_run):
+                design_weights = [tree.weight for tree in trial["design"]]
+                pilots = trial.get("phase1_x0_samples")
+                if pilots is None or len(pilots) == 0:
+                    parts_by_run.append(list(parts))
+                    weights_by_run.append(design_weights)
+                    continue
+                # Reused pilots are the all-ones tree; they carry their realized
+                # budget share B1 / B, and the designed types share the rest.
+                pilot_weight = float(trial["used_B1"]) / float(B)
+                parts_by_run.append([pilots, *parts])
+                weights_by_run.append(
+                    [pilot_weight]
+                    + [(1.0 - pilot_weight) * w for w in design_weights]
+                )
             submit_sampling_trial_result_futures(
                 executor=metric_executor,
                 futures=metric_futures,
                 run_indices=range(start, end),
-                samples_by_run=samples_by_run,
+                samples_by_run=parts_by_run,
                 runner=runner,
                 comparison_mode=comparison_mode,
                 metric_states=comparison_state,
                 metrics=metrics,
-                phase1_x0_samples_by_run=[t.get("phase1_x0_samples") for t in chunk],
+                weights_by_run=weights_by_run,
             )
         for run_idx, future in tqdm(metric_futures, desc="Metrics", leave=False):
             trial_results[run_idx].update(future.result())
@@ -2132,6 +2172,8 @@ def run_estimate_and_sample(
         "B1": int(B1),
         **summarize_sampling_trials(trial_results, metrics),
     }
+    for trial in trial_results:
+        trial.pop("design", None)
     if return_trial_results:
         result["trial_results"] = trial_results
     return result

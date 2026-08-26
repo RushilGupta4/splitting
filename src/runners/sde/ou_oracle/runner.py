@@ -5,6 +5,7 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 
 from runners.sde.ou_oracle.oracle import (
+    query_variance_contributions,
     CDF_MAX_POINTS,
     CDF_SEED,
     CDF_TOLERANCE,
@@ -45,6 +46,12 @@ class OUOracleRunner(SimpleOURunner):
         )
         key["runner"] = SimpleOURunner.runner_name
         return key
+
+    def oracle_variances(self, split_percentages: Sequence[float]) -> np.ndarray:
+        """Per-query segmentwise variances, the LP's view of this allocation."""
+        schedule = tuple(float(value) for value in split_percentages)
+        self.resolve_split_percentages(schedule)
+        return query_variance_contributions(schedule, steps=self._sampling_steps)
 
     def oracle_definition(self, split_percentages: Sequence[float]) -> dict[str, Any]:
         if self.input_dim != 2 or self._sampler != "euler":
