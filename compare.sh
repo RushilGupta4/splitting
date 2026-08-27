@@ -9,8 +9,8 @@ BASE_DIRS=(outputs_paper_final_2)
 
 # name|runner|config|device|reference_batch|num_queries|k_max|mlp_workers
 CONFIGS=(
-    # "edm_default|edm_gmm2d|default|cuda:0|50000|1024|64|25"
-    "simple_ou|simple_ou|default|cuda:0|1000000|1024|64|25"
+    "edm_default|edm_gmm2d|default|cuda:1|50000|1024|64|25"
+    # "simple_ou|simple_ou|default|cuda:0|1000000|1024|64|25"
     # "coupled_double_well_langevin|coupled_double_well_langevin|default|cuda:1|1000000|1024|64|25"
 
     # "simple_ou_mmd|simple_ou|mmd|cuda:0|1000000|1024|64|25"/gao

@@ -236,7 +236,7 @@ MODELS = (
             2_000_000,
             5_000_000,
         ),
-        "steps": (40, 45, 55, 63, 73, 87),
+        "steps": (40, 46, 55, 63, 73, 87),
         "sampler": "edm_stochastic",
         "reference_size": 5_000_000,
         "target": EDM_TARGET,
@@ -1286,11 +1286,10 @@ def _label_visible_grid(axes: np.ndarray, *, xlabel: str, ylabel: str) -> None:
 
 
 def _hide_repeated_x_ticklabels(axes: np.ndarray) -> None:
-    """Drop a panel's x tick labels only when the panel below repeats them.
+    """Show x tick labels only on the lowest visible panel in each column.
 
-    Panels autoscale independently, so a column whose budgets differ from row
-    to row must keep every label; otherwise the lowest panel's ticks read as
-    the whole column's and understate the wider panels.
+    Only for grids that share one x range across rows; budget panels autoscale
+    per model and each label their own ticks.
     """
     for column in range(axes.shape[1]):
         visible = [
@@ -1298,15 +1297,8 @@ def _hide_repeated_x_ticklabels(axes: np.ndarray) -> None:
             for row in range(axes.shape[0])
             if axes[row, column].get_visible()
         ]
-        for ax, below in zip(visible, visible[1:]):
-            if _x_ticks_match(ax, below):
-                ax.tick_params(axis="x", which="both", labelbottom=False)
-
-
-def _x_ticks_match(first: plt.Axes, second: plt.Axes) -> bool:
-    return np.array_equal(
-        first.get_xticks(), second.get_xticks()
-    ) and np.allclose(first.get_xlim(), second.get_xlim())
+        for ax in visible[:-1]:
+            ax.tick_params(axis="x", which="both", labelbottom=False)
 
 
 def _plotted_x_values(ax: plt.Axes) -> list[int]:
@@ -1749,7 +1741,6 @@ def _plot_reductions(
     )
     if visible_row_count > 1:
         _label_visible_grid(axes, xlabel="", ylabel="")
-        _hide_repeated_x_ticklabels(axes)
         _set_shared_axis_labels(
             fig,
             xlabel="Budget $B$",
@@ -1891,7 +1882,6 @@ def _plot_absolute_metrics(
         )
         return False
     _label_visible_grid(axes, xlabel="", ylabel="")
-    _hide_repeated_x_ticklabels(axes)
     _set_shared_axis_labels(
         fig,
         xlabel="Budget $B$",
