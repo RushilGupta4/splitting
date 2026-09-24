@@ -1597,6 +1597,7 @@ def _plot_splitting_diagram(output_dir: Path) -> None:
     fig.savefig(
         output_dir / "splitting_diagram.png",
         dpi=FIGURE_DPI,
+        bbox_inches="tight",
         metadata={"Software": "paper_plots.py"},
     )
     plt.close(fig)
