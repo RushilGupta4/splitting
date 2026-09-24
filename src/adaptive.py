@@ -79,7 +79,6 @@ _DEFAULT_QUERY_PARAMS: Dict[str, Any] = {
 }
 
 _CROSSFIT_Q_MLP_INIT_LOCK = Lock()
-_CROSSFIT_Q_FEATURE_CACHE_CHUNK_SIZE = 262_144
 _FAST_FW_RELATIVE_TOL = 3e-4
 _FAST_FW_MAX_ITERS = 2_000
 _FAST_FW_LINE_SEARCH_ITERS = 6
@@ -1019,47 +1018,35 @@ def _crossfit_q_mlp_predict_all_levels_impl(
     def triple_features(
         states: torch.Tensor, pair_idx: torch.Tensor, paths_per_level: int
     ):
-        """Inputs for one (level, path, query) triple.
+        """Inputs for one (level, path, query) triple, built on demand.
 
         The raw state is deliberately absent: the network sees only how far the
         state sits from the query corner in the queried coordinates, plus the
         query's size, its mass and the level time.
+
+        The margins are gathered by flat index rather than by first slicing out
+        `states[level, path]`. That intermediate would be (batch, state_dim)
+        wide just to read `max_active` columns from it -- for a latent diffusion
+        state it is hundreds of megabytes per batch, and for a target-space one
+        far more. Materialising every triple up front costs
+        `levels * paths * queries * max_active` floats, which is tens of
+        gigabytes once the split schedule is long, so each batch is built as it
+        is consumed instead.
         """
         level_path_idx = torch.div(pair_idx, num_queries, rounding_mode="floor")
         query_idx = pair_idx - level_path_idx * num_queries
-        path_idx = (
-            level_path_idx
-            - torch.div(level_path_idx, paths_per_level, rounding_mode="floor")
-            * paths_per_level
-        )
         level_idx = torch.div(level_path_idx, paths_per_level, rounding_mode="floor")
-        state_part = states[level_idx, path_idx]
-        query_part = q_features[query_idx]
-        dims = active_dims[query_idx]
-        mask = active_mask[query_idx]
-        margin = (torch.gather(state_part, 1, dims) - t_norm[query_idx]) * mask
-        time_part = time_features[level_idx]
-        return torch.cat([query_part, margin, time_part], dim=1)
+        state_dim = int(states.shape[-1])
+        flat_dims = level_path_idx.unsqueeze(1) * state_dim + active_dims[query_idx]
+        gathered = states.reshape(-1)[flat_dims]
+        margin = (gathered - t_norm[query_idx]) * active_mask[query_idx]
+        return torch.cat(
+            [q_features[query_idx], margin, time_features[level_idx]], dim=1
+        )
 
     input_dim = int(q_features.shape[1]) + max_active + 1
 
-    def materialize_triple_features(states: torch.Tensor, paths_per_level: int):
-        pair_count = int(num_levels) * int(paths_per_level) * int(num_queries)
-        features = torch.empty(
-            (pair_count, input_dim),
-            device=device,
-            dtype=torch.float32,
-        )
-        chunk_size = int(_CROSSFIT_Q_FEATURE_CACHE_CHUNK_SIZE)
-        for start in range(0, pair_count, chunk_size):
-            end = min(start + chunk_size, pair_count)
-            pair_idx = torch.arange(start, end, device=device, dtype=torch.long)
-            features[start:end] = triple_features(states, pair_idx, paths_per_level)
-        return features
-
-    train_features = materialize_triple_features(x_train, train_paths)
     train_targets = y_train.unsqueeze(0).expand(num_levels, -1, -1).reshape(-1, 1)
-    del x_train
 
     # Module parameters are initialized on CPU. Serialize that short section so
     # concurrent fits cannot race through PyTorch's process-global CPU RNG; no
@@ -1098,7 +1085,7 @@ def _crossfit_q_mlp_predict_all_levels_impl(
         order = torch.randperm(pair_count, device=device, generator=gen)
         for start in range(0, int(order.numel()), batch_size):
             idx = order[start : start + batch_size]
-            xb = train_features[idx]
+            xb = triple_features(x_train, idx, train_paths)
             yb = train_targets[idx]
             logits = model(xb)
             loss = supervised_loss(logits, yb)
@@ -1106,18 +1093,17 @@ def _crossfit_q_mlp_predict_all_levels_impl(
             loss.backward()
             optimizer.step()
 
-    del train_features, train_targets
+    del x_train, train_targets
     model.eval()
     test_paths = int(x_test.shape[1])
     test_pair_count = int(num_levels) * int(test_paths) * int(num_queries)
-    test_features = materialize_triple_features(x_test, test_paths)
-    del x_test
     predictions_flat = np.empty(test_pair_count, dtype=np.float32)
     with torch.inference_mode():
         for start in range(0, test_pair_count, batch_size):
             end = min(start + batch_size, test_pair_count)
+            pair_idx = torch.arange(start, end, device=device, dtype=torch.long)
             predictions_flat[start:end] = (
-                torch.sigmoid(model(test_features[start:end]))
+                torch.sigmoid(model(triple_features(x_test, pair_idx, test_paths)))
                 .reshape(-1)
                 .detach()
                 .cpu()
@@ -1670,7 +1656,7 @@ def _simulate_crossfit_q_trajectories(
         .astype(float, copy=False)
         .reshape(len(states_by_level), int(chunk_size), int(paths_per_run), -1)
     )
-    return states, x0
+    return states, x0, x.detach().reshape(total_paths, -1)
 
 
 def _grid_free_query_payload(samples, query_params, *, seed, run_index):
@@ -1785,7 +1771,7 @@ def _run_crossfit_q_phase1_sampling_batch(
         design_future = query_executor.submit(draw_designs)
         _synchronize_runner_device(runner)
         simulation_started = time.perf_counter()
-        states_by_run, x0 = _simulate_crossfit_q_trajectories(
+        states_by_run, x0, terminal_states = _simulate_crossfit_q_trajectories(
             runner,
             chunk_size=chunk_size,
             paths_per_run=paths_per_run,
@@ -1797,15 +1783,26 @@ def _run_crossfit_q_phase1_sampling_batch(
         simulation_seconds = time.perf_counter() - simulation_started
         designs, design_seconds = design_future.result()
     phase1_x0_by_run: List[Any] = [None] * chunk_size
-    x0_by_run = list(torch.split(x0, int(paths_per_run)))
     if reuse_phase1_samples:
         x0_np = coerce_samples_np(x0).reshape(int(chunk_size), int(paths_per_run), -1)
         phase1_x0_by_run = [x0_np[idx] for idx in range(int(chunk_size))]
 
+    # Queries are drawn at runner.input_dim, so they index the model state. A
+    # runner whose postprocessing changes dimension -- a latent diffusion model
+    # decoding to pixels -- must label on the model-space terminal state, or the
+    # query coordinates address a different space from the state the regressor
+    # conditions on. x0 stays decoded for the reused phase-1 samples and the metric.
+    query_samples = (
+        terminal_states
+        if str(getattr(runner, "phase1_query_space", "target")) == "model"
+        else x0
+    )
+    query_by_run = list(torch.split(query_samples, int(paths_per_run)))
+
     _synchronize_runner_device(runner)
     query_started = time.perf_counter()
-    if x0.is_cuda:
-        samples_by_run = x0.reshape(int(chunk_size), int(paths_per_run), -1)
+    if query_samples.is_cuda:
+        samples_by_run = query_samples.reshape(int(chunk_size), int(paths_per_run), -1)
         query_specs = _finish_grid_free_query_designs_cuda(samples_by_run, designs)
         labels_by_run = _lower_orthant_labels_batched(samples_by_run, query_specs)
         run_specs = [
@@ -1821,9 +1818,9 @@ def _run_crossfit_q_phase1_sampling_batch(
     else:
         def finish_run(run_idx):
             query_spec = _finish_grid_free_query_design(
-                x0_by_run[run_idx], designs[run_idx]
+                query_by_run[run_idx], designs[run_idx]
             )
-            labels = _lower_orthant_labels(x0_by_run[run_idx], query_spec)
+            labels = _lower_orthant_labels(query_by_run[run_idx], query_spec)
             return {
                 "query_spec": query_spec,
                 "labels": labels.numpy().astype(np.bool_, copy=False),

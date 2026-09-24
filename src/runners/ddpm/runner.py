@@ -225,6 +225,11 @@ class DDPMRunner(BaseRunner):
         return int(type(self).model_input_dim(self._model))
 
     @property
+    def sample_dim(self) -> int:
+        """Dimension after terminal postprocessing (possibly decoding)."""
+        return int(self._target_spec.get("sample_dim", self.input_dim))
+
+    @property
     def target_spec(self) -> Mapping[str, Any]:
         return self._target_spec
 
@@ -623,7 +628,7 @@ class DDPMRunner(BaseRunner):
             timestep_spacing=ref_cfg["timestep_spacing"],
         )
         output = torch.empty(
-            (int(num_samples), ref_runner.input_dim),
+            (int(num_samples), ref_runner.sample_dim),
             dtype=torch.float32,
             device="cpu",
         )
@@ -655,7 +660,7 @@ class DDPMRunner(BaseRunner):
                     device="cpu",
                     dtype=torch.float32,
                 )
-                if generated.shape != (current, ref_runner.input_dim):
+                if generated.shape != (current, ref_runner.sample_dim):
                     raise ValueError(
                         "DDPM reference generator returned unexpected shape "
                         f"{tuple(generated.shape)}"

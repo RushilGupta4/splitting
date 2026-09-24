@@ -38,6 +38,7 @@ RESULT_TABLE_STEMS = {
     "coupled_double_well_langevin": "complete_langevin",
     "edm_default": "complete_edm",
     "ddpm_cifar10_hf_mmd": "complete_ddpm",
+    "ldm_ffhq_mmd": "complete_ffhq",
 }
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -89,6 +90,7 @@ def _numerical_schedule_rows() -> tuple[list[str], list[dict[str, Any]]]:
     langevin = by_directory["coupled_double_well_langevin"]
     edm = by_directory["edm_default"]
     ddpm = by_directory["ddpm_cifar10_hf_mmd"]
+    ffhq = by_directory["ldm_ffhq_mmd"]
 
     if ou["budgets"] != langevin["budgets"] or ou["steps"] != langevin["steps"]:
         raise RuntimeError("OU and Langevin must use the same Euler schedule")
@@ -99,6 +101,11 @@ def _numerical_schedule_rows() -> tuple[list[str], list[dict[str, Any]]]:
     euler_steps = step_map(ou)
     edm_steps = step_map(edm)
     ddpm_steps = step_map(ddpm)
+    ffhq_steps = step_map(ffhq)
+    if any(
+        ddpm_steps.get(budget, steps) != steps for budget, steps in ffhq_steps.items()
+    ):
+        raise RuntimeError("CIFAR-10 and FFHQ must share the DDPM step schedule")
     budgets = sorted(set(euler_steps) | set(edm_steps) | set(ddpm_steps))
     rows = []
     for budget in budgets:
@@ -124,6 +131,11 @@ def _reference_source(model: dict[str, Any]) -> str:
         return "Direct draws from the Gaussian mixture"
     if method == "hf_ddpm_scheduler":
         return f"Full {config['sampling_steps']}-step DDPM sampler"
+    if method == "ldm_ddpm_samples":
+        return (
+            f"Full {config['sampling_steps']}-step latent DDPM sampler, "
+            "decoded to 256x256 images"
+        )
     raise RuntimeError(f"Unsupported reference method {method!r}")
 
 
@@ -133,6 +145,7 @@ def _reference_sample_rows() -> tuple[list[str], list[dict[str, Any]]]:
         "coupled_double_well_langevin": "Overdamped Langevin",
         "edm_default": "EDM",
         "ddpm_cifar10_hf_mmd": "CIFAR-10 DDPM",
+        "ldm_ffhq_mmd": "FFHQ LDM",
     }
     rows = [
         {

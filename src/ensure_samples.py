@@ -43,6 +43,43 @@ def parse_args():
     return parser.parse_args()
 
 
+def _reference_cache_path(runner, comparison_mode, reference_generation_config):
+    cache_key = runner.reference_cache_key(comparison_mode, reference_generation_config)
+    return (
+        reference_samples_path_for_key(runner.checkpoint_path, cache_key),
+        cache_key,
+    )
+
+
+def _use_existing_cache(
+    target_spec,
+    path,
+    reference_generation_config,
+    num_base_samples,
+):
+    cached = load_reference_samples_if_sufficient(path, num_base_samples)
+    if cached is None:
+        return False
+    try:
+        _validate_cifar_model_reference(
+            target_spec,
+            reference_generation_config,
+            cached,
+            expected_count=num_base_samples,
+        )
+    except ValueError as exc:
+        log.warning("Ignoring invalid reference cache at %s: %s", path, exc)
+        return False
+    log.info("Using existing reference samples at %s", path)
+    _ensure_image_preview(
+        target_spec,
+        reference_generation_config,
+        path,
+        cached,
+    )
+    return True
+
+
 def _ensure_for_runner(
     runner,
     comparison_mode,
@@ -52,28 +89,15 @@ def _ensure_for_runner(
 ):
     if int(batch_size) < 1:
         raise ValueError("batch_size must be at least 1")
-    cache_key = runner.reference_cache_key(comparison_mode, reference_generation_config)
-    path = reference_samples_path_for_key(runner.checkpoint_path, cache_key)
-    cached = load_reference_samples_if_sufficient(path, num_base_samples)
-    if cached is not None:
-        try:
-            _validate_cifar_model_reference(
-                runner,
-                reference_generation_config,
-                cached,
-                expected_count=num_base_samples,
-            )
-        except ValueError as exc:
-            log.warning("Ignoring invalid reference cache at %s: %s", path, exc)
-            cached = None
-    if cached is not None:
-        log.info("Using existing reference samples at %s", path)
-        _ensure_cifar_preview(
-            runner,
-            reference_generation_config,
-            path,
-            cached,
-        )
+    path, cache_key = _reference_cache_path(
+        runner, comparison_mode, reference_generation_config
+    )
+    if _use_existing_cache(
+        runner.target_spec,
+        path,
+        reference_generation_config,
+        num_base_samples,
+    ):
         return
     log.info(
         "Building reference samples for runner=%s mode=%s -> %s",
@@ -137,15 +161,15 @@ def _ensure_for_runner(
         finally:
             finish_step_progress()
     _validate_cifar_model_reference(
-        runner,
+        runner.target_spec,
         reference_generation_config,
         samples,
         expected_count=num_base_samples,
     )
     save_reference_samples_with_key(path, samples, cache_key=cache_key)
     log.info("Saved %d reference samples to %s", samples.shape[0], path)
-    _ensure_cifar_preview(
-        runner,
+    _ensure_image_preview(
+        runner.target_spec,
         reference_generation_config,
         path,
         samples,
@@ -153,8 +177,8 @@ def _ensure_for_runner(
     )
 
 
-def _ensure_cifar_preview(
-    runner,
+def _ensure_image_preview(
+    target_spec,
     reference_generation_config,
     reference_path,
     samples,
@@ -162,9 +186,9 @@ def _ensure_cifar_preview(
     force=False,
 ):
     method = str(reference_generation_config.get("method", ""))
-    if method not in {"hf_ddpm_scheduler", "edm_samples"}:
+    if method not in {"hf_ddpm_scheduler", "edm_samples", "ldm_ddpm_samples"}:
         return
-    image_shape = runner.target_spec.get("image_shape")
+    image_shape = target_spec.get("image_shape")
     if image_shape is None:
         return
     preview_path = reference_preview_path(reference_path)
@@ -179,7 +203,7 @@ def _ensure_cifar_preview(
 
 
 def _validate_cifar_model_reference(
-    runner,
+    target_spec,
     reference_generation_config,
     samples,
     *,
@@ -188,7 +212,7 @@ def _validate_cifar_model_reference(
     method = str(reference_generation_config.get("method", ""))
     if method not in {"hf_ddpm_scheduler", "edm_samples"}:
         return
-    if tuple(int(v) for v in runner.target_spec.get("image_shape", ())) != (
+    if tuple(int(v) for v in target_spec.get("image_shape", ())) != (
         3,
         32,
         32,
@@ -208,6 +232,32 @@ def _validate_cifar_model_reference(
             "CIFAR reference must lie in [0, 1], got range "
             f"[{float(minimum)}, {float(maximum)}]"
         )
+
+
+def _check_comparison_mode(runner, runner_name, comparison_mode):
+    if not any(s.name == comparison_mode for s in runner.comparison_modes()):
+        raise ValueError(
+            f"Runner {runner_name!r} does not support comparison_mode {comparison_mode!r}"
+        )
+
+
+def _reference_cache_required(runner, comparison_mode):
+    if runner.comparison_mode_spec(comparison_mode).requires_reference_cache:
+        return True
+    log.info(
+        "comparison_mode=%s does not require reference samples; nothing to do",
+        comparison_mode,
+    )
+    return False
+
+
+def _reference_generation_config(cfg, comparison_mode):
+    if "reference_generation_config" not in cfg:
+        raise ValueError(
+            "reference_generation_config is required when comparison_mode "
+            f"{comparison_mode!r} requires cached reference samples"
+        )
+    return cfg["reference_generation_config"]
 
 
 def main():
@@ -230,37 +280,41 @@ def main():
             metrics,
         )
         return
+    comparison_mode = cfg["comparison_mode"]
+    runner_defaults = dict(cfg.get("runner_defaults") or {})
+
+    probe = runner_cls.load_without_model(device=args.device, **runner_defaults)
+    if probe is not None:
+        _check_comparison_mode(probe, args.runner, comparison_mode)
+        if _reference_cache_required(probe, comparison_mode):
+            reference_generation_config = probe.normalize_reference_generation_config(
+                comparison_mode,
+                _reference_generation_config(cfg, comparison_mode),
+            )
+            path, _ = _reference_cache_path(
+                probe, comparison_mode, reference_generation_config
+            )
+            if _use_existing_cache(
+                probe.target_spec,
+                path,
+                reference_generation_config,
+                int(cfg["num_base_samples"]),
+            ):
+                return
+
     base_runner = runner_cls.load_from_checkpoint(
         device=args.device,
         no_compile=args.no_compile,
-        **dict(cfg.get("runner_defaults") or {}),
+        **runner_defaults,
     )
     validate_metric_dimensions(base_runner, metrics)
-    comparison_mode = cfg["comparison_mode"]
-
-    mode_spec = next(
-        (s for s in base_runner.comparison_modes() if s.name == comparison_mode),
-        None,
-    )
-    if mode_spec is None:
-        raise ValueError(
-            f"Runner {args.runner!r} does not support comparison_mode {comparison_mode!r}"
-        )
-    if not mode_spec.requires_reference_cache:
-        log.info(
-            "comparison_mode=%s does not require reference samples; nothing to do",
-            comparison_mode,
-        )
+    _check_comparison_mode(base_runner, args.runner, comparison_mode)
+    if not _reference_cache_required(base_runner, comparison_mode):
         return
 
-    if "reference_generation_config" not in cfg:
-        raise ValueError(
-            "reference_generation_config is required when comparison_mode "
-            f"{comparison_mode!r} requires cached reference samples"
-        )
     reference_generation_config = base_runner.normalize_reference_generation_config(
         comparison_mode,
-        cfg["reference_generation_config"],
+        _reference_generation_config(cfg, comparison_mode),
     )
     _ensure_for_runner(
         base_runner,

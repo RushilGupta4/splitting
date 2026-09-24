@@ -3,7 +3,7 @@ name = "splitting-ddpm"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
     "accelerate>=1.14.0",
     "diffusers>=0.35.0",

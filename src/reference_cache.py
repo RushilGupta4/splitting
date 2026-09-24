@@ -156,28 +156,29 @@ def save_reference_preview(
     *,
     image_shape,
 ) -> str:
-    """Atomically save the first 25 CIFAR samples as a 5x5 PNG grid."""
+    """Atomically save the first 25 RGB samples as a 5x5 PNG grid."""
     shape = tuple(int(v) for v in image_shape)
-    if shape != (3, 32, 32):
+    if len(shape) != 3 or shape[0] != 3 or min(shape[1:]) < 1:
         raise ValueError(
-            "Reference previews currently require CIFAR image_shape=(3, 32, 32), "
+            "Reference previews require image_shape=(3, height, width), "
             f"got {shape}"
         )
     values = torch.as_tensor(samples)
-    if values.ndim != 2 or int(values.shape[1]) != 3 * 32 * 32:
+    sample_dim = shape[0] * shape[1] * shape[2]
+    if values.ndim != 2 or int(values.shape[1]) != sample_dim:
         raise ValueError(
-            "CIFAR reference preview expects flattened samples with shape "
-            f"[N, 3072], got {tuple(values.shape)}"
+            "Reference preview expects flattened samples with shape "
+            f"[N, {sample_dim}], got {tuple(values.shape)}"
         )
     if int(values.shape[0]) < 25:
         raise ValueError(
-            f"CIFAR reference preview requires at least 25 samples, got {values.shape[0]}"
+            f"Reference preview requires at least 25 samples, got {values.shape[0]}"
         )
-    images = values[:25].to(dtype=torch.float32).reshape(25, 3, 32, 32)
+    images = values[:25].to(dtype=torch.float32).reshape(25, *shape)
     if not torch.isfinite(images).all():
-        raise ValueError("CIFAR reference preview samples contain non-finite values")
+        raise ValueError("Reference preview samples contain non-finite values")
     if bool(torch.any(images < 0.0)) or bool(torch.any(images > 1.0)):
-        raise ValueError("CIFAR reference preview samples must lie in [0, 1]")
+        raise ValueError("Reference preview samples must lie in [0, 1]")
 
     from torchvision.utils import save_image
 

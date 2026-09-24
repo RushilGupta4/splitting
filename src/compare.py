@@ -107,7 +107,7 @@ def parse_args():
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--n_runs", type=int, default=None)
     parser.add_argument("--n_parallel", type=int, default=None)
-    parser.add_argument("--crossfit_q_folds", type=int, default=None)
+    parser.add_argument("--crossfit_q_folds", type=str, default=None)
     parser.add_argument("--crossfit_q_mlp_run_parallelism", type=int, default=None)
     parser.add_argument("--crossfit_q_num_queries", type=int, default=None)
     parser.add_argument("--crossfit_q_k_max", type=int, default=None)
@@ -317,11 +317,9 @@ def _validate_config(cfg: dict, *, runner, config_name: str):
                 "CIFAR-10 training set"
             )
     cfg["query_params"] = _normalize_query_params(cfg.get("query_params"))
-    cfg["crossfit_q_folds"] = int(
+    cfg["crossfit_q_folds"] = _normalize_crossfit_q_folds(
         cfg.get("crossfit_q_folds", CROSSFIT_Q_DEFAULT_FOLDS)
     )
-    if cfg["crossfit_q_folds"] < 1:
-        raise ValueError("crossfit_q_folds must be at least 1")
     cfg["crossfit_q_mlp_run_parallelism"] = (
         _crossfit_q_normalize_mlp_run_parallelism(
             cfg.get("crossfit_q_mlp_run_parallelism")
@@ -413,7 +411,7 @@ def _apply_overrides(cfg: dict, args):
     else:
         cfg["n_parallel"] = int(cfg.get("n_parallel", 1))
     if args.crossfit_q_folds is not None:
-        cfg["crossfit_q_folds"] = int(args.crossfit_q_folds)
+        cfg["crossfit_q_folds"] = _normalize_crossfit_q_folds(args.crossfit_q_folds)
     if args.crossfit_q_mlp_run_parallelism is not None:
         cfg["crossfit_q_mlp_run_parallelism"] = int(
             args.crossfit_q_mlp_run_parallelism
@@ -462,6 +460,28 @@ def _resolve_solver_baseline_for_budget(cfg, baseline_spec, B: int, step_schedul
     return spec
 
 
+def _normalize_crossfit_q_folds(value):
+    """Normalize a fold count, comma-separated string, or sequence to a list."""
+    if isinstance(value, str):
+        items = [part for part in value.split(",") if part.strip()]
+    elif isinstance(value, (int, float)):
+        items = [value]
+    else:
+        items = list(value)
+    folds = sorted({int(item) for item in items})
+    if not folds:
+        raise ValueError("crossfit_q_folds must contain at least one value")
+    if folds[0] < 1:
+        raise ValueError("crossfit_q_folds must be at least 1")
+    return folds
+
+
+def _crossfit_q_fold_options(cfg):
+    return _normalize_crossfit_q_folds(
+        cfg.get("crossfit_q_folds", CROSSFIT_Q_DEFAULT_FOLDS)
+    )
+
+
 def _crossfit_q_loss_options(cfg):
     return _normalize_crossfit_q_mlp_losses(
         cfg.get("crossfit_q_mlp_losses"),
@@ -494,7 +514,7 @@ def _build_trial_specs(cfg, baselines, split_percentages):
     ]
     solver_baselines = [b for b in baselines if b["mode"] == "solver_baseline"]
 
-    def make(B, B1, B1_spec, resolved, *, reuse, optimizer, mlp_loss):
+    def make(B, B1, B1_spec, resolved, *, reuse, optimizer, mlp_loss, folds):
         return {
             "mode": "estimate_and_sample",
             "B": int(B),
@@ -504,20 +524,19 @@ def _build_trial_specs(cfg, baselines, split_percentages):
             "step_schedule": str(resolved.step_schedule),
             "optimization_mode": str(optimizer),
             "reuse_phase1_samples": bool(reuse),
-            "crossfit_q_folds": int(
-                cfg.get("crossfit_q_folds", CROSSFIT_Q_DEFAULT_FOLDS)
-            ),
+            "crossfit_q_folds": int(folds),
             "crossfit_q_mlp_loss": str(mlp_loss),
         }
 
     for resolved in iter_budget_resolved_sampling_config_specs(cfg):
-        for B1_entry, reuse, optimizer, mlp_loss in itertools.product(
+        for B1_entry, reuse, optimizer, mlp_loss, folds in itertools.product(
             _resolve_unique_b1_entries(
                 cfg["B1_list"], resolved.budget, config_key="B1_list"
             ),
             reuse_flags,
             optimization_modes,
             _crossfit_q_loss_options(cfg),
+            _crossfit_q_fold_options(cfg),
         ):
             B1, B1_spec = B1_entry
             if B1 >= int(resolved.budget):
@@ -527,7 +546,7 @@ def _build_trial_specs(cfg, baselines, split_percentages):
                 continue
             specs.append(
                 make(resolved.budget, B1, B1_spec, resolved, reuse=reuse,
-                     optimizer=optimizer, mlp_loss=mlp_loss)
+                     optimizer=optimizer, mlp_loss=mlp_loss, folds=folds)
             )
         for baseline_spec in schedule_baselines:
             specs.append(

@@ -58,6 +58,22 @@ FOUR_MODEL_LAYOUT = {
 # takes a different bump per figure.
 GAIN_LAYOUT = {**FOUR_MODEL_LAYOUT, "h_pad": 0.76, "w_pad": 0.89}
 ALLOCATION_LAYOUT = {**FOUR_MODEL_LAYOUT, "h_pad": 0.67, "w_pad": 1.65}
+# Five panels: the 2x2 grid plus a centred third row at the same panel size.
+# Margins are rescaled so they stay the same in inches as the 2x2 figures.
+_ABSOLUTE_HEIGHT_SCALE = 1.5
+ABSOLUTE_FIGSIZE = (FOUR_MODEL_FIGSIZE[0], _ABSOLUTE_HEIGHT_SCALE * FOUR_MODEL_FIGSIZE[1])
+ABSOLUTE_LAYOUT = {
+    **FOUR_MODEL_LAYOUT,
+    "rect": (
+        0.025,
+        0.055 / _ABSOLUTE_HEIGHT_SCALE,
+        0.99,
+        1.0 - 0.08 / _ABSOLUTE_HEIGHT_SCALE,
+    ),
+    "w_pad": 1.8,
+}
+ABSOLUTE_LEGEND_Y = 1.0 - 0.01 / _ABSOLUTE_HEIGHT_SCALE
+ABSOLUTE_XLABEL_Y = 0.025 / _ABSOLUTE_HEIGHT_SCALE
 
 SINGLE_01 = (0.1,)
 SINGLE_02 = (0.2,)
@@ -268,7 +284,46 @@ MODELS = (
             "seed": 0,
         },
     },
+    {
+        "directory": "ldm_ffhq_mmd",
+        "runner": "ldm_ffhq",
+        "config_name": "mmd",
+        "title": "FFHQ LDM",
+        "plot_title": "FFHQ LDM (MMD)",
+        "metric": "mmd",
+        "n_runs": 100,
+        "num_queries": 4_096,
+        "k_max": 1_024,
+        "pilot_coefficient": 10.0,
+        "pilot_exponent": 0.66,
+        "budgets": (50_000, 100_000, 200_000, 500_000),
+        "steps": (200, 252, 317, 430),
+        "sampler": "ddpm",
+        "reference_size": 20_000,
+        "target": None,
+        "reference_generation": {
+            "method": "ldm_ddpm_samples",
+            "sampler": "ddpm",
+            "T": 1_000,
+            "sampling_steps": 1_000,
+            "timestep_spacing": "trailing",
+            "seed": 0,
+        },
+    },
 )
+MODELS_BY_DIRECTORY = {model["directory"]: model for model in MODELS}
+# The 2x2 figures carry FFHQ in place of CIFAR-10; the tables keep both.
+PLOT_MODELS = tuple(
+    MODELS_BY_DIRECTORY[directory]
+    for directory in (
+        "simple_ou",
+        "coupled_double_well_langevin",
+        "edm_default",
+        "ldm_ffhq_mmd",
+    )
+)
+# Only the absolute-metric figure has room for CIFAR-10, in a centred bottom row.
+ABSOLUTE_MODELS = (*PLOT_MODELS, MODELS_BY_DIRECTORY["ddpm_cifar10_hf_mmd"])
 
 OU_ORACLE_MODEL = {
     **MODELS[0],
@@ -818,6 +873,24 @@ def _cifar_target_is_expected(target: dict[str, Any]) -> bool:
     )
 
 
+def _ffhq_target_is_expected(target: dict[str, Any]) -> bool:
+    return (
+        target.get("kind") == "hf_ldm_ffhq_model_samples"
+        and target.get("model_id") == "asparius/ldm-ffhq-256"
+        and target.get("commit_hash") == "5f206d37fa91ccbd1a389006cbecdd40798c0c2d"
+        and target.get("latent_shape") == [4, 32, 32]
+        and target.get("image_shape") == [3, 256, 256]
+        and target.get("sample_dim") == 196_608
+        and target.get("postprocess") == "kl_decode_scaled_clamp_0_1_chw_flat_v1"
+    )
+
+
+IMAGE_TARGET_CHECKS = {
+    "ddpm_cifar10_hf": _cifar_target_is_expected,
+    "ldm_ffhq": _ffhq_target_is_expected,
+}
+
+
 def _metric_config_is_expected(model: dict[str, Any], config: dict[str, Any]) -> bool:
     metric_config = config.get("metric_config", {})
     if metric_config.get("metrics") != [model["metric"]]:
@@ -875,8 +948,9 @@ def _sampling_config_is_expected(
 def _static_config_is_expected(model: dict[str, Any], key: dict[str, Any]) -> bool:
     target = key.get("runner_target", {})
     reference = key.get("reference_cache_key", {})
-    if model["runner"] == "ddpm_cifar10_hf":
-        targets_match = _cifar_target_is_expected(target) and _cifar_target_is_expected(
+    image_check = IMAGE_TARGET_CHECKS.get(model["runner"])
+    if image_check is not None:
+        targets_match = image_check(target) and image_check(
             reference.get("target_spec", {})
         )
     else:
@@ -939,7 +1013,8 @@ def _config_matches(row: ResultRow, config: dict[str, Any]) -> bool:
 
 def _read_valid_records(
     path: Path, metric: str, n_runs: int
-) -> tuple[np.ndarray, np.ndarray | None]:
+) -> tuple[np.ndarray, np.ndarray | None] | None:
+    """The first n_runs valid records, or None if the cache holds fewer."""
     values: list[float] = []
     factors: list[list[float]] = []
     factor_presence: bool | None = None
@@ -962,7 +1037,7 @@ def _read_valid_records(
             if len(values) == n_runs:
                 break
     if len(values) != n_runs:
-        raise RuntimeError(f"{path} contains only {len(values)} valid {metric} records")
+        return None
     factor_array = np.asarray(factors, dtype=float) if factors else None
     return np.asarray(values, dtype=float), factor_array
 
@@ -972,7 +1047,9 @@ def _attach_and_verify_caches(
     all_rows: dict[str, dict[tuple[float, ...], list[ResultRow]]],
     models: tuple[dict[str, Any], ...] = MODELS,
 ) -> None:
-    record_cache: dict[tuple[Path, str, int], tuple[np.ndarray, np.ndarray | None]] = {}
+    record_cache: dict[
+        tuple[Path, str, int], tuple[np.ndarray, np.ndarray | None] | None
+    ] = {}
     for model in models:
         run_root = outputs_root / model["directory"] / "runs"
         configs: list[tuple[Path, dict[str, Any]]] = []
@@ -994,6 +1071,8 @@ def _attach_and_verify_caches(
                         record_cache[cache_key] = _read_valid_records(
                             runs_path, model["metric"], row.n
                         )
+                    if record_cache[cache_key] is None:
+                        continue
                     samples, factors = record_cache[cache_key]
                     mean_matches = math.isclose(
                         float(samples.mean()), row.mean, rel_tol=1e-11, abs_tol=1e-13
@@ -1262,6 +1341,7 @@ def _four_model_title(model: dict[str, Any], *, include_metric: bool = True) -> 
         "coupled_double_well_langevin": "Langevin",
         "edm_default": "EDM-GMM",
         "ddpm_cifar10_hf_mmd": "CIFAR-10",
+        "ldm_ffhq_mmd": "FFHQ",
     }[model["directory"]]
     return f"{title} ({model['metric'].upper()})" if include_metric else title
 
@@ -1315,9 +1395,11 @@ def _set_budget_ticks(ax: plt.Axes, budgets: Iterable[int]) -> None:
     ax.xaxis.set_major_formatter(FuncFormatter(_budget_tick))
 
 
-def _set_shared_axis_labels(fig: plt.Figure, *, xlabel: str, ylabel: str) -> None:
+def _set_shared_axis_labels(
+    fig: plt.Figure, *, xlabel: str, ylabel: str, x_label_y: float = 0.025
+) -> None:
     """Place shared labels close to the axes without double-counting their margins."""
-    x_label = fig.supxlabel(xlabel, x=0.52, y=0.025)
+    x_label = fig.supxlabel(xlabel, x=0.52, y=x_label_y)
     y_label = fig.supylabel(ylabel, x=0.015, y=0.49)
     x_label.set_in_layout(False)
     y_label.set_in_layout(False)
@@ -1347,6 +1429,7 @@ def _finish_four_model_figure(
     *,
     legend_ncol: int | None = None,
     layout: dict[str, Any] | None = None,
+    legend_y: float = 0.990,
 ) -> None:
     """Apply the common legend, spacing, and exact-size export layout."""
     fig.legend(
@@ -1355,7 +1438,7 @@ def _finish_four_model_figure(
         loc="upper center",
         ncol=legend_ncol if legend_ncol is not None else len(legend_labels),
         frameon=False,
-        bbox_to_anchor=(0.5, 0.990),
+        bbox_to_anchor=(0.5, legend_y),
         columnspacing=1.4,
         handletextpad=0.5,
     )
@@ -1584,7 +1667,7 @@ def _plot_reductions(
     plotted_learned = False
     plotted_learned_c = False
 
-    for ax, model in zip(axes.flat, MODELS):
+    for ax, model in zip(axes.flat, PLOT_MODELS):
         if model["directory"] not in all_rows:
             ax.set_visible(False)
             continue
@@ -1779,12 +1862,19 @@ def _plot_absolute_metrics(
     output_dir: Path,
 ) -> bool:
     _four_model_style()
-    fig, axes = plt.subplots(2, 2, figsize=FOUR_MODEL_FIGSIZE)
+    fig = plt.figure(figsize=ABSOLUTE_FIGSIZE)
+    grid = fig.add_gridspec(3, 4)
+    axes = [
+        fig.add_subplot(grid[row, 2 * column : 2 * column + 2])
+        for row in range(2)
+        for column in range(2)
+    ]
+    axes.append(fig.add_subplot(grid[2, 1:3]))
     legend_handles: list[Any] = []
     legend_labels: list[str] = []
     plotted_any = False
 
-    for ax, model in zip(axes.flat, MODELS):
+    for ax, model in zip(axes, ABSOLUTE_MODELS):
         if model["directory"] not in all_rows:
             ax.set_visible(False)
             continue
@@ -1881,17 +1971,18 @@ def _plot_absolute_metrics(
             stacklevel=2,
         )
         return False
-    _label_visible_grid(axes, xlabel="", ylabel="")
     _set_shared_axis_labels(
         fig,
         xlabel="Budget $B$",
         ylabel="Mean Error Metric",
+        x_label_y=ABSOLUTE_XLABEL_Y,
     )
     _finish_four_model_figure(
         fig,
         legend_handles,
         legend_labels,
-        layout={**FOUR_MODEL_LAYOUT, "w_pad": 1.8},
+        layout=ABSOLUTE_LAYOUT,
+        legend_y=ABSOLUTE_LEGEND_Y,
     )
     _save_figure(
         fig,
@@ -2027,28 +2118,47 @@ def _plot_ou_oracle_allocations(
     return True
 
 
+def _mean_allocation(
+    model: dict[str, Any], schedule: tuple[float, ...], row: ResultRow
+) -> tuple[np.ndarray, np.ndarray]:
+    if row.split_factors is None:
+        raise RuntimeError("Missing split-factor samples")
+    expected_shape = (row.n, len(schedule))
+    if row.split_factors.shape != expected_shape:
+        raise RuntimeError(
+            f"Unexpected split-factor shape for {model['directory']}: "
+            f"{row.split_factors.shape}, expected {expected_shape}"
+        )
+    cumulative = np.cumprod(row.split_factors, axis=1)
+    if np.any(cumulative < 1.0 - 1e-10) or np.any(
+        np.diff(cumulative, axis=1) < -1e-10
+    ):
+        raise RuntimeError(f"Invalid allocation for {model['directory']}")
+    times, mean, _, _ = _allocation_curve(schedule, cumulative)
+    return times, mean
+
+
 def _plot_allocations(
     all_rows: dict[str, dict[tuple[float, ...], list[ResultRow]]], output_dir: Path
 ) -> bool:
     _four_model_style()
     fig, axes = plt.subplots(2, 2, figsize=FOUR_MODEL_FIGSIZE)
-    legend_handles: list[Any] = []
-    legend_labels: list[str] = []
+    plotted_schedules: set[tuple[float, ...]] = set()
+    plotted_learned_c = False
     plotted_any = False
 
-    for ax, model in zip(axes.flat, MODELS):
+    for ax, model in zip(axes.flat, PLOT_MODELS):
         if model["directory"] not in all_rows:
             ax.set_visible(False)
             continue
         curves: list[
             tuple[
                 tuple[float, ...],
-                str,
-                np.ndarray,
-                np.ndarray,
+                tuple[np.ndarray, np.ndarray],
+                tuple[np.ndarray, np.ndarray] | None,
             ]
         ] = []
-        for schedule, label in SCHEDULES:
+        for schedule, _ in SCHEDULES:
             if schedule not in all_rows[model["directory"]]:
                 continue
             rows = all_rows[model["directory"]][schedule]
@@ -2056,22 +2166,18 @@ def _plot_allocations(
             if not splitting_rows:
                 continue
             splitting = max(splitting_rows, key=lambda row: row.budget)
-            if splitting.split_factors is None:
-                raise RuntimeError("Missing split-factor samples")
-            expected_shape = (splitting.n, len(schedule))
-            if splitting.split_factors.shape != expected_shape:
-                raise RuntimeError(
-                    f"Unexpected split-factor shape for {model['directory']}: "
-                    f"{splitting.split_factors.shape}, expected {expected_shape}"
+            learned_c = _row_at_budget(
+                rows, splitting.budget, "adaptive", LEARNED_C_OPTIMIZER
+            )
+            curves.append(
+                (
+                    schedule,
+                    _mean_allocation(model, schedule, splitting),
+                    None
+                    if learned_c is None
+                    else _mean_allocation(model, schedule, learned_c),
                 )
-            split_factors = splitting.split_factors
-            cumulative = np.cumprod(split_factors, axis=1)
-            if np.any(cumulative < 1.0 - 1e-10) or np.any(
-                np.diff(cumulative, axis=1) < -1e-10
-            ):
-                raise RuntimeError(f"Invalid allocation for {model['directory']}")
-            times, mean, _, _ = _allocation_curve(schedule, cumulative)
-            curves.append((schedule, label, times, mean))
+            )
 
         if not curves:
             ax.set_visible(False)
@@ -2080,7 +2186,7 @@ def _plot_allocations(
 
         # Dense schedules go down first; shorter schedules stay visible where
         # their horizontal segments overlap the denser curves.
-        for schedule, label, times, mean in reversed(curves):
+        for schedule, (times, mean), learned_c_curve in reversed(curves):
             ax.step(
                 times,
                 mean,
@@ -2088,9 +2194,19 @@ def _plot_allocations(
                 color=SCHEDULE_COLORS[schedule],
                 linestyle="-",
                 linewidth=DATA_LINEWIDTH,
-                label=label,
                 zorder=3,
             )
+            if learned_c_curve is not None:
+                ax.step(
+                    *learned_c_curve,
+                    where="post",
+                    color=SCHEDULE_COLORS[schedule],
+                    linestyle=LEARNED_C_LINESTYLE,
+                    linewidth=LEARNED_C_LINEWIDTH,
+                    zorder=2,
+                )
+                plotted_learned_c = True
+            plotted_schedules.add(schedule)
         ax.axhline(1.0, color="#555555", linewidth=REFERENCE_LINEWIDTH, linestyle=":")
         ax.set_title(_four_model_title(model, include_metric=False))
         ax.set_xlim(0.0, 1.0)
@@ -2099,11 +2215,6 @@ def _plot_allocations(
         ax.yaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value:g}"))
         ax.tick_params(axis="y", which="minor", left=False)
         ax.grid(axis="y", which="major", color="#D8D8D8", linewidth=GRID_LINEWIDTH)
-        axis_handles, axis_labels = ax.get_legend_handles_labels()
-        for handle, label in zip(axis_handles, axis_labels):
-            if label not in legend_labels:
-                legend_handles.append(handle)
-                legend_labels.append(label)
     if not plotted_any:
         plt.close(fig)
         warnings.warn(
@@ -2117,15 +2228,15 @@ def _plot_allocations(
     _set_shared_axis_labels(
         fig,
         xlabel="Elapsed fraction of trajectory",
-        ylabel=r"Learned $R_i$",
+        ylabel=r"Cumulative allocation $R_i$",
     )
-    label_order = {label: index for index, (_, label) in enumerate(SCHEDULES)}
-    ordered_legend = sorted(
-        zip(legend_handles, legend_labels),
-        key=lambda item: label_order[item[1]],
+    legend_handles = _reduction_legend_handles(
+        plotted_schedules,
+        include_learned=plotted_learned_c,
+        include_uniform_c=False,
+        include_learned_c=plotted_learned_c,
     )
-    legend_handles = [handle for handle, _ in ordered_legend]
-    legend_labels = [label for _, label in ordered_legend]
+    legend_labels = [handle.get_label() for handle in legend_handles]
     _finish_four_model_figure(
         fig,
         legend_handles,

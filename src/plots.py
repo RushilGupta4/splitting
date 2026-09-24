@@ -28,6 +28,7 @@ STRUCTURAL_CSV_FIELDS = {
     "step_schedule",
     "B",
     "B1",
+    "crossfit_q_folds",
     "crossfit_q_mlp_loss",
     "reuse",
     "optimizer",
@@ -58,6 +59,7 @@ PLOT_SPECS = {
     },
 }
 PLOT_NAMES = tuple(PLOT_SPECS)
+DEFAULT_PLOTS = ("main", "percent_change", "cumulative_splits")
 
 
 @dataclass(frozen=True)
@@ -70,6 +72,7 @@ class Row:
     B: int
     B1: int | None
     B1_spec: str
+    crossfit_q_folds: int
     crossfit_q_mlp_loss: str
     reuse: bool | None
     optimizer: str
@@ -131,7 +134,7 @@ def _parse_plots(raw: str):
     if not names:
         raise ValueError("--plots must include at least one plot name")
     if "all" in names:
-        return list(PLOT_NAMES)
+        return list(DEFAULT_PLOTS)
     unknown = [n for n in names if n not in PLOT_SPECS]
     if unknown:
         raise ValueError(
@@ -347,6 +350,7 @@ def _load_rows(csv_path: str):
             reuse = _parse_bool(raw_row.get("reuse", ""))
             optimizer = (raw_row.get("optimizer") or "").strip()
             crossfit_q_mlp_loss = (raw_row.get("crossfit_q_mlp_loss") or "").strip()
+            crossfit_q_folds = _parse_int(raw_row.get("crossfit_q_folds", "")) or 1
             B1 = _parse_int(raw_row.get("B1", ""))
             B1_spec = _normalize_b1_spec(
                 raw_row.get("B1_spec", ""),
@@ -365,6 +369,7 @@ def _load_rows(csv_path: str):
                     B=B,
                     B1=B1,
                     B1_spec=B1_spec,
+                    crossfit_q_folds=crossfit_q_folds,
                     crossfit_q_mlp_loss=crossfit_q_mlp_loss,
                     reuse=reuse,
                     optimizer=optimizer,
@@ -532,6 +537,7 @@ def _method_key(row: Row):
         row.crossfit_q_mlp_loss,
         bool(row.reuse),
         row.optimizer,
+        int(row.crossfit_q_folds),
     )
 
 
@@ -587,7 +593,12 @@ def _solver_rows(rows):
 
 
 def _mode_key(row: Row):
-    return (row.crossfit_q_mlp_loss, bool(row.reuse), row.optimizer)
+    return (
+        row.crossfit_q_mlp_loss,
+        bool(row.reuse),
+        row.optimizer,
+        int(row.crossfit_q_folds),
+    )
 
 
 def _mode_keys(rows):
@@ -595,13 +606,13 @@ def _mode_keys(rows):
 
 
 def _mode_title(mode_key):
-    crossfit_q_mlp_loss, reuse, optimizer = mode_key
+    crossfit_q_mlp_loss, reuse, optimizer, crossfit_q_folds = mode_key
     label = "reuse" if reuse else "fresh"
     if crossfit_q_mlp_loss:
         label += f" {crossfit_q_mlp_loss}"
     if optimizer:
         label += f" {optimizer}"
-    return label
+    return f"{label} K={int(crossfit_q_folds)}"
 
 
 def _baseline_series_key(row: Row):
@@ -1626,6 +1637,14 @@ def _plot_percent_line(
     return True
 
 
+def _adaptive_linestyle(method_key):
+    return (
+        "--"
+        if method_key[1] == "independent"
+        else ":" if method_key[1] == "joint" else "-"
+    )
+
+
 def _plot_percent_change_panel(
     ax,
     schedule,
@@ -1633,8 +1652,10 @@ def _plot_percent_change_panel(
     baseline_by_group,
     adaptive_by_group,
     solver_by_group,
+    method_styles,
+    b1_markers,
     solver_styles,
-    mode_styles,
+    legend_handles,
 ):
     baseline_by_budget = {
         budget: row
@@ -1643,34 +1664,56 @@ def _plot_percent_change_panel(
     }
     plotted_any = False
 
-    adaptive_mode_keys = sorted(
+    adaptive_series_keys = sorted(
         {
-            mode_key
-            for (group_schedule, mode_key, _) in adaptive_by_group
+            (method_key, b1)
+            for (group_schedule, method_key, b1, _) in adaptive_by_group
             if group_schedule == schedule
-        }
+        },
+        key=str,
     )
-    for mode_key in adaptive_mode_keys:
+    for method_key, b1 in adaptive_series_keys:
         adaptive_by_budget = {
             budget: row
             for (
                 group_schedule,
-                group_mode_key,
+                group_method_key,
+                group_b1,
                 budget,
             ), row in adaptive_by_group.items()
-            if group_schedule == schedule and group_mode_key == mode_key
+            if group_schedule == schedule
+            and group_method_key == method_key
+            and group_b1 == b1
         }
-        color, linestyle, marker = _mode_style(mode_key, mode_styles)
-        plotted_any |= _plot_percent_line(
+        color = method_styles.get(method_key, "#1f77b4")
+        linestyle = _adaptive_linestyle(method_key)
+        marker = b1_markers.get(b1, "o")
+        label = (
+            f"{_method_display_label(method_key)}, "
+            f"{_format_b1_series_label(b1)}"
+        )
+        if _plot_percent_line(
             ax,
             baseline_by_budget,
             adaptive_by_budget,
             color=color,
             linestyle=linestyle,
             marker=marker,
-            label=_mode_title(mode_key),
+            label=label,
             metric=metric,
-        )
+        ):
+            plotted_any = True
+            legend_handles.setdefault(
+                label,
+                Line2D(
+                    [0],
+                    [0],
+                    color=color,
+                    linestyle=linestyle,
+                    marker=marker,
+                    linewidth=2.0,
+                ),
+            )
 
     solver_series_keys = sorted(
         {
@@ -1692,7 +1735,7 @@ def _plot_percent_change_panel(
         color, linestyle, marker, label = _solver_style(solver_key, solver_styles)
         if solver_step_schedule:
             label = f"{label}, {solver_step_schedule}"
-        plotted_any |= _plot_percent_line(
+        if _plot_percent_line(
             ax,
             baseline_by_budget,
             solver_by_budget,
@@ -1701,11 +1744,22 @@ def _plot_percent_change_panel(
             marker=marker,
             label=label,
             metric=metric,
-        )
+        ):
+            plotted_any = True
+            legend_handles.setdefault(
+                label,
+                Line2D(
+                    [0],
+                    [0],
+                    color=color,
+                    linestyle=linestyle,
+                    marker=marker,
+                    linewidth=2.0,
+                ),
+            )
 
     if plotted_any:
         ax.axhline(0.0, color="0.35", linestyle="--", linewidth=1.0)
-        ax.legend(frameon=False, fontsize=8, borderaxespad=0.6, labelspacing=0.5)
     else:
         ax.text(0.5, 0.5, "no data", ha="center", va="center", transform=ax.transAxes)
     ax.grid(alpha=0.25)
@@ -1713,7 +1767,7 @@ def _plot_percent_change_panel(
     _apply_scalar_formatters(ax, format_x=True, format_y=True)
 
 
-def _plot_percent_change(rows, title_prefix, solver_styles, mode_styles):
+def _plot_percent_change(rows, title_prefix, solver_styles, method_styles, b1_markers):
     metrics = _available_metrics(rows)
     schedules = sorted(
         {_schedule_key(row) for row in rows if row.mode != "solver_baseline"},
@@ -1723,15 +1777,6 @@ def _plot_percent_change(rows, title_prefix, solver_styles, mode_styles):
         return plt.figure(figsize=(7.2, 4.8), constrained_layout=True)
     panels = [(metric, schedule) for metric in metrics for schedule in schedules]
     nrows, ncols = _make_subplot_grid(len(panels), max_cols=2)
-    fig, axes = plt.subplots(
-        nrows,
-        ncols,
-        figsize=(7.2 * ncols, 4.8 * nrows),
-        squeeze=False,
-        sharey=True,
-        constrained_layout=True,
-    )
-    axes_flat = axes.flatten()
     groups_by_metric = {}
     for metric in metrics:
         groups_by_metric[metric] = (
@@ -1742,7 +1787,12 @@ def _plot_percent_change(rows, title_prefix, solver_styles, mode_styles):
             ),
             _best_by_group(
                 _adaptive_rows(rows),
-                key_fn=lambda row: (_schedule_key(row), _mode_key(row), row.B),
+                key_fn=lambda row: (
+                    _schedule_key(row),
+                    _method_key(row),
+                    _b1_series_key(row),
+                    row.B,
+                ),
                 metric=metric,
             ),
             _best_by_group(
@@ -1751,6 +1801,26 @@ def _plot_percent_change(rows, title_prefix, solver_styles, mode_styles):
                 metric=metric,
             ),
         )
+    legend_handles: dict[str, Line2D] = {}
+    label_count = len(
+        {
+            f"{_method_display_label(_method_key(row))}, "
+            f"{_format_b1_series_label(_b1_series_key(row))}"
+            for row in _adaptive_rows(rows)
+        }
+    ) + len(_solver_series_keys(rows))
+    legend_ncol = _main_legend_ncol([""] * label_count) if label_count else 1
+    fig, axes = plt.subplots(
+        nrows,
+        ncols,
+        figsize=_with_top_legend_height(
+            (7.2 * ncols, 4.8 * nrows), label_count, legend_ncol
+        ),
+        squeeze=False,
+        sharey=True,
+        constrained_layout=True,
+    )
+    axes_flat = axes.flatten()
     for ax, (metric, schedule) in zip(axes_flat, panels):
         baseline_by_group, adaptive_by_group, solver_by_group = groups_by_metric[metric]
         _plot_percent_change_panel(
@@ -1760,8 +1830,10 @@ def _plot_percent_change(rows, title_prefix, solver_styles, mode_styles):
             baseline_by_group,
             adaptive_by_group,
             solver_by_group,
+            method_styles,
+            b1_markers,
             solver_styles,
-            mode_styles,
+            legend_handles,
         )
         ax.set_title(f"{_format_schedule_short(schedule)} - {_metric_label(metric)}")
         ax.set_xlabel("B")
@@ -1771,6 +1843,18 @@ def _plot_percent_change(rows, title_prefix, solver_styles, mode_styles):
         row_axes[0].set_ylabel("Change vs baseline (%)")
     if title_prefix:
         fig.suptitle(f"{title_prefix}: {PLOT_SPECS['percent_change']['title']}")
+    if legend_handles:
+        labels = sorted(legend_handles)
+        fig.legend(
+            [legend_handles[label] for label in labels],
+            labels,
+            loc="outside upper center",
+            ncol=_main_legend_ncol(labels),
+            frameon=False,
+            borderaxespad=1.0,
+            columnspacing=1.4,
+            labelspacing=0.8,
+        )
     return fig
 
 
@@ -1881,7 +1965,13 @@ def main():
             output_path = _suffixed_output_path(
                 args.csv_file, PLOT_SPECS[plot_name]["filename_suffix"]
             )
-            fig = _plot_percent_change(rows, args.title, solver_styles, mode_styles)
+            fig = _plot_percent_change(
+                rows,
+                args.title,
+                solver_styles,
+                _build_method_style_map(rows),
+                _build_b1_marker_map(rows),
+            )
         else:
             continue
 

@@ -389,6 +389,16 @@ class BaseRunner(ABC):
     ) -> "BaseRunner":
         """Load model, target info, normalization, and default schedule config."""
 
+    @classmethod
+    def load_without_model(cls, *, device: str, **kwargs) -> "BaseRunner | None":
+        """Return a weightless instance for cache-key work, or None if unsupported.
+
+        Only metadata-driven methods (target_spec, checkpoint_path, cache keys)
+        are valid on the result; anything touching the model will fail.
+        """
+        del device, kwargs
+        return None
+
     @abstractmethod
     def with_sampling_config(self, **kwargs) -> "BaseRunner":
         """Return a cheap copy using the same loaded model but a different sampling config."""
@@ -402,6 +412,20 @@ class BaseRunner(ABC):
     @abstractmethod
     def input_dim(self) -> int:
         ...
+
+    @property
+    def phase1_query_space(self) -> str:
+        """Space the phase-1 queries and labels live in.
+
+        ``"target"`` labels on the postprocessed terminal sample, which is the
+        space the metric uses. ``"model"`` labels on the raw terminal state
+        instead -- the space the path state itself lives in. A latent diffusion
+        runner needs ``"model"``: its queries are drawn at ``input_dim`` (the
+        latent), so labelling on a decoded image would put the query's
+        coordinate indices in a different space from the state the regressor
+        conditions on.
+        """
+        return "target"
 
     @property
     @abstractmethod

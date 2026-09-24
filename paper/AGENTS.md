@@ -23,6 +23,7 @@ Tables are not imported automatically. Treat the generated CSVs as the source of
 - `complete_langevin.csv` -> `tab:complete-langevin`
 - `complete_edm.csv` -> `tab:complete-edm`
 - `complete_ddpm.csv` -> `tab:complete-ddpm`
+- `complete_ffhq.csv` -> `tab:complete-ffhq`
 - `ou_oracle_reductions.csv` -> `tab:ou-oracle-reductions`
 - `numerical_schedules.csv` and `reference_samples.csv` -> their corresponding setup tables
 
