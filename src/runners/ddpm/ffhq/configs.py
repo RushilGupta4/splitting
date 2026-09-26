@@ -2,7 +2,7 @@ from copy import deepcopy
 
 from runners.common_configs import (
     OPTIMIZATION_MODES_WITH_LEARNED_C,
-    crossfit_q_config,
+    mmd_sibling_config,
     split_schedules,
 )
 
@@ -34,12 +34,10 @@ _DEFAULT = {
     "metric_params": {"mmd": {"batch_size": 256}},
     "split_percentages_list": split_schedules(),
     "optimization_modes": OPTIMIZATION_MODES_WITH_LEARNED_C,
-    "crossfit_q_mlp_losses": ["mse"],
     "num_base_samples": 20_000,
     "max_sampling_batch_size": 2500,
     "n_runs": 100,
-    **crossfit_q_config(),
     "description": "FFHQ LDM with decoded-image MMD against a full DDPM reference",
 }
 
-CONFIGS = {name: deepcopy(_DEFAULT) for name in ("default", "mmd")}
+CONFIGS = {name: mmd_sibling_config(deepcopy(_DEFAULT)) for name in ("default", "mmd")}

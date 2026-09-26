@@ -44,7 +44,8 @@ from runners.base import (
     step_schedules_for_sampler,
     steps_for_budget,
 )
-from runners.common_configs import uniform_c_values
+from phase1_mmd import normalize_mmd_sibling_params
+from runners.common_configs import KS_PHASE1_KEYS, uniform_c_values
 from runners.registry import get_runner_class, names
 from runners.splitting import normalize_max_sampling_batch_size
 from trials import mean_vector, std_vector
@@ -316,21 +317,31 @@ def _validate_config(cfg: dict, *, runner, config_name: str):
                 "CIFAR reference-sample metrics require the torchvision "
                 "CIFAR-10 training set"
             )
-    cfg["query_params"] = _normalize_query_params(cfg.get("query_params"))
-    cfg["crossfit_q_folds"] = _normalize_crossfit_q_folds(
-        cfg.get("crossfit_q_folds", CROSSFIT_Q_DEFAULT_FOLDS)
-    )
-    cfg["crossfit_q_mlp_run_parallelism"] = (
-        _crossfit_q_normalize_mlp_run_parallelism(
-            cfg.get("crossfit_q_mlp_run_parallelism")
+    if cfg["primary_metric"] == "mmd":
+        ks_keys = sorted(KS_PHASE1_KEYS.intersection(cfg))
+        if ks_keys:
+            raise ValueError(
+                f"MMD configs use the mmd_sibling Phase 1; remove crossfit keys {ks_keys}"
+            )
+        cfg["phase1"] = normalize_mmd_sibling_params(cfg.get("phase1") or {})
+    else:
+        if cfg.get("phase1") is not None:
+            raise ValueError("phase1 is only configurable when primary_metric is mmd")
+        cfg["query_params"] = _normalize_query_params(cfg.get("query_params"))
+        cfg["crossfit_q_folds"] = _normalize_crossfit_q_folds(
+            cfg.get("crossfit_q_folds", CROSSFIT_Q_DEFAULT_FOLDS)
         )
-    )
-    cfg["crossfit_q_mlp_params"] = _crossfit_q_normalize_mlp_params(
-        cfg.get("crossfit_q_mlp_params")
-    )
-    cfg["crossfit_q_mlp_losses"] = _normalize_crossfit_q_mlp_losses(
-        cfg.get("crossfit_q_mlp_losses"), cfg["crossfit_q_mlp_params"]
-    )
+        cfg["crossfit_q_mlp_run_parallelism"] = (
+            _crossfit_q_normalize_mlp_run_parallelism(
+                cfg.get("crossfit_q_mlp_run_parallelism")
+            )
+        )
+        cfg["crossfit_q_mlp_params"] = _crossfit_q_normalize_mlp_params(
+            cfg.get("crossfit_q_mlp_params")
+        )
+        cfg["crossfit_q_mlp_losses"] = _normalize_crossfit_q_mlp_losses(
+            cfg.get("crossfit_q_mlp_losses"), cfg["crossfit_q_mlp_params"]
+        )
     optimization_modes = _normalize_optimization_modes(
         cfg.get("optimization_modes", ["monotone"])
     )
@@ -515,7 +526,7 @@ def _build_trial_specs(cfg, baselines, split_percentages):
     solver_baselines = [b for b in baselines if b["mode"] == "solver_baseline"]
 
     def make(B, B1, B1_spec, resolved, *, reuse, optimizer, mlp_loss, folds):
-        return {
+        spec = {
             "mode": "estimate_and_sample",
             "B": int(B),
             "B1": int(B1),
@@ -524,9 +535,15 @@ def _build_trial_specs(cfg, baselines, split_percentages):
             "step_schedule": str(resolved.step_schedule),
             "optimization_mode": str(optimizer),
             "reuse_phase1_samples": bool(reuse),
-            "crossfit_q_folds": int(folds),
-            "crossfit_q_mlp_loss": str(mlp_loss),
         }
+        if folds is not None:
+            spec["crossfit_q_folds"] = int(folds)
+            spec["crossfit_q_mlp_loss"] = str(mlp_loss)
+        return spec
+
+    sibling = cfg.get("phase1") is not None
+    loss_options = [None] if sibling else _crossfit_q_loss_options(cfg)
+    fold_options = [None] if sibling else _crossfit_q_fold_options(cfg)
 
     for resolved in iter_budget_resolved_sampling_config_specs(cfg):
         for B1_entry, reuse, optimizer, mlp_loss, folds in itertools.product(
@@ -535,8 +552,8 @@ def _build_trial_specs(cfg, baselines, split_percentages):
             ),
             reuse_flags,
             optimization_modes,
-            _crossfit_q_loss_options(cfg),
-            _crossfit_q_fold_options(cfg),
+            loss_options,
+            fold_options,
         ):
             B1, B1_spec = B1_entry
             if B1 >= int(resolved.budget):
@@ -633,6 +650,15 @@ def _run_trial(
             result_mode="ou_oracle",
             include_allocation=True,
             variances=runner.oracle_variances(split_percentages),
+        )
+    if cfg.get("phase1") is not None:
+        return run_estimate_and_sample(
+            **common,
+            B1=int(spec["B1"]),
+            split_percentages=split_percentages,
+            optimization_mode=str(spec["optimization_mode"]),
+            reuse_phase1_samples=bool(spec["reuse_phase1_samples"]),
+            phase1=cfg["phase1"],
         )
     crossfit_q_mlp_params = dict(cfg.get("crossfit_q_mlp_params") or {})
     crossfit_q_mlp_params["loss"] = str(spec["crossfit_q_mlp_loss"])
@@ -858,6 +884,9 @@ def _config_cache_key(
         )
     if spec["mode"] == "estimate_and_sample":
         key["adaptive_implementation_version"] = _ADAPTIVE_IMPLEMENTATION_VERSION
+        if cfg.get("phase1") is not None:
+            key["phase1"] = _json_safe(cfg["phase1"])
+            return key
         crossfit_folds = int(
             spec.get("crossfit_q_folds", CROSSFIT_Q_DEFAULT_FOLDS)
         )
@@ -1042,6 +1071,18 @@ def _build_comparison_states(base_runner, cfg):
             metric_params=cfg.get("metric_params") or {},
         )
     }
+    if cfg.get("phase1") is not None:
+        design_params = {
+            **((cfg.get("metric_params") or {}).get("mmd") or {}),
+            "seed": cfg["phase1"]["design_seed"],
+        }
+        states[None]["mmd_design"] = prepare_metric_states(
+            base_runner,
+            comparison_mode=mode,
+            reference_samples=samples,
+            metrics=["mmd"],
+            metric_params={"mmd": design_params},
+        )["mmd"]
     return mode_spec, states
 
 
@@ -1135,8 +1176,8 @@ def _aggregate_cached_runs(spec, trials, *, base_runner, split_percentages, cfg)
         **base,
         "B1": int(spec["B1"]),
         "B1_spec": str(spec["B1_spec"]),
-        "crossfit_q_folds": int(
-            spec.get("crossfit_q_folds", CROSSFIT_Q_DEFAULT_FOLDS)
+        "crossfit_q_folds": (
+            int(spec["crossfit_q_folds"]) if "crossfit_q_folds" in spec else ""
         ),
         "crossfit_q_mlp_loss": str(spec.get("crossfit_q_mlp_loss") or ""),
         "reuse": bool(spec["reuse_phase1_samples"]),

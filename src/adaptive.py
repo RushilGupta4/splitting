@@ -1988,7 +1988,10 @@ def run_estimate_and_sample(
     return_trial_results: bool = False,
     max_sampling_batch_size=None,
     max_paths_in_flight=None,
+    phase1: Mapping[str, Any] | None = None,
 ):
+    """``phase1`` selects the MMD sibling-pilot Phase 1, which reads
+    ``comparison_state["mmd_design"]``; without it the crossfit query MLP runs."""
     if not 0 <= B1 < B:
         raise ValueError("require 0 <= B1 < B")
     if int(crossfit_q_folds) < 1:
@@ -2060,19 +2063,37 @@ def run_estimate_and_sample(
                     if attempt_seed is None
                     else attempt_seed + attempt_offset + start
                 )
-                payloads = _run_crossfit_q_phase1_sampling_batch(
-                    runner,
-                    B1=B1,
-                    seed=attempt_seed,
-                    run_index_offset=attempt_offset + start,
-                    split_percentages=split_percentages,
-                    reuse_phase1_samples=reuse_phase1_samples,
-                    chunk_size=chunk_size,
-                    debug=debug,
-                    max_sampling_batch_size=max_sampling_batch_size,
-                    generator=make_torch_generator(run_seed, runner.device),
-                    **phase1_extra,
-                )
+                generator = make_torch_generator(run_seed, runner.device)
+                if phase1 is not None:
+                    from phase1_mmd import run_mmd_sibling_phase1_batch
+
+                    payloads = run_mmd_sibling_phase1_batch(
+                        runner,
+                        B=B,
+                        B1=B1,
+                        split_percentages=split_percentages,
+                        phase1=phase1,
+                        design_state=comparison_state["mmd_design"],
+                        optimization_mode=optimization_mode,
+                        reuse_phase1_samples=reuse_phase1_samples,
+                        chunk_size=chunk_size,
+                        max_sampling_batch_size=max_sampling_batch_size,
+                        generator=generator,
+                    )
+                else:
+                    payloads = _run_crossfit_q_phase1_sampling_batch(
+                        runner,
+                        B1=B1,
+                        seed=attempt_seed,
+                        run_index_offset=attempt_offset + start,
+                        split_percentages=split_percentages,
+                        reuse_phase1_samples=reuse_phase1_samples,
+                        chunk_size=chunk_size,
+                        debug=debug,
+                        max_sampling_batch_size=max_sampling_batch_size,
+                        generator=generator,
+                        **phase1_extra,
+                    )
                 for payload in payloads:
                     allocation_futures.append(
                         alloc_executor.submit(

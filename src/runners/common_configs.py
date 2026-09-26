@@ -28,6 +28,24 @@ def split_schedules(counts=SPLIT_COUNTS) -> list[list[float]]:
     ]
 
 
+KS_PHASE1_KEYS = frozenset(
+    {
+        "query_params",
+        "crossfit_q_folds",
+        "crossfit_q_mlp_params",
+        "crossfit_q_mlp_losses",
+        "crossfit_q_mlp_run_parallelism",
+    }
+)
+
+
+def mmd_sibling_config(cfg: dict, **phase1) -> dict:
+    """``cfg`` with the MMD Phase 1: the crossfit query keys are dropped and the sibling pilot selected."""
+    out = {key: value for key, value in cfg.items() if key not in KS_PHASE1_KEYS}
+    out["phase1"] = {"estimator": "mmd_sibling", **phase1}
+    return out
+
+
 def crossfit_q_config(
     num_queries: int | None = None,
     losses=None,
@@ -51,11 +69,13 @@ def crossfit_q_config(
 
 
 __all__ = [
+    "KS_PHASE1_KEYS",
     "OPTIMIZATION_MODES",
     "OPTIMIZATION_MODES_WITH_LEARNED_C",
     "SPLIT_COUNTS",
     "UNIFORM_C_BY_SPLIT_COUNT",
     "crossfit_q_config",
+    "mmd_sibling_config",
     "split_schedules",
     "uniform_c_values",
 ]

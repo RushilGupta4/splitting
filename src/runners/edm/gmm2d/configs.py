@@ -1,6 +1,7 @@
 from runners.common_configs import (
     OPTIMIZATION_MODES_WITH_LEARNED_C,
     crossfit_q_config,
+    mmd_sibling_config,
     split_schedules,
 )
 from runners.edm.configs import _DPMPP_2S_PARAMS, _EDM_PARAMS
@@ -83,13 +84,15 @@ _DEFAULT_CONFIG = {
 
 CONFIGS = {
     "default": _DEFAULT_CONFIG,
-    "mmd": {
-        **_DEFAULT_CONFIG,
-        "metrics": ["mmd"],
-        "primary_metric": "mmd",
-        "description": (
-            "Adaptive splitting with target-space MMD against target samples on EDM "
-            "(2D GMM)"
-        ),
-    },
+    "mmd": mmd_sibling_config(
+        {
+            **_DEFAULT_CONFIG,
+            "metrics": ["mmd"],
+            "primary_metric": "mmd",
+            "description": (
+                "Adaptive splitting with target-space MMD against target samples on EDM "
+                "(2D GMM)"
+            ),
+        }
+    ),
 }

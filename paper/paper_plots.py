@@ -39,8 +39,8 @@ FIGURE_DPI = 300
 # Shared styling for the three four-model, 2x2 publication figures.  Keeping
 # these values in one place prevents small visual differences between panels
 # that are intended to be read as a set.
-FOUR_MODEL_FIGSIZE = (8.4, 8.4 / 1.8)
-# 2520x1400 output for the standardized 1.8:1 figures at 300 DPI.
+FOUR_MODEL_FIGSIZE = (8.4, 8.4 / 1.9)
+# 2520x1326 output for the standardized 1.9:1 figures at 300 DPI.
 DATA_LINEWIDTH = 1.5
 LEARNED_LINEWIDTH = 1.25
 LEARNED_C_LINEWIDTH = 1.15
@@ -49,31 +49,29 @@ UNIFORM_C_ALPHA = 0.8
 REFERENCE_LINEWIDTH = 0.8
 GRID_LINEWIDTH = 0.55
 INTERVAL_ALPHA = 0.14
-FOUR_MODEL_LAYOUT = {
-    "rect": (0.025, 0.055, 0.99, 0.92),
-    "h_pad": 0.5,
-    "w_pad": 0.8,
-}
+# Vertical margins are held in inches so that every figure in the set gets the
+# same room for its legend and shared x label whatever its height.
+MARGIN_BOTTOM_IN = 0.31
+MARGIN_TOP_IN = 0.37
+LEGEND_TOP_IN = 0.056
+XLABEL_BOTTOM_IN = 0.14
+
+
+def _four_model_layout(height: float, *, h_pad: float, w_pad: float) -> dict[str, Any]:
+    return {
+        "rect": (0.03, MARGIN_BOTTOM_IN / height, 0.99, 1.0 - MARGIN_TOP_IN / height),
+        "h_pad": h_pad,
+        "w_pad": w_pad,
+    }
+
+
 # Pads are in font-size units, so matching a fractional change in panel spacing
 # takes a different bump per figure.
-GAIN_LAYOUT = {**FOUR_MODEL_LAYOUT, "h_pad": 0.76, "w_pad": 0.89}
-ALLOCATION_LAYOUT = {**FOUR_MODEL_LAYOUT, "h_pad": 0.67, "w_pad": 1.65}
+GAIN_LAYOUT = _four_model_layout(FOUR_MODEL_FIGSIZE[1], h_pad=0.76, w_pad=0.89)
+ALLOCATION_LAYOUT = _four_model_layout(FOUR_MODEL_FIGSIZE[1], h_pad=0.67, w_pad=1.65)
 # Five panels: the 2x2 grid plus a centred third row at the same panel size.
-# Margins are rescaled so they stay the same in inches as the 2x2 figures.
-_ABSOLUTE_HEIGHT_SCALE = 1.5
-ABSOLUTE_FIGSIZE = (FOUR_MODEL_FIGSIZE[0], _ABSOLUTE_HEIGHT_SCALE * FOUR_MODEL_FIGSIZE[1])
-ABSOLUTE_LAYOUT = {
-    **FOUR_MODEL_LAYOUT,
-    "rect": (
-        0.025,
-        0.055 / _ABSOLUTE_HEIGHT_SCALE,
-        0.99,
-        1.0 - 0.08 / _ABSOLUTE_HEIGHT_SCALE,
-    ),
-    "w_pad": 1.8,
-}
-ABSOLUTE_LEGEND_Y = 1.0 - 0.01 / _ABSOLUTE_HEIGHT_SCALE
-ABSOLUTE_XLABEL_Y = 0.025 / _ABSOLUTE_HEIGHT_SCALE
+ABSOLUTE_FIGSIZE = (FOUR_MODEL_FIGSIZE[0], 1.5 * FOUR_MODEL_FIGSIZE[1])
+ABSOLUTE_LAYOUT = _four_model_layout(ABSOLUTE_FIGSIZE[1], h_pad=0.95, w_pad=1.8)
 
 SINGLE_01 = (0.1,)
 SINGLE_02 = (0.2,)
@@ -265,13 +263,14 @@ MODELS = (
         "title": "CIFAR-10 DDPM",
         "plot_title": "CIFAR-10 DDPM (MMD)",
         "metric": "mmd",
+        "phase1": "mmd_sibling",
         "n_runs": 50,
         "num_queries": 4_096,
         "k_max": 512,
         "pilot_coefficient": 10.0,
         "pilot_exponent": 0.66,
-        "budgets": (50_000, 100_000, 200_000, 500_000, 1_000_000),
-        "steps": (200, 252, 317, 430, 542),
+        "budgets": (50_000, 100_000, 200_000, 500_000),
+        "steps": (200, 252, 317, 430),
         "sampler": "ddpm",
         "reference_size": 20_000,
         "target": None,
@@ -291,7 +290,8 @@ MODELS = (
         "title": "FFHQ LDM",
         "plot_title": "FFHQ LDM (MMD)",
         "metric": "mmd",
-        "n_runs": 100,
+        "phase1": "mmd_sibling",
+        "n_runs": 50,
         "num_queries": 4_096,
         "k_max": 1_024,
         "pilot_coefficient": 10.0,
@@ -654,11 +654,12 @@ def _load_manifest_rows(
                 expected_rule = (
                     f"power:{model['pilot_coefficient']:g},{model['pilot_exponent']:g}"
                 )
+                expected_loss = None if model.get("phase1") == "mmd_sibling" else "mse"
                 for splitting in adaptive_rows + learned_c_rows:
                     if (
                         splitting.pilot_rule != expected_rule
                         or splitting.pilot_budget != expected_pilot
-                        or splitting.loss != "mse"
+                        or splitting.loss != expected_loss
                         or splitting.reuse is not True
                     ):
                         raise RuntimeError(f"Unexpected splitting rule at B={budget}")
@@ -1001,13 +1002,17 @@ def _config_matches(row: ResultRow, config: dict[str, Any]) -> bool:
         and spec.get("B1") == row.pilot_budget
         and spec.get("optimization_mode") == row.optimizer
         and spec.get("reuse_phase1_samples") == row.reuse
-        and key.get("query_params")
-        == {
-            "num_queries": row.model["num_queries"],
-            "k_max": row.model["k_max"],
-            **EXPECTED_QUERY_PARAMS,
-        }
-        and key.get("crossfit_q_mlp_params") == EXPECTED_MLP_PARAMS
+        and (
+            (key.get("phase1") or {}).get("estimator") == "mmd_sibling"
+            if row.model.get("phase1") == "mmd_sibling"
+            else key.get("query_params")
+            == {
+                "num_queries": row.model["num_queries"],
+                "k_max": row.model["k_max"],
+                **EXPECTED_QUERY_PARAMS,
+            }
+            and key.get("crossfit_q_mlp_params") == EXPECTED_MLP_PARAMS
+        )
     )
 
 
@@ -1324,12 +1329,12 @@ def _four_model_style() -> None:
     _style()
     plt.rcParams.update(
         {
-            "font.size": 9.5,
-            "axes.titlesize": 10.0,
-            "axes.labelsize": 9.5,
-            "xtick.labelsize": 7.5,
-            "ytick.labelsize": 8.5,
-            "legend.fontsize": 8.5,
+            "font.size": 11.4,
+            "axes.titlesize": 12.0,
+            "axes.labelsize": 11.4,
+            "xtick.labelsize": 9.0,
+            "ytick.labelsize": 10.2,
+            "legend.fontsize": 10.2,
         }
     )
 
@@ -1396,9 +1401,10 @@ def _set_budget_ticks(ax: plt.Axes, budgets: Iterable[int]) -> None:
 
 
 def _set_shared_axis_labels(
-    fig: plt.Figure, *, xlabel: str, ylabel: str, x_label_y: float = 0.025
+    fig: plt.Figure, *, xlabel: str, ylabel: str
 ) -> None:
     """Place shared labels close to the axes without double-counting their margins."""
+    x_label_y = XLABEL_BOTTOM_IN / fig.get_figheight()
     x_label = fig.supxlabel(xlabel, x=0.52, y=x_label_y)
     y_label = fig.supylabel(ylabel, x=0.015, y=0.49)
     x_label.set_in_layout(False)
@@ -1429,7 +1435,6 @@ def _finish_four_model_figure(
     *,
     legend_ncol: int | None = None,
     layout: dict[str, Any] | None = None,
-    legend_y: float = 0.990,
 ) -> None:
     """Apply the common legend, spacing, and exact-size export layout."""
     fig.legend(
@@ -1438,7 +1443,7 @@ def _finish_four_model_figure(
         loc="upper center",
         ncol=legend_ncol if legend_ncol is not None else len(legend_labels),
         frameon=False,
-        bbox_to_anchor=(0.5, legend_y),
+        bbox_to_anchor=(0.5, 1.0 - LEGEND_TOP_IN / fig.get_figheight()),
         columnspacing=1.4,
         handletextpad=0.5,
     )
@@ -1452,12 +1457,16 @@ def _plot_splitting_diagram(output_dir: Path) -> None:
             "mathtext.fontset": "cm",
         }
     )
-    fig, ax = plt.subplots(figsize=(15, 7))
-    fig.subplots_adjust(left=0.035, right=0.965, bottom=0.07, top=0.97)
+    height = 6.0
+    # The label rows below the tree hang from its bottom edge in points, so the
+    # bottom margin is fixed in inches and the tree takes the remaining height.
+    fig, ax = plt.subplots(figsize=(15, height))
+    fig.subplots_adjust(left=0.035, right=0.965, bottom=1.15 / height, top=0.97)
     path_color = "#2b2b2b"
     guide_color = "#c7c7c7"
     text_color = "#111111"
-    label_fontsize = 26
+    label_fontsize = 28.6
+    guide_bottom = -3.8
     x = [0.0, 1.6, 3.2, 4.8, 6.4, 8.0]
     levels = [
         [(x[0], 0.0)],
@@ -1511,7 +1520,7 @@ def _plot_splitting_diagram(output_dir: Path) -> None:
     for x_value in x:
         ax.plot(
             [x_value, x_value],
-            [-3.8, 4.3],
+            [guide_bottom, 4.3],
             linestyle=":",
             linewidth=1.0,
             color=guide_color,
@@ -1561,42 +1570,31 @@ def _plot_splitting_diagram(output_dir: Path) -> None:
             fontsize=label_fontsize,
             color=text_color,
         )
+
+    def label_below(x_value: float, drop: float, label: str, fontsize: float) -> None:
+        ax.annotate(
+            label,
+            xy=(x_value, guide_bottom),
+            xytext=(0.0, -drop),
+            textcoords="offset points",
+            ha="center",
+            va="top",
+            fontsize=fontsize,
+            color=text_color,
+        )
+
     time_labels = [r"$t_0=0$", r"$t_1$", r"$t_2$", r"$t_3$", r"$t_4$", r"$t_5=T$"]
     for x_value, label in zip(x, time_labels):
-        ax.text(
-            x_value,
-            -4.00,
-            label,
-            ha="center",
-            va="top",
-            fontsize=label_fontsize,
-            color=text_color,
-        )
+        label_below(x_value, 9.0, label, label_fontsize)
     for index, count in enumerate([1, 2, 6, 6, 12]):
-        ax.text(
-            x[index],
-            -4.75,
-            rf"$R_{index}={count}$",
-            ha="center",
-            va="top",
-            fontsize=label_fontsize,
-            color=text_color,
-        )
-    ax.text(
-        4.0,
-        -5.55,
-        r"$R_i=\prod_{j=1}^{i}N_j$",
-        ha="center",
-        va="top",
-        fontsize=28,
-        color=text_color,
-    )
+        label_below(x[index], 45.0, rf"$R_{index}={count}$", label_fontsize)
     ax.set_xlim(-0.4, 8.4)
-    ax.set_ylim(-6.40, 4.30)
+    ax.set_ylim(guide_bottom, 4.30)
     ax.axis("off")
     fig.savefig(
         output_dir / "splitting_diagram.png",
         dpi=FIGURE_DPI,
+        bbox_inches="tight",
         metadata={"Software": "paper_plots.py"},
     )
     plt.close(fig)
@@ -1975,14 +1973,12 @@ def _plot_absolute_metrics(
         fig,
         xlabel="Budget $B$",
         ylabel="Mean Error Metric",
-        x_label_y=ABSOLUTE_XLABEL_Y,
     )
     _finish_four_model_figure(
         fig,
         legend_handles,
         legend_labels,
         layout=ABSOLUTE_LAYOUT,
-        legend_y=ABSOLUTE_LEGEND_Y,
     )
     _save_figure(
         fig,
@@ -2144,20 +2140,13 @@ def _plot_allocations(
     _four_model_style()
     fig, axes = plt.subplots(2, 2, figsize=FOUR_MODEL_FIGSIZE)
     plotted_schedules: set[tuple[float, ...]] = set()
-    plotted_learned_c = False
     plotted_any = False
 
     for ax, model in zip(axes.flat, PLOT_MODELS):
         if model["directory"] not in all_rows:
             ax.set_visible(False)
             continue
-        curves: list[
-            tuple[
-                tuple[float, ...],
-                tuple[np.ndarray, np.ndarray],
-                tuple[np.ndarray, np.ndarray] | None,
-            ]
-        ] = []
+        curves: list[tuple[tuple[float, ...], tuple[np.ndarray, np.ndarray]]] = []
         for schedule, _ in SCHEDULES:
             if schedule not in all_rows[model["directory"]]:
                 continue
@@ -2166,18 +2155,7 @@ def _plot_allocations(
             if not splitting_rows:
                 continue
             splitting = max(splitting_rows, key=lambda row: row.budget)
-            learned_c = _row_at_budget(
-                rows, splitting.budget, "adaptive", LEARNED_C_OPTIMIZER
-            )
-            curves.append(
-                (
-                    schedule,
-                    _mean_allocation(model, schedule, splitting),
-                    None
-                    if learned_c is None
-                    else _mean_allocation(model, schedule, learned_c),
-                )
-            )
+            curves.append((schedule, _mean_allocation(model, schedule, splitting)))
 
         if not curves:
             ax.set_visible(False)
@@ -2186,7 +2164,7 @@ def _plot_allocations(
 
         # Dense schedules go down first; shorter schedules stay visible where
         # their horizontal segments overlap the denser curves.
-        for schedule, (times, mean), learned_c_curve in reversed(curves):
+        for schedule, (times, mean) in reversed(curves):
             ax.step(
                 times,
                 mean,
@@ -2196,16 +2174,6 @@ def _plot_allocations(
                 linewidth=DATA_LINEWIDTH,
                 zorder=3,
             )
-            if learned_c_curve is not None:
-                ax.step(
-                    *learned_c_curve,
-                    where="post",
-                    color=SCHEDULE_COLORS[schedule],
-                    linestyle=LEARNED_C_LINESTYLE,
-                    linewidth=LEARNED_C_LINEWIDTH,
-                    zorder=2,
-                )
-                plotted_learned_c = True
             plotted_schedules.add(schedule)
         ax.axhline(1.0, color="#555555", linewidth=REFERENCE_LINEWIDTH, linestyle=":")
         ax.set_title(_four_model_title(model, include_metric=False))
@@ -2228,13 +2196,12 @@ def _plot_allocations(
     _set_shared_axis_labels(
         fig,
         xlabel="Elapsed fraction of trajectory",
-        ylabel=r"Cumulative allocation $R_i$",
+        ylabel=r"Learned $R_i$",
     )
     legend_handles = _reduction_legend_handles(
         plotted_schedules,
-        include_learned=plotted_learned_c,
+        include_learned=False,
         include_uniform_c=False,
-        include_learned_c=plotted_learned_c,
     )
     legend_labels = [handle.get_label() for handle in legend_handles]
     _finish_four_model_figure(

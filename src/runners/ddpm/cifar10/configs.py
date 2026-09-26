@@ -1,6 +1,6 @@
 from runners.common_configs import (
     OPTIMIZATION_MODES_WITH_LEARNED_C,
-    crossfit_q_config,
+    mmd_sibling_config,
     split_schedules,
 )
 
@@ -27,7 +27,6 @@ _SAMPLING_BASE = {
         100_000,
         200_000,
         500_000,
-        1_000_000,
     ],
     "B1_list": [
         "10,0.66",
@@ -61,7 +60,6 @@ _METADATA_DEFAULTS = {
     },
     "split_percentages_list": _SPLITS,
     "optimization_modes": OPTIMIZATION_MODES_WITH_LEARNED_C,
-    "crossfit_q_mlp_losses": ["mse"],
     "num_base_samples": _MODEL_REFERENCE_SAMPLE_COUNT,
     "max_sampling_batch_size": 2500,
     "n_runs": 100,
@@ -77,16 +75,18 @@ _MMD_DEFAULTS = {
 }
 
 CONFIGS = {
-    "default": {
-        **_SAMPLING_BASE,
-        **_METADATA_DEFAULTS,
-        **crossfit_q_config(),
-        "description": "CIFAR-10 HF DDPM splitting against the configured DDPM reference",
-    },
-    "mmd": {
-        **_SAMPLING_BASE,
-        **_MMD_DEFAULTS,
-        **crossfit_q_config(),
-        "description": "CIFAR-10 HF DDPM splitting with MMD against the configured DDPM reference",
-    },
+    "default": mmd_sibling_config(
+        {
+            **_SAMPLING_BASE,
+            **_METADATA_DEFAULTS,
+            "description": "CIFAR-10 HF DDPM splitting against the configured DDPM reference",
+        }
+    ),
+    "mmd": mmd_sibling_config(
+        {
+            **_SAMPLING_BASE,
+            **_MMD_DEFAULTS,
+            "description": "CIFAR-10 HF DDPM splitting with MMD against the configured DDPM reference",
+        }
+    ),
 }

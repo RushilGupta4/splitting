@@ -9,6 +9,7 @@ from copy import deepcopy
 
 from runners.common_configs import (
     OPTIMIZATION_MODES_WITH_LEARNED_C,
+    mmd_sibling_config,
     split_schedules,
 )
 
@@ -113,11 +114,13 @@ def sde_case_configs(*, terminal_time: float, description: str) -> dict[str, dic
     return {
         "default": deepcopy(default_config),
         "mmd": deepcopy(
-            {
-                **default_config,
-                **_MMD_SELECTION,
-                "description": f"{description} with target-space MMD",
-            }
+            mmd_sibling_config(
+                {
+                    **default_config,
+                    **_MMD_SELECTION,
+                    "description": f"{description} with target-space MMD",
+                }
+            )
         ),
     }
 

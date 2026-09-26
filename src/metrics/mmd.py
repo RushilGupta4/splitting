@@ -328,6 +328,26 @@ def _mmd_feature_means(
     return cosine_sum.div_(count), sine_sum.div_(count), count
 
 
+@torch.inference_mode()
+def mmd_features(samples, state: Mapping[str, Any]) -> torch.Tensor:
+    """Random Fourier features ``phi(x)`` of the metric, one row per sample, with ``|phi(x)| = 1``."""
+    frequencies = state["frequencies"]
+    count = int(frequencies.shape[1])
+    samples = _samples_to_mmd_coordinates(samples, expected_dimension=int(state["dimension"]))
+    batch_size = int(state["params"]["batch_size"])
+    rows = []
+    for start in range(0, int(samples.shape[0]), batch_size):
+        projected = _mmd_standardize_batch(
+            samples[start : start + batch_size],
+            device=state["device"],
+            mean=state["mean"],
+            scale=state["scale"],
+            quantize=state["representation"] == "quantized_image_target",
+        ) @ frequencies
+        rows.append(torch.cat([torch.cos(projected), torch.sin(projected)], dim=1))
+    return torch.cat(rows, dim=0).div_(math.sqrt(count))
+
+
 def _prepare_mmd_state(
     runner,
     *,
