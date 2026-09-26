@@ -1,60 +1,75 @@
 #!/usr/bin/env bash
+# Reproduce the paper experiments. For each experiment this
+#   1. builds (or reuses) the cached reference samples,
+#   2. runs the comparison sweep (compare.py),
+#   3. plots every summary CSV the sweep wrote.
+#
+# Usage:
+#   ./compare.sh                     # all experiments below
+#   ./compare.sh simple_ou edm_default   # a subset, by name
+#   DEVICE=cuda:1 DEBUG=1 ./compare.sh simple_ou
+#
+# edm_default needs the trained checkpoint from ./train.sh.
 set -u
 
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# BASE_DIRS=(outputs_paper_final)
-# BASE_DIRS=(outputs_paper_final_2)
-# BASE_DIRS=(outputs_paper_final_3)
-BASE_DIRS=(outputs_paper_final_4)
-
-# name|runner|config|device|reference_batch|num_queries|k_max|mlp_workers|n_parallel
-# MMD configs use the sibling Phase 1: leave num_queries, k_max and mlp_workers empty.
-# An empty n_parallel falls back to N_PARALLEL.
-CONFIGS=(
-    # "edm_default|edm_gmm2d|default|cuda:1|50000|1024|64|25"
-    # "simple_ou|simple_ou|default|cuda:0|1000000|1024|64|25"
-    # "coupled_double_well_langevin|coupled_double_well_langevin|default|cuda:1|1000000|1024|64|25"
-
-    # "simple_ou_mmd|simple_ou|mmd|cuda:0|1000000|||"
-    # "coupled_double_well_langevin_mmd|coupled_double_well_langevin|mmd|cuda:1|1000000|||"
-    "ddpm_cifar10_hf_mmd|ddpm_cifar10_hf|mmd|cuda:0|5000||||5"
-    "ldm_ffhq_mmd|ldm_ffhq|mmd|cuda:1|1024||||4"
-)
-# N_PARALLEL=100
-# N_RUNS=2500
-N_PARALLEL=1
-N_RUNS=50
+BASE_DIR="${BASE_DIR:-outputs_paper_final}"
+DEVICE="${DEVICE:-cuda:0}"
+DEBUG="${DEBUG:-0}"
 CI_LEVEL=0.95
-DEBUG=0
-# K="1,5"
-K="1"
 
-for base_dir in "${BASE_DIRS[@]}"
+# name|runner|config|reference_batch|n_runs|n_parallel|phase1
+# phase1 is "ks" (CrossFit-Q Phase 1, used by the KS configs) or "mmd" (sibling
+# Phase 1, configured entirely in the runner's configs.py).
+EXPERIMENTS=(
+    "simple_ou|simple_ou|default|1000000|2500|100|ks"
+    "coupled_double_well_langevin|coupled_double_well_langevin|default|1000000|2500|100|ks"
+    "edm_default|edm_gmm2d|default|50000|2500|100|ks"
+    "ddpm_cifar10_hf_mmd|ddpm_cifar10_hf|mmd|5000|50|5|mmd"
+    "ldm_ffhq_mmd|ldm_ffhq|mmd|1024|50|2|mmd"
+    "ou_oracle|ou_oracle|default|1000000|10000|1000|ks"
+)
+
+# CrossFit-Q Phase 1 settings used for every KS experiment.
+CROSSFIT_ARGS=(
+    --crossfit_q_folds 1
+    --crossfit_q_num_queries 1024
+    --crossfit_q_k_max 64
+    --crossfit_q_mlp_run_parallelism 25
+)
+
+debug_flag=""
+if [ "$DEBUG" -eq 1 ]; then
+    debug_flag="--debug"
+fi
+
+for experiment in "${EXPERIMENTS[@]}"
 do
-    for config in "${CONFIGS[@]}"
-    do
-        (
-            IFS='|' read -r output_name runner config_name device reference_sample_batch_size num_queries k_max mlp_workers n_parallel <<< "$config"
-            n_parallel="${n_parallel:-$N_PARALLEL}"
-            output_dir="$base_dir/$output_name"
-            mkdir -p "$output_dir"
-            debug_flag=""
-            if [ "$DEBUG" -eq 1 ]; then
-                debug_flag="--debug"
-            fi
-            uv run python src/ensure_samples.py --runner "$runner" --config "$config_name" --batch_size "$reference_sample_batch_size" --device "$device" $debug_flag || exit 1
-            crossfit_args=()
-            if [ -n "$num_queries" ]; then
-                crossfit_args=(--crossfit_q_folds "$K" --crossfit_q_num_queries "$num_queries" --crossfit_q_k_max "$k_max" --crossfit_q_mlp_run_parallelism "$mlp_workers")
-            fi
-            uv run python src/compare.py --runner "$runner" --config "$config_name" --output_dir "$output_dir" --device "$device" --n_parallel "$n_parallel" --n_runs $N_RUNS "${crossfit_args[@]}" $debug_flag || exit 1
-            manifest="$output_dir/compare_outputs.json"
-            while IFS= read -r csv; do
-                uv run python src/plots.py "$csv" --ci "$CI_LEVEL" || exit 1
-                sleep 1
-            done < <(uv run python - "$manifest" <<'PY'
+    IFS='|' read -r name runner config ref_batch n_runs n_parallel phase1 <<< "$experiment"
+    if [ "$#" -gt 0 ] && [[ ! " $* " =~ " $name " ]]; then
+        continue
+    fi
+
+    output_dir="$BASE_DIR/$name"
+    mkdir -p "$output_dir"
+
+    phase1_args=()
+    if [ "$phase1" = "ks" ]; then
+        phase1_args=("${CROSSFIT_ARGS[@]}")
+    fi
+
+    uv run python src/ensure_samples.py --runner "$runner" --config "$config" \
+        --batch_size "$ref_batch" --device "$DEVICE" $debug_flag || exit 1
+    uv run python src/compare.py --runner "$runner" --config "$config" \
+        --output_dir "$output_dir" --device "$DEVICE" \
+        --n_runs "$n_runs" --n_parallel "$n_parallel" \
+        ${phase1_args[@]+"${phase1_args[@]}"} $debug_flag || exit 1
+
+    while IFS= read -r csv; do
+        uv run python src/plots.py "$csv" --ci "$CI_LEVEL" || exit 1
+    done < <(uv run python - "$output_dir/compare_outputs.json" <<'PY'
 import json
 import sys
 
@@ -63,24 +78,5 @@ with open(sys.argv[1]) as f:
 for path in payload["csv_files"]:
     print(path)
 PY
-            )
-        ) &
-    done
-    wait
+    )
 done
-
-wait
-
-# N_PARALLEL=1000
-# N_RUNS=10000
-# for base_dir in "${BASE_DIRS[@]}"
-# do
-#     output_dir="$base_dir/ou_oracle"
-#     mkdir -p "$output_dir"
-#     debug_flag=""
-#     if [ "$DEBUG" -eq 1 ]; then
-#         debug_flag="--debug"
-#     fi
-#     uv run python src/ensure_samples.py --runner ou_oracle --config default --batch_size 1000000 --device cuda:1 $debug_flag || exit 1
-#     uv run python src/compare.py --runner ou_oracle --config default --output_dir "$output_dir" --device cuda:1 --n_parallel $N_PARALLEL --n_runs $N_RUNS $debug_flag || exit 1
-# done

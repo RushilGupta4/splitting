@@ -175,12 +175,3 @@ datasets/
 evaluators/
 lightning_logs/
 outputs/
-
-# Release zip files
-cp_ffhq_base.zip
-cp_ffhq.zip
-datasets.zip
-even_pixels.zip
-mnist_sudoku_base.zip
-mnist_sudoku_df.zip
-mnist_sudoku.zip

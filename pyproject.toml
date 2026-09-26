@@ -1,7 +1,7 @@
 [project]
 name = "splitting-ddpm"
 version = "0.1.0"
-description = "Add your description here"
+description = "Adaptive splitting allocations for stochastic samplers"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
