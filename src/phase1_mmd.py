@@ -161,7 +161,10 @@ def _simulate_sibling_pilot(
     max_sampling_batch_size,
     generator,
 ):
-    """Straight pilot paths plus one branch per path from its anchor level; returns postprocessed endpoints."""
+    """Straight pilot paths plus one branch per path from its anchor level; returns postprocessed endpoints.
+
+    Branches join the main batch at their anchor level, so every segment is one batched call.
+    """
     starts = [runner.start_time] + list(split_points)
     ends = list(split_points) + [runner.end_time]
     x, run_ids = _sample_prior_by_run_batches(
@@ -170,13 +173,16 @@ def _simulate_sibling_pilot(
         max_sampling_batch_size=max_sampling_batch_size,
         generator=generator,
     )
-    anchored = {}
+    num_main = int(x.shape[0])
+    positions = torch.empty(0, dtype=torch.long, device=x.device)
     for level, (start, end) in enumerate(zip(starts, ends)):
         if level in anchors:
             mask = torch.as_tensor(
                 np.tile(assignment == level, chunk_size), device=x.device
             )
-            anchored[level] = (x[mask].clone(), run_ids[mask], mask)
+            x = torch.cat([x, x[:num_main][mask].clone()])
+            run_ids = torch.cat([run_ids, run_ids[:num_main][mask]])
+            positions = torch.cat([positions, torch.nonzero(mask).flatten()])
         x = _sample_segment_by_run_batches(
             runner,
             x,
@@ -187,21 +193,9 @@ def _simulate_sibling_pilot(
             max_sampling_batch_size=max_sampling_batch_size,
             generator=generator,
         )
-    branch = torch.empty_like(x)
-    for level, (xb, ids, mask) in anchored.items():
-        for start, end in zip(starts[level:], ends[level:]):
-            xb = _sample_segment_by_run_batches(
-                runner,
-                xb,
-                ids,
-                num_runs=chunk_size,
-                start_time=start,
-                end_time=end,
-                max_sampling_batch_size=max_sampling_batch_size,
-                generator=generator,
-            )
-        branch[mask] = xb
-    return runner.postprocess_samples(x), runner.postprocess_samples(branch)
+    branch = torch.empty_like(x[:num_main])
+    branch[positions] = x[num_main:]
+    return runner.postprocess_samples(x[:num_main]), runner.postprocess_samples(branch)
 
 
 def run_mmd_sibling_phase1_batch(

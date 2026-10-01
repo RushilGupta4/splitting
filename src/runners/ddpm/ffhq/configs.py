@@ -29,15 +29,26 @@ _DEFAULT = {
         "sampling_steps": 1000,
         "timestep_spacing": "trailing",
     },
-    "metrics": ["mmd"],
-    "primary_metric": "mmd",
+    # The allocation is designed in the latent (the denoiser's own); samples are scored
+    # in Inception and DINOv2 embeddings. Any of "mmd" (latent), "mmd_pixel",
+    # "mmd_inception" and "mmd_dino" can be listed.
+    "metrics": ["mmd_inception", "mmd_dino"],
+    "primary_metric": "mmd_inception",
     "metric_params": {"mmd": {"batch_size": 256}},
+    "batching": {"phase1": 2500, "phase2": 2500, "max_paths_in_flight": None, "scoring": 64},
     "split_percentages_list": split_schedules(),
     "optimization_modes": OPTIMIZATION_MODES_WITH_LEARNED_C,
     "num_base_samples": 20_000,
     "max_sampling_batch_size": 2500,
     "n_runs": 100,
-    "description": "FFHQ LDM with decoded-image MMD against a full DDPM reference",
+    "description": "FFHQ LDM with Inception and DINOv2 MMD against a full DDPM reference",
 }
 
 CONFIGS = {name: mmd_sibling_config(deepcopy(_DEFAULT)) for name in ("default", "mmd")}
+# Per-run timings at one budget (run with compare.py --timing).
+CONFIGS["timing"] = {
+    **deepcopy(CONFIGS["mmd"]),
+    "B_list": [200_000],
+    "n_runs": 10,
+    "description": "FFHQ per-run stage timings at B=200k",
+}

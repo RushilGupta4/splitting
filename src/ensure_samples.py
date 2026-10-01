@@ -7,12 +7,15 @@ import torch
 from tqdm import tqdm
 
 from metrics import (
+    metric_spaces,
     normalize_metrics,
     uses_reference_samples,
     validate_metric_dimensions,
 )
 from reference_cache import (
+    load_reference_samples_checked,
     load_reference_samples_if_sufficient,
+    load_space_references,
     reference_preview_path,
     reference_samples_path_for_key,
     save_reference_preview,
@@ -282,7 +285,39 @@ def main():
         return
     comparison_mode = cfg["comparison_mode"]
     runner_defaults = dict(cfg.get("runner_defaults") or {})
+    _ensure_base_reference(args, runner_cls, cfg, metrics, comparison_mode, runner_defaults)
+    _ensure_space_references(args, runner_cls, cfg, metrics, comparison_mode, runner_defaults)
 
+
+
+
+def _ensure_space_references(args, runner_cls, cfg, metrics, comparison_mode, runner_defaults):
+    """Decode/embed the base reference into each MMD space the config measures in."""
+    needed = metric_spaces(runner_cls, metrics)
+    if not needed:
+        return
+    runner = runner_cls.load_from_checkpoint(
+        device=args.device, no_compile=args.no_compile, **runner_defaults
+    )
+    reference_generation_config = runner.normalize_reference_generation_config(
+        comparison_mode, _reference_generation_config(cfg, comparison_mode)
+    )
+    path, _ = _reference_cache_path(runner, comparison_mode, reference_generation_config)
+    count = int(cfg["num_base_samples"])
+    scoring = int((cfg.get("batching") or {}).get("scoring", 256))
+    log.info("Ensuring %s references for runner=%s", needed, runner.runner_name)
+    load_space_references(
+        runner,
+        comparison_mode,
+        reference_generation_config,
+        load_reference_samples_checked(path, count),
+        needed,
+        count,
+        batch_size=scoring,
+    )
+
+
+def _ensure_base_reference(args, runner_cls, cfg, metrics, comparison_mode, runner_defaults):
     probe = runner_cls.load_without_model(device=args.device, **runner_defaults)
     if probe is not None:
         _check_comparison_mode(probe, args.runner, comparison_mode)

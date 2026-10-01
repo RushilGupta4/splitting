@@ -2,7 +2,11 @@
 
 The two implementations live alongside this module: :mod:`metrics.ks` and
 :mod:`metrics.mmd`. Sample coercion shared by both (and by the runners) is in
-:mod:`metrics.utils`.
+:mod:`metrics.utils`; MMD measurement spaces are in :mod:`metrics.spaces`.
+
+``mmd`` is the MMD of the runner's postprocessed samples; ``mmd_<space>`` measures the
+same samples in another space (``latent``, ``pixel``, ``inception``, ``dino``), each
+against that space's reference. All share the ``mmd`` metric_params.
 """
 
 from __future__ import annotations
@@ -12,6 +16,7 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 import torch
 
+from metrics import spaces
 from metrics.mmd import (
     _compute_mmd_metric,
     _mmd_metric_cache_key,
@@ -20,8 +25,25 @@ from metrics.mmd import (
     _prepare_mmd_state,
 )
 
-SUPPORTED_METRICS = ("ks", "mmd")
+MMD_SPACE_METRICS = tuple(f"mmd_{space}" for space in spaces.SPACES)
+SUPPORTED_METRICS = ("ks", "mmd", *MMD_SPACE_METRICS)
 REFERENCE_SAMPLE_METRICS = frozenset(SUPPORTED_METRICS)
+
+
+def is_mmd(metric: str) -> bool:
+    return metric == "mmd" or metric in MMD_SPACE_METRICS
+
+
+def mmd_space(metric: str, runner) -> str:
+    """The space an MMD metric measures in; plain ``mmd`` is the runner's sample space."""
+    return runner.sample_space if metric == "mmd" else metric[len("mmd_"):]
+
+
+def metric_spaces(runner, metrics: Sequence[str]) -> list[str]:
+    """Spaces other than the sample space that the metrics need references in."""
+    return sorted(
+        {mmd_space(m, runner) for m in metrics if is_mmd(m)} - {runner.sample_space}
+    )
 
 
 def normalize_metrics(
@@ -40,7 +62,7 @@ def normalize_metrics(
             raise ValueError(
                 f"Unknown metric {metric!r}; available: {list(SUPPORTED_METRICS)}"
             )
-        if metric not in supported_set:
+        if metric not in supported_set and not (is_mmd(metric) and "mmd" in supported_set):
             raise ValueError(f"Metric {metric!r} is not supported by this runner")
         if metric not in seen:
             metrics.append(metric)
@@ -93,12 +115,22 @@ def metric_cache_key(runner, metrics: Sequence[str], metric_params: Mapping[str,
     key: dict[str, Any] = {
         "metrics": list(metrics),
     }
+    params = normalized_params.get("mmd") or {}
     if "mmd" in metrics:
-        params = normalized_params.get("mmd") or {}
         key["mmd"] = _mmd_metric_cache_key(
             params,
             representation=_mmd_representation(runner, params),
         )
+    for metric in metrics:
+        if metric in MMD_SPACE_METRICS:
+            space = mmd_space(metric, runner)
+            key[metric] = {
+                **_mmd_metric_cache_key(
+                    params,
+                    representation=_mmd_representation(spaces.space_runner(runner, space), params),
+                ),
+                **spaces.space_cache_key(space),
+            }
     return key
 
 
@@ -109,23 +141,33 @@ def prepare_metric_states(
     reference_samples=None,
     metrics: Sequence[str],
     metric_params: Mapping[str, Any] | None = None,
+    space_references: Mapping[str, Any] | None = None,
+    scoring_batch_size: int = spaces.DEFAULT_BATCH_SIZE,
 ):
+    """``space_references`` maps each space in ``metric_spaces`` to its reference samples."""
     metric_params = normalize_metric_params(metric_params)
     validate_metric_dimensions(runner, metrics)
-    states: dict[str, Any] = {}
+    states: dict[str, Any] = {"scoring_batch_size": int(scoring_batch_size)}
     if "ks" in metrics:
         states["ks"] = runner.prepare_comparison_state(
             comparison_mode=comparison_mode,
             reference_samples=reference_samples,
             metric_params=metric_params.get("ks"),
         )
-    if "mmd" in metrics:
-        states["mmd"] = _prepare_mmd_state(
-            runner,
+    for metric in metrics:
+        if not is_mmd(metric):
+            continue
+        space = mmd_space(metric, runner)
+        states[metric] = _prepare_mmd_state(
+            spaces.space_runner(runner, space),
             comparison_mode=comparison_mode,
-            reference_samples=reference_samples,
+            reference_samples=(
+                reference_samples if space == runner.sample_space
+                else (space_references or {}).get(space)
+            ),
             params=metric_params.get("mmd") or {},
         )
+        states[metric]["space"] = space
     return states
 
 
@@ -155,14 +197,20 @@ def compute_trial_metrics(
                 part_weights=part_weights,
             )
         )
-    if "mmd" in metrics:
-        mmd_value, mmd_payload = _compute_mmd_metric(
+    mmd_metrics = [metric for metric in metrics if is_mmd(metric)]
+    if mmd_metrics:
+        parts = parts if isinstance(parts, (list, tuple)) else [parts]
+        mapped = spaces.map_parts(
+            runner,
             parts,
-            metric_states.get("mmd"),
-            part_weights=part_weights,
+            sorted({metric_states[metric]["space"] for metric in mmd_metrics}),
+            batch_size=metric_states.get("scoring_batch_size", spaces.DEFAULT_BATCH_SIZE),
         )
-        values["mmd"] = mmd_value
-        payloads["mmd"] = mmd_payload
+        for metric in mmd_metrics:
+            state = metric_states.get(metric)
+            values[metric], payloads[metric] = _compute_mmd_metric(
+                mapped[state["space"]], state, part_weights=part_weights
+            )
     return values, payloads
 
 

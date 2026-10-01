@@ -261,8 +261,12 @@ MODELS = (
         "runner": "ddpm_cifar10_hf",
         "config_name": "mmd",
         "title": "CIFAR-10 DDPM",
-        "plot_title": "CIFAR-10 DDPM (MMD)",
-        "metric": "mmd",
+        "plot_title": "CIFAR-10 DDPM (Inception MMD)",
+        "metric": "mmd_inception",
+        "mmd_representations": {
+            "mmd_inception": "float_target",
+            "mmd_dino": "float_target",
+        },
         "phase1": "mmd_sibling",
         "n_runs": 50,
         "num_queries": 4_096,
@@ -288,8 +292,12 @@ MODELS = (
         "runner": "ldm_ffhq",
         "config_name": "mmd",
         "title": "FFHQ LDM",
-        "plot_title": "FFHQ LDM (MMD)",
-        "metric": "mmd",
+        "plot_title": "FFHQ LDM (Inception MMD)",
+        "metric": "mmd_inception",
+        "mmd_representations": {
+            "mmd_inception": "float_target",
+            "mmd_dino": "float_target",
+        },
         "phase1": "mmd_sibling",
         "n_runs": 50,
         "num_queries": 4_096,
@@ -880,9 +888,11 @@ def _ffhq_target_is_expected(target: dict[str, Any]) -> bool:
         and target.get("model_id") == "asparius/ldm-ffhq-256"
         and target.get("commit_hash") == "5f206d37fa91ccbd1a389006cbecdd40798c0c2d"
         and target.get("latent_shape") == [4, 32, 32]
-        and target.get("image_shape") == [3, 256, 256]
-        and target.get("sample_dim") == 196_608
-        and target.get("postprocess") == "kl_decode_scaled_clamp_0_1_chw_flat_v1"
+        and target.get("pixel_shape") == [3, 256, 256]
+        and target.get("sample_dim") == 4_096
+        and target.get("latent_scale_factor") == 0.13025
+        and target.get("postprocess") == "kl_latent_scaled_flat_v1"
+        and target.get("to_pixels") == "kl_decode_scaled_clamp_0_1_chw_flat_v1"
     )
 
 
@@ -894,18 +904,25 @@ IMAGE_TARGET_CHECKS = {
 
 def _metric_config_is_expected(model: dict[str, Any], config: dict[str, Any]) -> bool:
     metric_config = config.get("metric_config", {})
-    if metric_config.get("metrics") != [model["metric"]]:
-        return False
     if model["metric"] == "ks":
         return metric_config == {"metrics": ["ks"]}
-    mmd = metric_config.get("mmd", {})
+    representations = model["mmd_representations"]
+    if metric_config.get("metrics") != list(representations):
+        return False
+    return all(
+        _mmd_config_is_expected(metric_config.get(metric, {}), representation)
+        for metric, representation in representations.items()
+    )
+
+
+def _mmd_config_is_expected(mmd: dict[str, Any], representation: str) -> bool:
     return (
         mmd.get("kind") == "target_space_random_fourier_mmd"
         and mmd.get("version") == 1
         and mmd.get("estimator") == "biased_empirical_root"
         and mmd.get("kernel") == "equal_weight_multiscale_gaussian"
         and mmd.get("standardization") == "reference_coordinate_zscore_v1"
-        and mmd.get("representation") == "quantized_image_target"
+        and mmd.get("representation") == representation
         and mmd.get("num_frequencies") == 1_024
         and mmd.get("bandwidth_multipliers")
         == [0.0625, 0.125, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0]

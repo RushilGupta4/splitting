@@ -51,10 +51,13 @@ _MODEL_REFERENCE = {
     },
 }
 
-_METADATA_DEFAULTS = {
+# The allocation is designed in pixel space (the denoiser's own); samples are scored
+# in Inception and DINOv2 embeddings. Any of "mmd" (pixels), "mmd_inception" and
+# "mmd_dino" can be listed.
+_MMD_DEFAULTS = {
     **_MODEL_REFERENCE,
-    "metrics": ["mmd"],
-    "primary_metric": "mmd",
+    "metrics": ["mmd_inception", "mmd_dino"],
+    "primary_metric": "mmd_inception",
     "metric_params": {
         "mmd": _MMD_METRIC_PARAMS,
     },
@@ -62,31 +65,26 @@ _METADATA_DEFAULTS = {
     "optimization_modes": OPTIMIZATION_MODES_WITH_LEARNED_C,
     "num_base_samples": _MODEL_REFERENCE_SAMPLE_COUNT,
     "max_sampling_batch_size": 2500,
+    "batching": {"phase1": 2500, "phase2": 2500, "max_paths_in_flight": None, "scoring": 500},
     "n_runs": 100,
 }
 
-_MMD_DEFAULTS = {
-    **_METADATA_DEFAULTS,
-    "metrics": ["mmd"],
-    "primary_metric": "mmd",
-    "metric_params": {
-        "mmd": _MMD_METRIC_PARAMS,
-    },
-}
+_MMD = mmd_sibling_config(
+    {
+        **_SAMPLING_BASE,
+        **_MMD_DEFAULTS,
+        "description": "CIFAR-10 HF DDPM splitting with Inception and DINOv2 MMD",
+    }
+)
 
 CONFIGS = {
-    "default": mmd_sibling_config(
-        {
-            **_SAMPLING_BASE,
-            **_METADATA_DEFAULTS,
-            "description": "CIFAR-10 HF DDPM splitting against the configured DDPM reference",
-        }
-    ),
-    "mmd": mmd_sibling_config(
-        {
-            **_SAMPLING_BASE,
-            **_MMD_DEFAULTS,
-            "description": "CIFAR-10 HF DDPM splitting with MMD against the configured DDPM reference",
-        }
-    ),
+    "default": _MMD,
+    "mmd": _MMD,
+    # Per-run timings at one budget (run with compare.py --timing).
+    "timing": {
+        **_MMD,
+        "B_list": [200_000],
+        "n_runs": 10,
+        "description": "CIFAR-10 per-run stage timings at B=200k",
+    },
 }

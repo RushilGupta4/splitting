@@ -24,7 +24,11 @@ from adaptive import (
 )
 from baselines import run_fixed_N_sampling, run_solver_baseline_sampling
 from metrics import (
+    MMD_SPACE_METRICS,
     aggregate_cached_metric_rows,
+    is_mmd,
+    metric_spaces,
+    mmd_space,
     metric_cache_key,
     normalize_metric_params,
     normalize_metrics,
@@ -32,8 +36,10 @@ from metrics import (
     uses_reference_samples,
     validate_metric_dimensions,
 )
+from metrics import spaces
 from reference_cache import (
     load_reference_samples_for_runner,
+    load_space_references,
     reference_samples_path_for_key,
 )
 from runners.base import (
@@ -63,7 +69,10 @@ TIMING_FIELDS = (
     "optimization_seconds",
     "phase2_seconds",
     "total_seconds",
+    "scoring_seconds",
 )
+# Discarded warm-up run per spec in --timing mode (torch.compile, caches).
+TIMING_WARMUP_OFFSET = 10_000
 
 CSV_FIELDS = [
     "mode",
@@ -88,6 +97,7 @@ CSV_FIELDS = [
     "mean_mmd",
     "std_mmd",
     "n_valid_mmd",
+    *[f"{stat}_{metric}" for metric in MMD_SPACE_METRICS for stat in ("mean", "std", "n_valid")],
     "mean_ks",
     "std_ks",
     "n_valid_ks",
@@ -117,6 +127,11 @@ def parse_args():
     )
     parser.add_argument("--no_compile", action="store_true")
     parser.add_argument("--debug", action="store_true")
+    parser.add_argument(
+        "--timing",
+        action="store_true",
+        help="Per-run timings: n_parallel=1 and one discarded warm-up run per spec",
+    )
     return parser.parse_args()
 
 
@@ -270,7 +285,10 @@ def _validate_config(cfg: dict, *, runner, config_name: str):
     )
     validate_metric_dimensions(runner, cfg["metrics"])
     cfg["metric_params"] = normalize_metric_params(cfg.get("metric_params"))
-    extra_metric_params = sorted(set(cfg["metric_params"]) - set(cfg["metrics"]))
+    # metric_params["mmd"] configures every MMD space.
+    uses_mmd = any(is_mmd(metric) for metric in cfg["metrics"])
+    active_params = set(cfg["metrics"]) | ({"mmd"} if uses_mmd else set())
+    extra_metric_params = sorted(set(cfg["metric_params"]) - active_params)
     if extra_metric_params:
         raise ValueError(
             f"metric_params configured for inactive metrics: {extra_metric_params}"
@@ -278,7 +296,7 @@ def _validate_config(cfg: dict, *, runner, config_name: str):
     cfg["primary_metric"] = str(cfg.get("primary_metric", cfg["metrics"][0])).lower()
     if cfg["primary_metric"] not in cfg["metrics"]:
         raise ValueError("primary_metric must be one of metrics")
-    if "mmd" in cfg["metrics"] and not mode_spec.requires_reference_cache:
+    if uses_mmd and not mode_spec.requires_reference_cache:
         raise ValueError(
             "mmd requires a comparison_mode backed by cached reference samples; "
             f"comparison_mode {cfg['comparison_mode']!r} is analytic"
@@ -298,7 +316,7 @@ def _validate_config(cfg: dict, *, runner, config_name: str):
                 cfg["comparison_mode"], cfg["reference_generation_config"]
             )
         )
-    cifar_reference_metrics = {"ks", "mmd"}.intersection(cfg["metrics"])
+    cifar_reference_metrics = "ks" in cfg["metrics"] or uses_mmd
     if (
         cfg["comparison_mode"] == "cifar10_dataset_samples"
         and cifar_reference_metrics
@@ -317,7 +335,7 @@ def _validate_config(cfg: dict, *, runner, config_name: str):
                 "CIFAR reference-sample metrics require the torchvision "
                 "CIFAR-10 training set"
             )
-    if cfg["primary_metric"] == "mmd":
+    if is_mmd(cfg["primary_metric"]):
         ks_keys = sorted(KS_PHASE1_KEYS.intersection(cfg))
         if ks_keys:
             raise ValueError(
@@ -326,7 +344,7 @@ def _validate_config(cfg: dict, *, runner, config_name: str):
         cfg["phase1"] = normalize_mmd_sibling_params(cfg.get("phase1") or {})
     else:
         if cfg.get("phase1") is not None:
-            raise ValueError("phase1 is only configurable when primary_metric is mmd")
+            raise ValueError("phase1 is only configurable when primary_metric is an MMD")
         cfg["query_params"] = _normalize_query_params(cfg.get("query_params"))
         cfg["crossfit_q_folds"] = _normalize_crossfit_q_folds(
             cfg.get("crossfit_q_folds", CROSSFIT_Q_DEFAULT_FOLDS)
@@ -354,6 +372,11 @@ def _validate_config(cfg: dict, *, runner, config_name: str):
     cfg["max_sampling_batch_size"] = normalize_max_sampling_batch_size(
         cfg.get("max_sampling_batch_size")
     )
+    if cfg.get("batching") is not None:
+        cfg["batching"] = _normalize_batching(cfg["batching"], cfg["max_sampling_batch_size"])
+    for metric in cfg["metrics"]:
+        if is_mmd(metric):
+            spaces.validate_space(runner, mmd_space(metric, runner))
     if not cfg["B_list"]:
         raise ValueError("B_list must be non-empty")
     _validate_b1_lists(cfg)
@@ -377,6 +400,40 @@ def _validate_config(cfg: dict, *, runner, config_name: str):
                     int(B),
                     schedule_key=BASELINE_STEP_SCHEDULES,
                 )
+
+
+BATCHING_KEYS = ("phase1", "phase2", "max_paths_in_flight", "scoring")
+
+
+def _normalize_batching(raw, max_sampling_batch_size):
+    """Per-phase sampling batch caps.
+
+    ``phase1`` and ``phase2`` are per-run caps on paths per model call (Phase 2 also
+    covers fixed_N, uniform_c and solver baselines); ``max_paths_in_flight`` caps one
+    Phase-2 call across runs and tree types; ``scoring`` is the decode/embedding batch.
+    Sampling caps change the random draws, so they enter the cache key; ``scoring`` only
+    sets memory.
+    """
+    if not isinstance(raw, Mapping):
+        raise ValueError(f"batching must be a mapping, got {raw!r}")
+    unknown = sorted(set(raw) - set(BATCHING_KEYS))
+    if unknown:
+        raise ValueError(f"Unknown batching keys: {unknown}")
+    scoring = raw.get("scoring", spaces.DEFAULT_BATCH_SIZE)
+    if isinstance(scoring, bool) or int(scoring) < 1:
+        raise ValueError(f"batching scoring must be a positive integer, got {scoring!r}")
+    return {
+        "phase1": normalize_max_sampling_batch_size(raw.get("phase1", max_sampling_batch_size)),
+        "phase2": normalize_max_sampling_batch_size(raw.get("phase2", max_sampling_batch_size)),
+        "max_paths_in_flight": normalize_max_sampling_batch_size(raw.get("max_paths_in_flight")),
+        "scoring": int(scoring),
+    }
+
+
+def _batching(cfg):
+    if cfg.get("batching") is not None:
+        return cfg["batching"]
+    return _normalize_batching({}, cfg.get("max_sampling_batch_size"))
 
 
 def _normalize_crossfit_q_mlp_losses(raw_losses, mlp_params):
@@ -421,6 +478,8 @@ def _apply_overrides(cfg: dict, args):
         cfg["n_parallel"] = int(args.n_parallel)
     else:
         cfg["n_parallel"] = int(cfg.get("n_parallel", 1))
+    if getattr(args, "timing", False):
+        cfg["n_parallel"] = 1
     if args.crossfit_q_folds is not None:
         cfg["crossfit_q_folds"] = _normalize_crossfit_q_folds(args.crossfit_q_folds)
     if args.crossfit_q_mlp_run_parallelism is not None:
@@ -617,8 +676,9 @@ def _run_trial(
         n_parallel=int(cfg["n_parallel"]),
         run_offset=run_offset,
         return_trial_results=return_trial_results,
-        max_sampling_batch_size=cfg.get("max_sampling_batch_size"),
+        max_sampling_batch_size=_batching(cfg)["phase2"],
     )
+    max_paths_in_flight = _batching(cfg)["max_paths_in_flight"]
     if spec["mode"] == "solver_baseline":
         return run_solver_baseline_sampling(
             **common,
@@ -630,10 +690,12 @@ def _run_trial(
             **common,
             split_percentages=[],
             N_i_list=[],
+            max_paths_in_flight=max_paths_in_flight,
         )
     if spec["mode"] == "uniform_c":
         return run_fixed_N_sampling(
             **common,
+            max_paths_in_flight=max_paths_in_flight,
             split_percentages=split_percentages,
             N_i_list=[float(spec["uniform_c"])] * len(split_percentages),
             result_mode="uniform_c",
@@ -659,6 +721,8 @@ def _run_trial(
             optimization_mode=str(spec["optimization_mode"]),
             reuse_phase1_samples=bool(spec["reuse_phase1_samples"]),
             phase1=cfg["phase1"],
+            phase1_max_sampling_batch_size=_batching(cfg)["phase1"],
+            max_paths_in_flight=max_paths_in_flight,
         )
     crossfit_q_mlp_params = dict(cfg.get("crossfit_q_mlp_params") or {})
     crossfit_q_mlp_params["loss"] = str(spec["crossfit_q_mlp_loss"])
@@ -679,6 +743,8 @@ def _run_trial(
         optimization_mode=str(spec["optimization_mode"]),
         reuse_phase1_samples=bool(spec["reuse_phase1_samples"]),
         query_params=dict(cfg.get("query_params") or {}),
+        phase1_max_sampling_batch_size=_batching(cfg)["phase1"],
+        max_paths_in_flight=max_paths_in_flight,
     )
 
 
@@ -882,6 +948,12 @@ def _config_cache_key(
         key["reference_samples_path"] = _file_identity(
             reference_samples_path_for_key(reference_runner.checkpoint_path, ref_key)
         )
+    if cfg.get("batching") is not None:
+        # Sampling caps and run chunking change the draws; configs without an
+        # explicit batching block keep their original cache keys.
+        batching = dict(cfg["batching"])
+        batching.pop("scoring")
+        key["batching"] = {**batching, "n_parallel": int(cfg["n_parallel"])}
     if spec["mode"] == "estimate_and_sample":
         key["adaptive_implementation_version"] = _ADAPTIVE_IMPLEMENTATION_VERSION
         if cfg.get("phase1") is not None:
@@ -949,9 +1021,9 @@ def _trial_to_cache_record(spec, trial):
         record["n0"] = int(trial["n0"])
     if spec["mode"] == "estimate_and_sample":
         record["used_B1"] = int(trial["used_B1"])
-        for field in TIMING_FIELDS:
-            if field in trial:
-                record[field] = float(trial[field])
+    for field in TIMING_FIELDS:
+        if field in trial:
+            record[field] = float(trial[field])
     return record
 
 
@@ -1062,6 +1134,16 @@ def _build_comparison_states(base_runner, cfg):
         reference_generation_config,
         int(cfg["num_base_samples"]),
     )
+    scoring_batch_size = _batching(cfg)["scoring"]
+    space_references = load_space_references(
+        base_runner,
+        mode,
+        reference_generation_config,
+        samples,
+        metric_spaces(base_runner, cfg["metrics"]),
+        int(cfg["num_base_samples"]),
+        batch_size=scoring_batch_size,
+    )
     states: Dict[Any, Any] = {
         None: prepare_metric_states(
             base_runner,
@@ -1069,6 +1151,8 @@ def _build_comparison_states(base_runner, cfg):
             reference_samples=samples,
             metrics=cfg["metrics"],
             metric_params=cfg.get("metric_params") or {},
+            space_references=space_references,
+            scoring_batch_size=scoring_batch_size,
         )
     }
     if cfg.get("phase1") is not None:
@@ -1141,7 +1225,8 @@ def _aggregate_cached_runs(spec, trials, *, base_runner, split_percentages, cfg)
         base[f"std_{field}"] = (
             float(np.std(values, ddof=1)) if len(values) > 1 else (0.0 if values else "")
         )
-        timing_counts.append(len(values))
+        if values:
+            timing_counts.append(len(values))
     base["n_valid_timing"] = min(timing_counts) if timing_counts else 0
     if spec["mode"] == "fixed_N":
         return base
@@ -1294,6 +1379,9 @@ def _run_split(args, cfg, base_runner, baselines, split_percentages):
 
     if total_remaining:
         mode_spec, comparison_states = _build_comparison_states(base_runner, cfg)
+        if args.timing:
+            # Scoring must not overlap the next run's timed sampling.
+            comparison_states[None]["serial_scoring"] = True
         for entry in tqdm(
             entries, desc=f"Compare split {_split_tag(split_percentages)}"
         ):
@@ -1321,6 +1409,19 @@ def _run_split(args, cfg, base_runner, baselines, split_percentages):
 
             completed_runs = int(entry["completed_runs"])
             try:
+                if args.timing:
+                    # Not cached: the first run of a spec pays for compilation and caches.
+                    _run_trial(
+                        spec,
+                        base_runner=base_runner,
+                        comparison_state=comparison_state,
+                        cfg=cfg,
+                        split_percentages=split_percentages,
+                        seed=entry["seed"],
+                        n_runs=1,
+                        run_offset=TIMING_WARMUP_OFFSET,
+                        return_trial_results=True,
+                    )
                 result = _run_trial(
                     spec,
                     base_runner=base_runner,

@@ -24,7 +24,10 @@ script also runs on CPU (`--device cpu`), slowly.
 | Latent diffusion, FFHQ | `ldm_ffhq` | `mmd` | downloads `asparius/ldm-ffhq-256` |
 | OU minimax oracle | `ou_oracle` | `default` | – |
 
-`default` configs score samples with KS; `mmd` configs use MMD.
+`default` configs score samples with KS; `mmd` configs use MMD. The image
+runners also have `timing` (per-run stage timings at B = 200k, run with
+`--timing`). The CIFAR-10 DDPM samples with the posterior variance
+(`fixed_small`) rather than the checkpoint's `fixed_large`.
 
 ## Running
 
@@ -54,6 +57,11 @@ uv run python src/plots.py outputs_paper_final/simple_ou/compare_results_<splits
    CSVs).
 3. `plots.py` draws per-experiment diagnostics from a CSV.
 
+Every run records synchronized stage timings (`phase1_seconds`,
+`phase2_seconds`, `total_seconds`, and `scoring_seconds`, which is excluded
+from the total), including for `fixed_N`. For clean timings pass `--timing`: it
+runs one trial at a time and discards a warm-up run per setting.
+
 Once all six experiments are complete, the paper's figures and tables are
 rebuilt with:
 
@@ -79,8 +87,9 @@ a new named entry.
 | `optimization_modes` | Allocation rule: `monotone` is the learned allocation, `learned_c` is the Learned-c baseline. |
 | `baselines` | `fixed_N` (no splitting), `uniform_c` (the same factor c at every split; values from `UNIFORM_C_BY_SPLIT_COUNT`), or a named solver baseline. |
 | `sampling_configs`, `step_schedules` | Sampler and its parameters; step count per budget (a `{B: steps}` map). |
-| `metrics`, `primary_metric` | `ks` and/or `mmd`. |
-| `phase1` | Set by `mmd_sibling_config(...)` for MMD configs; KS configs use CrossFit-Q, tuned by the `--crossfit_q_*` flags. |
+| `metrics`, `primary_metric` | `ks` and/or MMDs. `mmd` is measured in the sampler's own space (pixels for CIFAR-10, the KL latent for FFHQ); `mmd_pixel`, `mmd_latent`, `mmd_inception` (FID Inception pool3) and `mmd_dino` (DINOv2 ViT-L/14) score the same samples in another space. The image `mmd` configs report `mmd_inception` (primary) and `mmd_dino`; the allocation is always designed in the sampler's own space. Each sample is decoded once per run, and per-space references are derived from the base reference by `ensure_samples.py`. |
+| `phase1` | Set by `mmd_sibling_config(...)` for MMD configs, which design the allocation in the sampler's own space; KS configs use CrossFit-Q, tuned by the `--crossfit_q_*` flags. |
+| `batching` | Optional `{"phase1", "phase2", "max_paths_in_flight", "scoring"}`: sampling batch sizes for the two phases (default `max_sampling_batch_size`), a cap on live paths, and the decode/embedding batch. When set, it and `n_parallel` enter the run cache key. |
 | `n_runs`, `n_parallel` | Repetitions per setting and how many run at once (both overridable on the command line). |
 
 Example: a quick OU sweep with a pilot budget of 10% of B.

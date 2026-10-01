@@ -34,6 +34,9 @@ class _FFHQModel(torch.nn.Module):
 class LDMFFHQRunner(DDPMRunner):
     runner_name = "ldm_ffhq"
     config_module = "runners.ddpm.ffhq.configs"
+    # Samples stay in the denoiser's latent space; to_pixels decodes when a metric needs images.
+    sample_space = "latent"
+    pixel_shape = IMAGE_SHAPE
     supported_samplers = ("ddpm",)
     # Generic solver baselines assume a different training noise schedule.
     supported_solvers = ()
@@ -94,10 +97,11 @@ class LDMFFHQRunner(DDPMRunner):
             "model_id": HF_MODEL_ID,
             "commit_hash": HF_REVISION,
             "latent_shape": list(LATENT_SHAPE),
-            "image_shape": list(IMAGE_SHAPE),
-            "sample_dim": SAMPLE_DIM,
+            "pixel_shape": list(IMAGE_SHAPE),
+            "sample_dim": INPUT_DIM,
             "latent_scale_factor": float(decoder_config["scaling_factor"]),
-            "postprocess": "kl_decode_scaled_clamp_0_1_chw_flat_v1",
+            "postprocess": "kl_latent_scaled_flat_v1",
+            "to_pixels": "kl_decode_scaled_clamp_0_1_chw_flat_v1",
             "cost_unit": "denoiser_nfe",
             "scheduler_config": _stable_scheduler_config(scheduler_config),
         }
@@ -180,13 +184,17 @@ class LDMFFHQRunner(DDPMRunner):
             raise ValueError(
                 f"Expected FFHQ latents [N, {INPUT_DIM}], got {tuple(values.shape)}"
             )
+        return values.float()
+
+    @torch.inference_mode()
+    def to_pixels(self, samples, *, batch_size=None):
+        values = self.postprocess_samples(samples)
+        batch_size = int(batch_size or DECODE_BATCH_SIZE)
         output = torch.empty(
             (values.shape[0], SAMPLE_DIM), device=values.device, dtype=torch.float32
         )
-        for start in range(0, values.shape[0], DECODE_BATCH_SIZE):
-            decoded = self._model.decode(
-                values[start : start + DECODE_BATCH_SIZE].float()
-            )
+        for start in range(0, values.shape[0], batch_size):
+            decoded = self._model.decode(values[start : start + batch_size])
             if tuple(decoded.shape[1:]) != IMAGE_SHAPE:
                 raise ValueError(
                     f"Unexpected decoded FFHQ shape {tuple(decoded.shape)}"

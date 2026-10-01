@@ -75,6 +75,8 @@ class _FlatCIFAR10UNet(torch.nn.Module):
 class DDPMCIFAR10HFRunner(DDPMRunner):
     runner_name = "ddpm_cifar10_hf"
     config_module = "runners.ddpm.cifar10.configs"
+    sample_space = "pixel"
+    pixel_shape = IMAGE_SHAPE
     supported_samplers = ("ddpm",)
     supported_solvers = ("ddim",)
     comparison_mode_specs = (
@@ -129,11 +131,19 @@ class DDPMCIFAR10HFRunner(DDPMRunner):
             "sample_dim": int(INPUT_DIM),
             "native_range": "[-1,1]",
             "postprocess": "clamp_0_1_flat_v1",
-            "scheduler_config": _stable_scheduler_config(pipe.scheduler.config),
+            # The DDPM posterior variance instead of the checkpoint's fixed_large, which
+            # adds noise after the last (t > 0) step of a trailing schedule.
+            "scheduler_config": {
+                **_stable_scheduler_config(pipe.scheduler.config),
+                "variance_type": "fixed_small",
+            },
         }
         data_mean = torch.zeros(INPUT_DIM, device=device, dtype=torch.float32)
         data_std = torch.ones(INPUT_DIM, device=device, dtype=torch.float32)
         return model, target_spec, data_mean, data_std
+
+    def to_pixels(self, samples, *, batch_size=None):
+        return torch.as_tensor(samples, dtype=torch.float32)
 
     @staticmethod
     def model_input_dim(model) -> int:

@@ -37,7 +37,8 @@ on the config, and confirm the resolved B1 values and trial specs.
   rounds a relaxed allocation to a mixture of exact integer (dyadic) trees.
 - `src/baselines.py` (fixed-N and solver baselines), `src/trials.py` (seeding,
   chunking, parallel runs), `src/metrics/` (KS and random-Fourier MMD),
-  `src/reference_cache.py` (reference samples under `checkpoints/<runner>/`).
+  `src/reference_cache.py` (reference samples under `checkpoints/<runner>/`),
+  `src/metrics/spaces.py` (pixel/latent/Inception/DINOv2 spaces for MMD).
 - `src/runners/<family>/` holds one sampler family (`sde`, `edm`, `ddpm`); each
   case below it has a `runner.py` and a `configs.py` exporting `CONFIGS`.
 - `paper/` rebuilds the paper's figures and tables from `outputs_paper_final/`.
@@ -54,6 +55,10 @@ on the config, and confirm the resolved B1 values and trial specs.
 - SDE cases: set `terminal_time` only through `sde_case_configs` in
   `runners/sde/configs.py`, which writes it to all three places that read it.
 - `step_schedules` must have an entry for every value in `B_list`.
+- Image runners set `sample_space` and `pixel_shape` and implement `to_pixels`;
+  that is all `mmd_<space>` metrics need.
+- Seeds depend on chunking: with `n_parallel` > 1, extend `n_runs` in multiples
+  of `n_parallel`. Only configs with `batching` put `n_parallel` in the cache key.
 
 ## Rules
 

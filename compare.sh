@@ -20,16 +20,21 @@ DEVICE="${DEVICE:-cuda:0}"
 DEBUG="${DEBUG:-0}"
 CI_LEVEL=0.95
 
-# name|runner|config|reference_batch|n_runs|n_parallel|phase1
+# name|runner|config|reference_batch|n_runs|n_parallel|phase1|extra_args
 # phase1 is "ks" (CrossFit-Q Phase 1, used by the KS configs) or "mmd" (sibling
-# Phase 1, configured entirely in the runner's configs.py).
+# Phase 1, configured entirely in the runner's configs.py). The MMD configs score
+# every sample in all their measurement spaces (pixel/latent, Inception, DINOv2).
+# The timing experiments run one trial at a time after a discarded warm-up.
 EXPERIMENTS=(
-    "simple_ou|simple_ou|default|1000000|2500|100|ks"
-    "coupled_double_well_langevin|coupled_double_well_langevin|default|1000000|2500|100|ks"
-    "edm_default|edm_gmm2d|default|50000|2500|100|ks"
-    "ddpm_cifar10_hf_mmd|ddpm_cifar10_hf|mmd|5000|50|5|mmd"
-    "ldm_ffhq_mmd|ldm_ffhq|mmd|1024|50|2|mmd"
-    "ou_oracle|ou_oracle|default|1000000|10000|1000|ks"
+    "simple_ou|simple_ou|default|1000000|2500|100|ks|"
+    "coupled_double_well_langevin|coupled_double_well_langevin|default|1000000|2500|100|ks|"
+    "edm_default|edm_gmm2d|default|50000|2500|100|ks|"
+    "ou_oracle|ou_oracle|default|1000000|10000|1000|ks|"
+
+    "ddpm_cifar10_hf_mmd|ddpm_cifar10_hf|mmd|5000|50|5|mmd|"
+    "ldm_ffhq_mmd|ldm_ffhq|mmd|1024|50|2|mmd|"
+    "ddpm_cifar10_hf_timing|ddpm_cifar10_hf|timing|5000|10|1|mmd|--timing"
+    "ldm_ffhq_timing|ldm_ffhq|timing|1024|10|1|mmd|--timing"
 )
 
 # CrossFit-Q Phase 1 settings used for every KS experiment.
@@ -47,7 +52,7 @@ fi
 
 for experiment in "${EXPERIMENTS[@]}"
 do
-    IFS='|' read -r name runner config ref_batch n_runs n_parallel phase1 <<< "$experiment"
+    IFS='|' read -r name runner config ref_batch n_runs n_parallel phase1 extra_args <<< "$experiment"
     if [ "$#" -gt 0 ] && [[ ! " $* " =~ " $name " ]]; then
         continue
     fi
@@ -65,7 +70,7 @@ do
     uv run python src/compare.py --runner "$runner" --config "$config" \
         --output_dir "$output_dir" --device "$DEVICE" \
         --n_runs "$n_runs" --n_parallel "$n_parallel" \
-        ${phase1_args[@]+"${phase1_args[@]}"} $debug_flag || exit 1
+        ${phase1_args[@]+"${phase1_args[@]}"} $extra_args $debug_flag || exit 1
 
     while IFS= read -r csv; do
         uv run python src/plots.py "$csv" --ci "$CI_LEVEL" || exit 1

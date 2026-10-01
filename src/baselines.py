@@ -1,4 +1,5 @@
 import logging
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Mapping, Sequence
 
@@ -13,6 +14,7 @@ from trials import (
     make_torch_generator,
     submit_sampling_trial_result_futures,
     summarize_sampling_trials,
+    synchronize,
 )
 
 log = logging.getLogger(__name__)
@@ -38,6 +40,7 @@ def _run_phase2_loop(
     weights (``None`` means equal weight per observation).
     """
     trial_results: list = [None] * n_runs
+    seconds_per_run: list = [None] * n_runs
     workers = max(1, min(int(n_parallel), n_runs))
     futures: list = []
     with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -50,9 +53,13 @@ def _run_phase2_loop(
                 if seed is None
                 else seed + PHASE2_SEED_OFFSET + run_offset + start
             )
+            synchronize(runner.device)
+            started = time.perf_counter()
             samples_by_run = sample_batch_fn(
                 chunk_size, make_torch_generator(run_seed, runner.device)
             )
+            synchronize(runner.device)
+            seconds_per_run[start:end] = [(time.perf_counter() - started) / chunk_size] * chunk_size
             submit_sampling_trial_result_futures(
                 executor=executor,
                 futures=futures,
@@ -65,6 +72,10 @@ def _run_phase2_loop(
                 weights_by_run=[weights] * len(samples_by_run),
             )
         collect_sampling_trial_result_futures(trial_results, futures)
+    for trial, seconds in zip(trial_results, seconds_per_run):
+        # All sampling is "phase 2" for methods without a pilot.
+        trial["phase2_seconds"] = float(seconds)
+        trial["total_seconds"] = float(seconds)
     return trial_results
 
 

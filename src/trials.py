@@ -1,3 +1,4 @@
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Sequence, Tuple
 
@@ -16,6 +17,13 @@ def make_torch_generator(seed: int | None, device: str):
     generator = torch.Generator(device=torch.device(device))
     generator.manual_seed(int(seed))
     return generator
+
+
+def synchronize(device) -> None:
+    """Wait for queued GPU work so wall-clock stage timers are accurate."""
+    device = torch.device(device)
+    if device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize(device)
 
 
 def iter_run_chunks(n_runs: int, n_parallel: int):
@@ -37,6 +45,8 @@ def build_sampling_trial_result(
         parts = [parts]
     parts = [p if isinstance(p, torch.Tensor) else torch.as_tensor(p) for p in parts]
 
+    synchronize(runner.device)
+    started = time.perf_counter()
     metric_values, metric_payloads = compute_trial_metrics(
         parts,
         runner,
@@ -46,7 +56,12 @@ def build_sampling_trial_result(
         part_weights=part_weights,
     )
 
-    result: Dict[str, Any] = {"metrics": metric_values}
+    synchronize(runner.device)
+    result: Dict[str, Any] = {
+        "metrics": metric_values,
+        # Evaluation cost (decoding, embedding, MMD), not part of the method's cost.
+        "scoring_seconds": time.perf_counter() - started,
+    }
     if metric_payloads:
         result["metric_payloads"] = metric_payloads
     if "ks" in metric_values:
@@ -81,6 +96,8 @@ def submit_sampling_trial_result_futures(
             metrics,
             weights_by_run[local_idx],
         )
+        if metric_states.get("serial_scoring"):
+            future.result()
         futures.append((int(run_idx), future))
 
 

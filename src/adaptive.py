@@ -41,6 +41,7 @@ from trials import (
     summarize_sampling_trials,
 )
 
+_SAME_AS_PHASE2 = object()
 log = logging.getLogger(__name__)
 
 CROSSFIT_Q_DEFAULT_FOLDS = 1
@@ -1989,9 +1990,14 @@ def run_estimate_and_sample(
     max_sampling_batch_size=None,
     max_paths_in_flight=None,
     phase1: Mapping[str, Any] | None = None,
+    phase1_max_sampling_batch_size=_SAME_AS_PHASE2,
 ):
     """``phase1`` selects the MMD sibling-pilot Phase 1, which reads
-    ``comparison_state["mmd_design"]``; without it the crossfit query MLP runs."""
+    ``comparison_state["mmd_design"]``; without it the crossfit query MLP runs.
+    ``max_sampling_batch_size`` caps Phase 2; ``phase1_max_sampling_batch_size``
+    caps Phase 1 and defaults to the same value."""
+    if phase1_max_sampling_batch_size is _SAME_AS_PHASE2:
+        phase1_max_sampling_batch_size = max_sampling_batch_size
     if not 0 <= B1 < B:
         raise ValueError("require 0 <= B1 < B")
     if int(crossfit_q_folds) < 1:
@@ -2077,7 +2083,7 @@ def run_estimate_and_sample(
                         optimization_mode=optimization_mode,
                         reuse_phase1_samples=reuse_phase1_samples,
                         chunk_size=chunk_size,
-                        max_sampling_batch_size=max_sampling_batch_size,
+                        max_sampling_batch_size=phase1_max_sampling_batch_size,
                         generator=generator,
                     )
                 else:
@@ -2090,7 +2096,7 @@ def run_estimate_and_sample(
                         reuse_phase1_samples=reuse_phase1_samples,
                         chunk_size=chunk_size,
                         debug=debug,
-                        max_sampling_batch_size=max_sampling_batch_size,
+                        max_sampling_batch_size=phase1_max_sampling_batch_size,
                         generator=generator,
                         **phase1_extra,
                     )

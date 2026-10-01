@@ -328,6 +328,15 @@ class BaseRunner(ABC):
     runner_name: str
     config_module: str | None = None
     supported_metrics: Sequence[str] = ("ks", "mmd")
+    # What postprocess_samples returns: "state" (low-dimensional SDE/EDM state),
+    # "pixel" (flat images in [0, 1]) or "latent" (a decoder's input); see metrics.spaces.
+    sample_space: str = "state"
+    # (C, H, W) of to_pixels, or None when the runner has no image decoder.
+    pixel_shape: tuple[int, int, int] | None = None
+
+    def to_pixels(self, samples, *, batch_size: int | None = None) -> torch.Tensor:
+        """Flat [N, C*H*W] images in [0, 1] of postprocessed samples."""
+        raise NotImplementedError(f"{type(self).__name__} has no pixel decoder")
 
     @classmethod
     def runner_dir(cls) -> str:

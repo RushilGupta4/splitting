@@ -260,3 +260,35 @@ def load_reference_samples_for_runner(
         f"Missing/insufficient reference samples at {primary}; "
         f"need >= {required_count}. Run ensure_samples.py first."
     )
+
+
+def load_space_references(
+    runner,
+    comparison_mode: str,
+    reference_generation_config: Mapping[str, object],
+    base_samples,
+    spaces_needed,
+    required_count: int,
+    *,
+    batch_size: int,
+) -> dict:
+    """``{space: reference}`` for MMD spaces other than the sample space.
+
+    Each is the base reference mapped into ``space`` (decoded, embedded), cached
+    next to it under the base key plus the space's extractor key; built on first use.
+    """
+    from metrics import spaces
+
+    base_key = runner.reference_cache_key(comparison_mode, reference_generation_config)
+    references = {}
+    for space in spaces_needed:
+        key = {**dict(base_key), "space": spaces.space_cache_key(space)}
+        path = reference_samples_path_for_key(runner.checkpoint_path, key)
+        samples = _try_load(path, required_count)
+        if samples is None:
+            samples = spaces.features_in_chunks(
+                runner, space, base_samples[: int(required_count)], batch_size=batch_size
+            )
+            save_reference_samples_with_key(path, samples, cache_key=key)
+        references[space] = samples
+    return references

@@ -39,7 +39,13 @@ STRUCTURAL_CSV_FIELDS = {
     "N_i",
     "N_i_std",
 }
-METRIC_ORDER = ("mmd", "ks")
+MMD_SPACE_LABELS = {
+    "mmd_latent": "Latent MMD",
+    "mmd_pixel": "Pixel MMD",
+    "mmd_inception": "Inception MMD",
+    "mmd_dino": "DINOv2 MMD",
+}
+METRIC_ORDER = ("mmd", *MMD_SPACE_LABELS, "ks")
 
 PLOT_SPECS = {
     "main": {"filename_suffix": None, "title": "Metrics vs B"},
@@ -303,6 +309,8 @@ def _metric_label(metric: str):
         return "MMD"
     if metric == "ks":
         return "KS"
+    if metric in MMD_SPACE_LABELS:
+        return MMD_SPACE_LABELS[metric]
     return str(metric).replace("_", " ").upper()
 
 
