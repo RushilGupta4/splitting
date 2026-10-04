@@ -5,16 +5,14 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 
 from runners.sde.ou_oracle.oracle import (
-    query_variance_contributions,
     CDF_MAX_POINTS,
     CDF_SEED,
     CDF_TOLERANCE,
     QUERY_COUNT,
     QUERY_GRID_SIZE,
     QUERY_PROBABILITIES,
-    ou_oracle_allocation,
-    ou_oracle_relative_gap,
-    ou_oracle_variance_contributions,
+    minimax_solution,
+    query_variance_contributions,
 )
 from runners.sde.runner import SimpleOURunner
 
@@ -58,18 +56,18 @@ class OUOracleRunner(SimpleOURunner):
             raise ValueError("OU oracle requires the 2D Euler Simple OU runner")
         schedule = tuple(float(value) for value in split_percentages)
         self.resolve_split_percentages(schedule)
-        cumulative = ou_oracle_allocation(schedule, steps=self._sampling_steps)
+        cumulative, profile, relative_gap = minimax_solution(
+            schedule, steps=self._sampling_steps
+        )
         factors = cumulative[1:] / cumulative[:-1]
         if factors.shape != (len(schedule),):
             raise RuntimeError(
                 f"OU oracle produced invalid split factors. Expected shape {(len(schedule),)}, got {factors.shape}"
             )
-
         if np.any(factors < 1.0 - _FACTOR_TOLERANCE):
             raise RuntimeError(
                 f"OU oracle produced invalid split factors. Expected all factors >= 1.0, got {factors}"
             )
-
         return {
             "version": 2,
             "sampling_steps": int(self._sampling_steps),
@@ -80,15 +78,8 @@ class OUOracleRunner(SimpleOURunner):
             "cdf_seed": int(CDF_SEED),
             "cdf_max_points": int(CDF_MAX_POINTS),
             "cdf_tolerance": float(CDF_TOLERANCE),
-            "relative_gap": float(
-                ou_oracle_relative_gap(schedule, steps=self._sampling_steps)
-            ),
-            "variance_profile": ou_oracle_variance_contributions(
-                schedule, steps=self._sampling_steps
-            ).tolist(),
+            "relative_gap": float(relative_gap),
+            "variance_profile": profile.tolist(),
             "cumulative_allocation": cumulative.tolist(),
             "split_factors": factors.tolist(),
         }
-
-
-__all__ = ["OUOracleRunner"]

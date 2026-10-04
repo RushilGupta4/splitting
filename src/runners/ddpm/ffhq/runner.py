@@ -3,8 +3,7 @@
 import torch
 
 from runners.base import ComparisonModeSpec
-from runners.ddpm.cifar10.runner import _stable_scheduler_config
-from runners.ddpm.runner import DDPMRunner
+from runners.ddpm.runner import DDPMRunner, stable_scheduler_config
 
 HF_MODEL_ID = "asparius/ldm-ffhq-256"
 HF_REVISION = "5f206d37fa91ccbd1a389006cbecdd40798c0c2d"
@@ -41,30 +40,13 @@ class LDMFFHQRunner(DDPMRunner):
     # Generic solver baselines assume a different training noise schedule.
     supported_solvers = ()
     supported_metrics = ("mmd",)
+    reference_method = "ldm_ddpm_samples"
     comparison_mode_specs = (
-        ComparisonModeSpec(
-            name="true_samples",
-            requires_reference_cache=True,
-            reference_uses_sampling_config=False,
-            description="Decoded FFHQ images from the configured latent DDPM reference.",
-        ),
+        ComparisonModeSpec(name="true_samples", requires_reference_cache=True),
     )
-
-    @property
-    def phase1_query_space(self) -> str:
-        # Queries are drawn at input_dim, the 4096-d latent; labelling on the
-        # 196608-d decoded image would put them in a different space.
-        return "model"
-
-    @classmethod
-    def add_train_args(cls, parser):
-        pass
-
-    @classmethod
-    def train_from_args(cls, args):
-        raise RuntimeError(
-            f"{cls.runner_name} uses the pretrained {HF_MODEL_ID} checkpoint"
-        )
+    # Queries are drawn at input_dim, the 4096-d latent; labelling on the
+    # 196608-d decoded image would put them in a different space.
+    phase1_query_space = "model"
 
     @staticmethod
     def model_input_dim(model):
@@ -103,7 +85,7 @@ class LDMFFHQRunner(DDPMRunner):
             "postprocess": "kl_latent_scaled_flat_v1",
             "to_pixels": "kl_decode_scaled_clamp_0_1_chw_flat_v1",
             "cost_unit": "denoiser_nfe",
-            "scheduler_config": _stable_scheduler_config(scheduler_config),
+            "scheduler_config": stable_scheduler_config(scheduler_config),
         }
 
     @classmethod
@@ -131,8 +113,6 @@ class LDMFFHQRunner(DDPMRunner):
         return cls(
             model=None,
             target_spec=target_spec,
-            data_mean=torch.zeros(INPUT_DIM),
-            data_std=torch.ones(INPUT_DIM),
             T=T,
             sampling_steps=T,
             device=device,
@@ -140,8 +120,7 @@ class LDMFFHQRunner(DDPMRunner):
         )
 
     @classmethod
-    def load_model_and_stats(cls, checkpoint_path, device, *, no_compile=False):
-        del checkpoint_path
+    def load_model(cls, device, *, no_compile=False):
         from diffusers import AutoencoderKL, UNet2DModel
 
         unet = UNet2DModel.from_pretrained(
@@ -168,12 +147,7 @@ class LDMFFHQRunner(DDPMRunner):
             # Keep fixed image/attention dimensions static. Automatic dynamism
             # specializes the first batch, then generalizes changing batch sizes.
             model.unet = torch.compile(model.unet, dynamic=None)
-        return (
-            model,
-            target_spec,
-            torch.zeros(INPUT_DIM, device=device),
-            torch.ones(INPUT_DIM, device=device),
-        )
+        return model, target_spec
 
     @torch.inference_mode()
     def postprocess_samples(self, native_samples):
@@ -202,41 +176,6 @@ class LDMFFHQRunner(DDPMRunner):
             images = ((decoded.float() + 1) * 0.5).clamp(0, 1)
             output[start : start + images.shape[0]] = images.flatten(1)
         return output
-
-    def normalize_reference_generation_config(
-        self, comparison_mode, reference_generation_config
-    ):
-        self._validate_mode(comparison_mode)
-        cfg = self._normalize_ddpm_sample_reference_config(
-            reference_generation_config,
-            method="ldm_ddpm_samples",
-        )
-        if cfg["T"] != self._T:
-            raise ValueError("FFHQ reference T must match the checkpoint schedule")
-        return cfg
-
-    def generate_reference_samples(
-        self,
-        *,
-        comparison_mode,
-        reference_generation_config,
-        num_samples,
-        batch_size,
-        generator=None,
-        progress=None,
-    ):
-        cfg = self.normalize_reference_generation_config(
-            comparison_mode, reference_generation_config
-        )
-        if batch_size < 1 or num_samples < 1:
-            raise ValueError("Reference batch_size and num_samples must be positive")
-        return self._generate_ddpm_model_reference(
-            cfg,
-            num_samples=num_samples,
-            batch_size=batch_size,
-            generator=generator,
-            progress=progress,
-        )
 
     def run_solver_baseline_batch(self, **kwargs):
         raise ValueError(

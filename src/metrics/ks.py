@@ -4,7 +4,6 @@ import math
 from typing import Any, Dict
 
 import numpy as np
-import torch
 from numba import njit
 
 from metrics.utils import coerce_samples_np
@@ -13,15 +12,6 @@ KS_QUADRATURE_POINTS = 96
 KS_QUAD_NODES, KS_QUAD_WEIGHTS = np.polynomial.legendre.leggauss(KS_QUADRATURE_POINTS)
 KS_QUAD_NODES = np.ascontiguousarray(KS_QUAD_NODES, dtype=np.float32)
 KS_QUAD_WEIGHTS = np.ascontiguousarray(KS_QUAD_WEIGHTS, dtype=np.float32)
-
-
-def _require_sample_dim(samples_np: np.ndarray, dim: int) -> np.ndarray:
-    samples_np = np.asarray(samples_np, dtype=float)
-    if samples_np.ndim != 2 or samples_np.shape[1] != int(dim):
-        raise ValueError(
-            f"Expected samples of shape [N, {int(dim)}], got {samples_np.shape}"
-        )
-    return samples_np
 
 
 def prepare_reference_cdf_state(samples) -> Dict[str, Any]:
@@ -57,154 +47,6 @@ def prepare_reference_cdf_state(samples) -> Dict[str, Any]:
 
 
 @njit(cache=True, nogil=True)
-def _segment_tree_update(
-    sums: np.ndarray,
-    max_prefix: np.ndarray,
-    min_prefix: np.ndarray,
-    size: int,
-    index: int,
-    delta: float,
-):
-    pos = size + index
-    sums[pos] += delta
-    max_prefix[pos] = max(0.0, sums[pos])
-    min_prefix[pos] = min(0.0, sums[pos])
-    pos //= 2
-    while pos >= 1:
-        left = pos * 2
-        right = left + 1
-        sums[pos] = sums[left] + sums[right]
-        max_prefix[pos] = max(max_prefix[left], sums[left] + max_prefix[right])
-        min_prefix[pos] = min(min_prefix[left], sums[left] + min_prefix[right])
-        pos //= 2
-
-
-@njit(cache=True, nogil=True)
-def _exact_two_sample_lower_orthant_ks_numba(
-    x_a: np.ndarray,
-    y_rank_a: np.ndarray,
-    x_b: np.ndarray,
-    y_rank_b: np.ndarray,
-    n_y: int,
-) -> float:
-    size = 1
-    while size < n_y:
-        size *= 2
-
-    tree_len = 2 * size
-    sums = np.zeros(tree_len, dtype=np.float32)
-    max_prefix = np.zeros(tree_len, dtype=np.float32)
-    min_prefix = np.zeros(tree_len, dtype=np.float32)
-
-    n_a = x_a.shape[0]
-    n_b = x_b.shape[0]
-    weight_a = 1.0 / float(n_a)
-    weight_b = -1.0 / float(n_b)
-    i = 0
-    j = 0
-    best = 0.0
-
-    while i < n_a or j < n_b:
-        if j >= n_b or (i < n_a and x_a[i] <= x_b[j]):
-            current_x = x_a[i]
-        else:
-            current_x = x_b[j]
-
-        while i < n_a and x_a[i] == current_x:
-            _segment_tree_update(
-                sums, max_prefix, min_prefix, size, int(y_rank_a[i]), weight_a
-            )
-            i += 1
-
-        while j < n_b and x_b[j] == current_x:
-            _segment_tree_update(
-                sums, max_prefix, min_prefix, size, int(y_rank_b[j]), weight_b
-            )
-            j += 1
-
-        if max_prefix[1] > best:
-            best = max_prefix[1]
-        if -min_prefix[1] > best:
-            best = -min_prefix[1]
-
-    return best
-
-
-def _sorted_empirical_ks_inputs(samples: np.ndarray, union_y: np.ndarray):
-    samples_np = np.ascontiguousarray(
-        np.asarray(samples, dtype=np.float32).reshape(-1, 2)
-    )
-    if samples_np.shape[0] == 0:
-        raise ValueError("Cannot compute KS distance from zero samples")
-    order = np.argsort(samples_np[:, 0], kind="mergesort")
-    x_sorted = np.ascontiguousarray(samples_np[order, 0], dtype=np.float32)
-    y_ranks = np.searchsorted(union_y, samples_np[order, 1]).astype(np.int64)
-    return x_sorted, np.ascontiguousarray(y_ranks, dtype=np.int64)
-
-
-def _exact_two_sample_ks_1d_from_state(
-    samples,
-    reference_cdf_state: Dict[str, Any],
-) -> float:
-    samples_np = _require_sample_dim(coerce_samples_np(samples), 1)
-    if samples_np.shape[0] == 0:
-        raise ValueError("Cannot compute KS distance from zero samples")
-
-    x_a = np.ascontiguousarray(np.sort(samples_np[:, 0]), dtype=np.float32)
-    x_b = np.ascontiguousarray(reference_cdf_state["x_sorted"], dtype=np.float32)
-    if x_b.shape[0] == 0:
-        raise ValueError("Cannot compute KS distance against zero reference samples")
-
-    n_a = int(x_a.shape[0])
-    n_b = int(x_b.shape[0])
-    i = 0
-    j = 0
-    best = 0.0
-    while i < n_a or j < n_b:
-        if j >= n_b or (i < n_a and x_a[i] <= x_b[j]):
-            value = x_a[i]
-        else:
-            value = x_b[j]
-        while i < n_a and x_a[i] == value:
-            i += 1
-        while j < n_b and x_b[j] == value:
-            j += 1
-        diff = abs(i / float(n_a) - j / float(n_b))
-        if diff > best:
-            best = diff
-    return float(best)
-
-
-def _exact_two_sample_lower_orthant_ks_from_state(
-    samples, reference_cdf_state: Dict[str, Any]
-) -> float:
-    samples_np = _require_sample_dim(coerce_samples_np(samples), 2)
-    if samples_np.shape[0] == 0:
-        raise ValueError("Cannot compute KS distance from zero samples")
-
-    ref_count = int(reference_cdf_state["count"])
-    if ref_count == 0:
-        raise ValueError("Cannot compute KS distance against zero reference samples")
-
-    ref_y_values = np.asarray(reference_cdf_state["y_values"], dtype=np.float32)
-    union_y = np.unique(np.concatenate([samples_np[:, 1], ref_y_values]))
-    x_a, y_rank_a = _sorted_empirical_ks_inputs(samples_np, union_y)
-
-    ref_rank_map = np.searchsorted(union_y, ref_y_values).astype(np.int64)
-    y_rank_b = ref_rank_map[
-        np.asarray(reference_cdf_state["y_ranks_sorted"], dtype=np.int64) - 1
-    ]
-    x_b = np.ascontiguousarray(reference_cdf_state["x_sorted"], dtype=np.float32)
-    y_rank_b = np.ascontiguousarray(y_rank_b, dtype=np.int64)
-
-    return float(
-        _exact_two_sample_lower_orthant_ks_numba(
-            x_a, y_rank_a, x_b, y_rank_b, int(union_y.shape[0])
-        )
-    )
-
-
-@njit(cache=True, nogil=True)
 def _weighted_segment_tree_update(
     sums: np.ndarray,
     max_prefix: np.ndarray,
@@ -236,8 +78,8 @@ def _weighted_lower_orthant_ks_numba(
 ) -> float:
     """sup over lower orthants of a signed weighted measure summing to zero.
 
-    Float64 throughout: with millions of reference points the float32 tree of
-    the unweighted kernel loses several digits.
+    Float64 throughout: with millions of reference points a float32 tree loses
+    several digits.
     """
     size = 1
     while size < n_y:
@@ -337,44 +179,6 @@ def _weighted_two_sample_lower_orthant_ks(parts, part_weights, reference_cdf_sta
             int(union_y.shape[0]),
         )
     )
-
-
-def _normal_cdf_np(values: np.ndarray, *, mean: float, std: float) -> np.ndarray:
-    if float(std) <= 0.0:
-        raise ValueError("normal CDF std must be positive")
-    z = (np.asarray(values, dtype=np.float32) - float(mean)) / (
-        float(std) * math.sqrt(2.0)
-    )
-    erf = np.vectorize(math.erf, otypes=[np.float32])
-    return 0.5 * (1.0 + erf(z))
-
-
-def _target_cdf_1d(values: np.ndarray, target_spec: Dict[str, Any]) -> np.ndarray:
-    cdf_spec = target_spec.get("cdf")
-    if not isinstance(cdf_spec, dict):
-        raise ValueError("1D true_dist target_spec must include a CDF spec")
-    kind = cdf_spec.get("kind")
-    values_np = np.asarray(values, dtype=np.float32)
-    if kind == "normal":
-        return _normal_cdf_np(
-            values_np,
-            mean=float(cdf_spec["mean"]),
-            std=float(cdf_spec["std"]),
-        )
-    raise ValueError(f"Unknown 1D CDF kind {kind!r}")
-
-
-def _exact_empirical_target_ks_1d(samples, target_spec: Dict[str, Any]) -> float:
-    samples_np = _require_sample_dim(coerce_samples_np(samples), 1)
-    n_samples = int(samples_np.shape[0])
-    if n_samples == 0:
-        raise ValueError("Cannot compute KS distance from zero samples")
-    y = np.sort(np.ascontiguousarray(samples_np[:, 0], dtype=np.float32))
-    cdf = np.clip(_target_cdf_1d(y, target_spec), 0.0, 1.0)
-    j = np.arange(1, n_samples + 1, dtype=np.float32)
-    d_plus = np.max(j / float(n_samples) - cdf)
-    d_minus = np.max(cdf - (j - 1.0) / float(n_samples))
-    return float(max(d_plus, d_minus))
 
 
 def _target_spec_arrays(target_spec: Dict[str, Any]):
@@ -587,7 +391,7 @@ def _exact_empirical_target_lower_orthant_ks_numba(
 def _exact_empirical_target_lower_orthant_ks(
     samples, target_spec: Dict[str, Any]
 ) -> float:
-    samples_np = _require_sample_dim(coerce_samples_np(samples), 2)
+    samples_np = coerce_samples_np(samples, expected_dim=2)
     n_samples = int(samples_np.shape[0])
     if n_samples == 0:
         raise ValueError("Cannot compute KS distance from zero samples")
@@ -630,50 +434,22 @@ def _warm_target_ks_kernel(target_spec: Dict[str, Any]):
 
 
 def warm_ks_kernel_for_mode(reference_mode: str, target_spec: Dict[str, Any]):
-    if reference_mode == "true_dist":
-        dimension = int(target_spec.get("dimension", 2))
-        if dimension == 1:
-            _target_cdf_1d(np.asarray([0.0], dtype=np.float32), target_spec)
-            return
-        if dimension > 2:
-            raise ValueError(
-                f"KS supports only dimensions 1 and 2; got target dimension {dimension}"
-            )
-        _warm_target_ks_kernel(target_spec)
-    elif reference_mode in {"true_samples", "ddpm_samples", "edm_samples"}:
-        _exact_two_sample_lower_orthant_ks_numba(
-            np.ascontiguousarray([0.0], dtype=np.float32),
-            np.ascontiguousarray([0], dtype=np.int64),
-            np.ascontiguousarray([0.0], dtype=np.float32),
-            np.ascontiguousarray([0], dtype=np.int64),
-            1,
+    if reference_mode != "true_dist":
+        return
+    dimension = int(target_spec.get("dimension", 2))
+    if dimension != 2:
+        raise ValueError(
+            f"KS against an analytic target supports only dimension 2; got {dimension}"
         )
+    _warm_target_ks_kernel(target_spec)
 
 
-def _warm_weighted_kernel():
+def warm_reference_ks_kernel(reference_cdf_state: Dict[str, Any]):
+    del reference_cdf_state
     _weighted_lower_orthant_ks_numba(
         np.zeros(2, dtype=np.float32),
         np.zeros(2, dtype=np.int64),
         np.array([1.0, -1.0], dtype=np.float64),
-        1,
-    )
-
-
-def warm_reference_ks_kernel(reference_cdf_state: Dict[str, Any]):
-    dimension = int(reference_cdf_state.get("dimension", 2))
-    if dimension > 2:
-        raise ValueError(
-            f"KS supports only dimensions 1 and 2; got reference dimension {dimension}"
-        )
-    _warm_weighted_kernel()
-    if dimension == 1:
-        return
-    sample_x = reference_cdf_state["x_sorted"][0]
-    _exact_two_sample_lower_orthant_ks_numba(
-        np.ascontiguousarray([sample_x], dtype=np.float32),
-        np.ascontiguousarray([0], dtype=np.int64),
-        np.ascontiguousarray([sample_x], dtype=np.float32),
-        np.ascontiguousarray([0], dtype=np.int64),
         1,
     )
 
@@ -700,8 +476,7 @@ def compute_reference_ks_distance(
         raise ValueError(
             f"KS supports only dimensions 1 and 2; got reference dimension {dimension}"
         )
-    empty = torch.empty(0)
-    return ks_distance, empty, empty
+    return ks_distance
 
 
 def compute_target_ks_distance(parts, target_spec: Dict[str, Any], part_weights=None):
@@ -715,35 +490,9 @@ def compute_target_ks_distance(parts, target_spec: Dict[str, Any], part_weights=
         )
     samples_np = np.concatenate(arrays, axis=0)
     target_dim = int(target_spec.get("dimension", samples_np.shape[1]))
-    if target_dim == 1:
-        ks_distance = _exact_empirical_target_ks_1d(samples_np, target_spec)
-    elif target_dim == 2:
-        ks_distance = _exact_empirical_target_lower_orthant_ks(samples_np, target_spec)
-    else:
+    if target_dim != 2:
         raise ValueError(
-            f"KS supports only dimensions 1 and 2; got target dimension {target_dim}"
+            f"KS against an analytic target supports only dimension 2; got {target_dim}"
         )
-    empty = torch.empty(0)
-    return ks_distance, empty, empty
-
-
-def compute_ks_distance(
-    parts,
-    target_spec: Dict[str, Any],
-    reference_mode: str,
-    reference_cdf_state: Dict[str, Any] | None,
-    part_weights=None,
-):
-    if reference_mode in {"true_samples", "ddpm_samples"}:
-        if reference_cdf_state is None:
-            raise ValueError(
-                f"reference_cdf_state is required when reference_mode='{reference_mode}'"
-            )
-        return compute_reference_ks_distance(
-            parts, reference_cdf_state, part_weights=part_weights
-        )
-    if reference_mode == "true_dist":
-        return compute_target_ks_distance(
-            parts, target_spec, part_weights=part_weights
-        )
-    raise ValueError(f"Unknown reference_mode '{reference_mode}'")
+    ks_distance = _exact_empirical_target_lower_orthant_ks(samples_np, target_spec)
+    return ks_distance

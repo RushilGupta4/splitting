@@ -1,12 +1,12 @@
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Sequence, Tuple
 
 import numpy as np
 import torch
 from tqdm import tqdm
 
-from metrics import compute_trial_metrics, summarize_metric_trials
+from metrics import compute_trial_metrics
 
 PHASE2_SEED_OFFSET = 1_000_000
 
@@ -64,8 +64,6 @@ def build_sampling_trial_result(
     }
     if metric_payloads:
         result["metric_payloads"] = metric_payloads
-    if "ks" in metric_values:
-        result["ks_distance"] = float(metric_values["ks"])
     return result
 
 
@@ -101,37 +99,59 @@ def submit_sampling_trial_result_futures(
         futures.append((int(run_idx), future))
 
 
-def collect_sampling_trial_result_futures(
-    trial_results: List[Dict[str, Any] | None],
-    futures: Sequence[Tuple[int, Any]],
+def run_phase2(
+    sample_batch_fn: Callable,
     *,
-    desc: str = "Metrics",
+    runner,
+    comparison_mode: str,
+    metric_states: Any,
+    metrics: Sequence[str],
+    n_runs: int,
+    n_parallel: int,
+    seed: int | None,
+    run_offset: int,
+    desc: str = "Runs",
 ):
-    for run_idx, future in tqdm(futures, desc=desc, leave=False):
-        trial_results[run_idx] = future.result()
+    """Sample and score ``n_runs`` Phase-2 runs in chunks of ``n_parallel``.
 
-
-def summarize_sampling_trials(
-    trial_results: Sequence[Dict[str, Any]],
-    metrics: Sequence[str] = ("ks",),
-):
-    if not trial_results:
-        result: Dict[str, Any] = {}
-        for metric in metrics:
-            result[f"mean_{metric}"] = float("nan")
-            result[f"std_{metric}"] = float("nan")
-            result[f"n_valid_{metric}"] = 0
-        return result
-
-    # A split never shrinks the path count -- the allocation is monotone so every
-    # N_i >= 1, and n0 >= 1 -- so a run can never end with zero samples.
-    return summarize_metric_trials(trial_results, metrics)
-
-
-def mean_scalar(values: Sequence[float | int]):
-    if not values:
-        return float("nan")
-    return float(np.mean(np.asarray(values, dtype=float)))
+    ``sample_batch_fn(start, end, generator)`` returns ``(parts_by_run,
+    weights_by_run)`` for runs ``start:end``: each run's sample blocks and their
+    mixture weights (``None`` weights every observation equally). Returns the
+    per-run metric results and per-run sampling seconds.
+    """
+    results: list = [None] * n_runs
+    seconds: list = [None] * n_runs
+    futures: list = []
+    with ThreadPoolExecutor(max_workers=max(1, min(int(n_parallel), n_runs))) as executor:
+        for start, end in tqdm(
+            list(iter_run_chunks(n_runs, n_parallel)), desc=desc, leave=False
+        ):
+            run_seed = (
+                None if seed is None else seed + PHASE2_SEED_OFFSET + run_offset + start
+            )
+            synchronize(runner.device)
+            started = time.perf_counter()
+            parts_by_run, weights_by_run = sample_batch_fn(
+                start, end, make_torch_generator(run_seed, runner.device)
+            )
+            synchronize(runner.device)
+            seconds[start:end] = [(time.perf_counter() - started) / (end - start)] * (
+                end - start
+            )
+            submit_sampling_trial_result_futures(
+                executor=executor,
+                futures=futures,
+                run_indices=range(start, end),
+                samples_by_run=parts_by_run,
+                runner=runner,
+                comparison_mode=comparison_mode,
+                metric_states=metric_states,
+                metrics=metrics,
+                weights_by_run=weights_by_run,
+            )
+        for run_idx, future in tqdm(futures, desc="Metrics", leave=False):
+            results[run_idx] = future.result()
+    return results, seconds
 
 
 def mean_vector(values: Sequence[Sequence[float | int]]):

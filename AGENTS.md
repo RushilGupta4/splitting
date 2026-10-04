@@ -40,14 +40,16 @@ on the config, and confirm the resolved B1 values and trial specs.
   `src/reference_cache.py` (reference samples under `checkpoints/<runner>/`),
   `src/metrics/spaces.py` (pixel/latent/Inception/DINOv2 spaces for MMD).
 - `src/runners/<family>/` holds one sampler family (`sde`, `edm`, `ddpm`); each
-  case below it has a `runner.py` and a `configs.py` exporting `CONFIGS`.
+  case below it has a `configs.py` exporting `CONFIGS`, plus a `runner.py`
+  (the SDE cases have a `spec.py` with drift and diffusion instead; their runner
+  classes are in `runners/sde/runner.py`).
 - `paper/` rebuilds the paper's figures and tables from `outputs_paper_final/`.
 
 ## Adding a runner or config
 
 - New config: add a named entry to the runner's `CONFIGS` dict. Build on the
   shared helpers in `runners/common_configs.py` (`split_schedules`,
-  `crossfit_q_config`, `mmd_sibling_config`) rather than copying values.
+  `mmd_sibling_config`) rather than copying values.
 - New runner: subclass the family runner (or `runners.base.BaseRunner`), set
   `runner_name` and `config_module`, and add it to the family's
   `*_RUNNER_CLASSES` in `runners/<family>/__init__.py`; `runners/registry.py`

@@ -6,22 +6,16 @@ import numpy as np
 import torch
 
 from reference_cache import checkpoint_fingerprint
-from runners.base import BaseRunner, ComparisonModeSpec, SamplingConfig
+from runners.base import BaseRunner
 from runners.edm.sampling import (
     EDMSchedule,
+    _schedule_segment_indices,
     dpmpp_2s_sample_segment,
     edm_sample_segment,
     resolve_split_percentages as _resolve_split_percentages,
     sde_euler_maruyama_sample_segment,
 )
-from runners.splitting import (
-    append_by_counts as _append_by_counts,
-    cat_parts_by_run as _cat_parts_by_run,
-    run_full_trajectory_batch,
-    run_split_trajectory_batch,
-    trajectory_expected_cost_per_root,
-    trajectory_segment_costs,
-)
+from runners.splitting import run_full_trajectory_batch
 
 EDM_STOCHASTIC_DEFAULT_PARAMS = {
     "S_churn": 0.0,
@@ -40,22 +34,20 @@ SAMPLER_PARAM_DEFAULTS = {
     "dpmpp_2s": DPMPP_2S_DEFAULT_PARAMS,
     "sde_euler_maruyama": {},
 }
+SAMPLE_SEGMENT_FNS = {
+    "edm_stochastic": edm_sample_segment,
+    "dpmpp_2s": dpmpp_2s_sample_segment,
+    "sde_euler_maruyama": sde_euler_maruyama_sample_segment,
+}
 FLAT_EDM_PARAM_KEYS = frozenset(EDM_STOCHASTIC_DEFAULT_PARAMS)
 
 
 class EDMRunner(BaseRunner):
-    runner_name = "edm"
-    target_adapter = None
-    supported_samplers: Sequence[str] = ()
-    supported_solvers: Sequence[str] = ()
-    comparison_mode_specs: Sequence[ComparisonModeSpec] = ()
-    DEFAULT_SOLVER = "edm_stochastic"
+    """EDM sampler family; subclasses set ``target_adapter`` and the model hooks."""
 
-    @classmethod
-    def _target_adapter(cls):
-        if cls.target_adapter is None:
-            raise RuntimeError(f"{cls.__name__} must define target_adapter")
-        return cls.target_adapter
+    runner_name = "edm"
+    target_adapter: Any = None
+    supported_samplers: Sequence[str] = ()
 
     def __init__(
         self,
@@ -72,10 +64,6 @@ class EDMRunner(BaseRunner):
         sigma_data: float,
         device: str,
         sampler_params: Mapping[str, Any] | None = None,
-        S_churn: float | None = None,
-        S_min: float | None = None,
-        S_max: float | None = None,
-        S_noise: float | None = None,
         checkpoint_path: str | None = None,
     ):
         sampler = str(sampler)
@@ -84,16 +72,7 @@ class EDMRunner(BaseRunner):
                 f"Unknown EDM sampler {sampler!r}. "
                 f"Available: {tuple(type(self).supported_samplers)}"
             )
-        self._sampler_params = self._normalize_sampler_params(
-            sampler,
-            sampler_params=sampler_params,
-            flat_edm_params={
-                "S_churn": S_churn,
-                "S_min": S_min,
-                "S_max": S_max,
-                "S_noise": S_noise,
-            },
-        )
+        self._sampler_params = self._normalize_sampler_params(sampler, sampler_params)
         self._model = model
         self._target_spec = dict(target_spec)
         self._data_mean = data_mean
@@ -154,27 +133,13 @@ class EDMRunner(BaseRunner):
     @staticmethod
     def _normalize_sampler_params(
         sampler: str,
-        *,
         sampler_params: Mapping[str, Any] | None,
-        flat_edm_params: Mapping[str, Any],
     ) -> dict[str, float]:
         if sampler not in SAMPLER_PARAM_DEFAULTS:
             raise ValueError(f"Unknown EDM sampler {sampler!r}")
-        explicit_flat = {
-            key: value for key, value in flat_edm_params.items() if value is not None
-        }
-        if explicit_flat and sampler != "edm_stochastic":
-            raise ValueError(
-                f"flat EDM S_* parameters are only valid for edm_stochastic, got sampler={sampler!r}"
-            )
-        if explicit_flat and sampler_params:
-            raise ValueError("Use either sampler_params or flat S_* parameters, not both")
-
         params = dict(SAMPLER_PARAM_DEFAULTS[sampler])
         if sampler_params:
             params.update(dict(sampler_params))
-        elif explicit_flat:
-            params.update(explicit_flat)
 
         unknown = set(params) - set(SAMPLER_PARAM_DEFAULTS[sampler])
         if unknown:
@@ -202,24 +167,6 @@ class EDMRunner(BaseRunner):
         return normalized
 
     @classmethod
-    def add_train_args(cls, parser) -> None:
-        raise NotImplementedError(f"{cls.__name__}.add_train_args must be implemented")
-
-    @classmethod
-    def train_from_args(cls, args) -> None:
-        raise NotImplementedError(f"{cls.__name__}.train_from_args must be implemented")
-
-    @classmethod
-    def load_model_from_checkpoint(cls, checkpoint: Mapping[str, Any], device: str, no_compile: bool):
-        raise NotImplementedError(
-            f"{cls.__name__}.load_model_from_checkpoint must be implemented"
-        )
-
-    @staticmethod
-    def model_input_dim(model) -> int:
-        raise NotImplementedError("EDM subclasses must implement model_input_dim")
-
-    @classmethod
     def load_from_checkpoint(
         cls,
         checkpoint_path: str | None = None,
@@ -244,11 +191,22 @@ class EDMRunner(BaseRunner):
         }
         defaults.update(checkpoint.get("sampling_defaults", {}))
         defaults.update(kwargs)
+        flat = {key: defaults.pop(key) for key in FLAT_EDM_PARAM_KEYS & set(defaults)}
+        flat = {key: value for key, value in flat.items() if value is not None}
+        if flat:
+            if defaults["sampler"] != "edm_stochastic":
+                raise ValueError(
+                    "flat EDM S_* parameters are only valid for edm_stochastic, "
+                    f"got sampler={defaults['sampler']!r}"
+                )
+            if defaults.get("sampler_params"):
+                raise ValueError("Use either sampler_params or flat S_* parameters, not both")
+            defaults["sampler_params"] = flat
         return cls(
             model=model,
             target_spec=checkpoint.get(
                 "target_spec",
-                cls._target_adapter().get_target_distribution_spec(),
+                cls.target_adapter.get_target_distribution_spec(),
             ),
             data_mean=torch.as_tensor(
                 checkpoint["data_mean"], device=device, dtype=torch.float32
@@ -270,10 +228,6 @@ class EDMRunner(BaseRunner):
             "sigma_max",
             "rho",
             "sampler_params",
-            "S_churn",
-            "S_min",
-            "S_max",
-            "S_noise",
         }
         unknown = set(kwargs) - allowed
         if unknown:
@@ -281,21 +235,9 @@ class EDMRunner(BaseRunner):
                 f"{type(self).__name__}.with_sampling_config got unknown keys: {sorted(unknown)}"
             )
         sampler = str(kwargs.get("sampler", self._sampler))
-        flat_edm_params = {
-            "S_churn": kwargs.get("S_churn"),
-            "S_min": kwargs.get("S_min"),
-            "S_max": kwargs.get("S_max"),
-            "S_noise": kwargs.get("S_noise"),
-        }
-        has_flat_edm_params = any(value is not None for value in flat_edm_params.values())
-        requested_sampler_params = kwargs.get("sampler_params")
-        if requested_sampler_params is None and not has_flat_edm_params and sampler == self._sampler:
-            requested_sampler_params = self._sampler_params
-        sampler_params = self._normalize_sampler_params(
-            sampler,
-            sampler_params=requested_sampler_params,
-            flat_edm_params=flat_edm_params,
-        )
+        sampler_params = kwargs.get("sampler_params")
+        if sampler_params is None and sampler == self._sampler:
+            sampler_params = self._sampler_params
         return type(self)(
             model=self._model,
             target_spec=self._target_spec,
@@ -313,29 +255,18 @@ class EDMRunner(BaseRunner):
         )
 
     @property
-    def device(self) -> str:
-        return self._device
-
-    @property
     def input_dim(self) -> int:
         return int(type(self).model_input_dim(self._model))
 
-    @property
-    def target_spec(self) -> Mapping[str, Any]:
-        return self._target_spec
-
-    @property
-    def sampling_config(self) -> SamplingConfig:
-        return SamplingConfig(
-            values={
-                "sampler": str(self._sampler),
-                "sampling_steps": int(self._sampling_steps),
-                "sigma_min": float(self._sigma_min),
-                "sigma_max": float(self._sigma_max),
-                "rho": float(self._rho),
-                "sampler_params": dict(self._sampler_params),
-            }
-        )
+    def sampling_cache_key(self) -> Mapping[str, Any]:
+        return {
+            "sampler": str(self._sampler),
+            "sampling_steps": int(self._sampling_steps),
+            "sigma_min": float(self._sigma_min),
+            "sigma_max": float(self._sigma_max),
+            "rho": float(self._rho),
+            "sampler_params": dict(self._sampler_params),
+        }
 
     @property
     def start_time(self) -> Any:
@@ -345,16 +276,6 @@ class EDMRunner(BaseRunner):
     def end_time(self) -> Any:
         return 0.0
 
-    @property
-    def checkpoint_path(self) -> str | None:
-        return self._checkpoint_path
-
-    def comparison_modes(self) -> Sequence[ComparisonModeSpec]:
-        return tuple(type(self).comparison_mode_specs)
-
-    def _validate_mode(self, comparison_mode: str) -> None:
-        self.comparison_mode_spec(comparison_mode)
-
     def sample_prior(self, num_samples: int, *, generator=None) -> torch.Tensor:
         return torch.randn(
             int(num_samples), self.input_dim, device=self._device, generator=generator
@@ -363,50 +284,19 @@ class EDMRunner(BaseRunner):
     def sample_segment(
         self, x, start_time, end_time, *, generator=None, progress_callback=None
     ):
-        if self._sampler == "edm_stochastic":
-            params = self._sampler_params
-            return edm_sample_segment(
-                self._model,
-                x,
-                float(start_time),
-                float(end_time),
-                self._schedule,
-                S_churn=params["S_churn"],
-                S_min=params["S_min"],
-                S_max=params["S_max"],
-                S_noise=params["S_noise"],
-                generator=generator,
-                progress_callback=progress_callback,
-            )
-        if self._sampler == "dpmpp_2s":
-            params = self._sampler_params
-            return dpmpp_2s_sample_segment(
-                self._model,
-                x,
-                float(start_time),
-                float(end_time),
-                self._schedule,
-                stochastic_churn_rate=params["stochastic_churn_rate"],
-                churn_min_noise_level=params["churn_min_noise_level"],
-                churn_max_noise_level=params["churn_max_noise_level"],
-                noise_level_inflation_factor=params["noise_level_inflation_factor"],
-                generator=generator,
-                progress_callback=progress_callback,
-            )
-        if self._sampler == "sde_euler_maruyama":
-            return sde_euler_maruyama_sample_segment(
-                self._model,
-                x,
-                float(start_time),
-                float(end_time),
-                self._schedule,
-                generator=generator,
-                progress_callback=progress_callback,
-            )
-        raise ValueError(f"Unknown EDM sampler {self._sampler!r}")
+        return SAMPLE_SEGMENT_FNS[self._sampler](
+            self._model,
+            x,
+            float(start_time),
+            float(end_time),
+            self._schedule,
+            **self._sampler_params,
+            generator=generator,
+            progress_callback=progress_callback,
+        )
 
     def postprocess_samples(self, native_samples: torch.Tensor) -> torch.Tensor:
-        return type(self)._target_adapter().denormalize(
+        return type(self).target_adapter.denormalize(
             native_samples,
             self._data_mean,
             self._data_std,
@@ -416,45 +306,20 @@ class EDMRunner(BaseRunner):
         return _resolve_split_percentages(self._schedule, split_percentages)
 
     def segment_cost(self, start_time: Any, end_time: Any) -> float:
-        start_idx = self._schedule.index_for_sigma(float(start_time))
-        end_idx = self._schedule.index_for_sigma(float(end_time))
-        if start_idx > end_idx:
-            raise ValueError(
-                f"EDM segment must move toward lower sigma, got {start_time} -> {end_time}"
+        start_idx, end_idx = _schedule_segment_indices(
+            start_time, end_time, self._schedule
+        )
+        if self._sampler == "sde_euler_maruyama":
+            return float(end_idx - start_idx)
+        return float(
+            sum(
+                1 if self._schedule.sigmas_cpu[idx + 1] <= 0.0 else 2
+                for idx in range(start_idx, end_idx)
             )
-        total = 0
-        for idx in range(start_idx, end_idx):
-            sigma_next = self._schedule.sigmas_cpu[idx + 1]
-            total += self._transition_cost(sigma_next)
-        return float(total)
-
-    def segment_costs(self, split_points: Sequence[Any]) -> list:
-        points = [float(p) for p in split_points]
-        return trajectory_segment_costs(self, points)
-
-    def expected_cost_per_root(self, split_points, split_factors) -> float:
-        return trajectory_expected_cost_per_root(self, split_points, split_factors)
-
-    def run_split_batch(
-        self,
-        *,
-        n0_by_run,
-        split_points,
-        split_factors_by_run,
-        generator=None,
-        max_sampling_batch_size=None,
-    ):
-        return run_split_trajectory_batch(
-            self,
-            n0_by_run=n0_by_run,
-            split_points=[float(point) for point in split_points],
-            split_factors_by_run=split_factors_by_run,
-            generator=generator,
-            max_sampling_batch_size=max_sampling_batch_size,
         )
 
-    def solver_names(self) -> Sequence[str]:
-        return tuple(type(self).supported_solvers)
+    def _split_point(self, point):
+        return float(point)
 
     def parse_solver_baseline_name(self, name: str, solver: str) -> dict | None:
         prefix = f"{solver}_"
@@ -523,8 +388,7 @@ class EDMRunner(BaseRunner):
         sampler_params = self._solver_sampler_params(solver, solver_kwargs)
         if sampler_params:
             key["sampler_params"] = sampler_params
-        consumed = {"sampling_steps", "sampler_params", *FLAT_EDM_PARAM_KEYS}
-        for name in sorted(set(solver_kwargs) - consumed - {"eta"}):
+        for name in sorted(set(solver_kwargs) - {"sampling_steps", "sampler_params", "eta"}):
             key[name] = solver_kwargs[name]
         return key
 
@@ -533,15 +397,7 @@ class EDMRunner(BaseRunner):
         solver: str,
         solver_kwargs: Mapping[str, Any],
     ) -> dict[str, float]:
-        flat_edm_params = {
-            key: solver_kwargs[key] if key in solver_kwargs else None
-            for key in FLAT_EDM_PARAM_KEYS
-        }
-        return self._normalize_sampler_params(
-            solver,
-            sampler_params=solver_kwargs.get("sampler_params"),
-            flat_edm_params=flat_edm_params,
-        )
+        return self._normalize_sampler_params(solver, solver_kwargs.get("sampler_params"))
 
     def _validate_solver_kwargs(
         self, solver: str, solver_kwargs: Mapping[str, Any]
@@ -555,26 +411,14 @@ class EDMRunner(BaseRunner):
             "rho",
             "sampler_params",
             "eta",
-            *FLAT_EDM_PARAM_KEYS,
         }
         unknown = set(solver_kwargs) - allowed
         if unknown:
             raise ValueError(f"Unknown solver kwargs for {solver!r}: {sorted(unknown)}")
         self._solver_sampler_params(solver, solver_kwargs)
 
-    def _transition_cost(self, sigma_next) -> int:
-        if self._sampler in ("edm_stochastic", "dpmpp_2s"):
-            return 1 if float(sigma_next) <= 0.0 else 2
-        if self._sampler == "sde_euler_maruyama":
-            return 1
-        raise ValueError(f"Unknown EDM sampler {self._sampler!r}")
-
     def schedule_cost(self) -> float:
-        if self._sampler in ("edm_stochastic", "dpmpp_2s"):
-            return float(2 * int(self._sampling_steps) - 1)
-        if self._sampler == "sde_euler_maruyama":
-            return float(int(self._sampling_steps))
-        raise ValueError(f"Unknown EDM sampler {self._sampler!r}")
+        return self.segment_cost(self.start_time, self.end_time)
 
     def run_solver_baseline_batch(
         self,
@@ -611,7 +455,7 @@ class EDMRunner(BaseRunner):
         comparison_mode: str,
         reference_generation_config: Mapping[str, Any] | None,
     ) -> Mapping[str, Any]:
-        self._validate_mode(comparison_mode)
+        self.comparison_mode_spec(comparison_mode)
         if comparison_mode == "true_dist":
             return {}
         if reference_generation_config is None:
@@ -669,11 +513,7 @@ class EDMRunner(BaseRunner):
             sigma_max=cfg["sigma_max"],
             rho=cfg["rho"],
         )
-        sampler_params = self._normalize_sampler_params(
-            sampler,
-            sampler_params=dict(cfg["sampler_params"]),
-            flat_edm_params={key: None for key in FLAT_EDM_PARAM_KEYS},
-        )
+        sampler_params = self._normalize_sampler_params(sampler, dict(cfg["sampler_params"]))
         seed = int(cfg.get("seed", 0))
         if seed < 0:
             raise ValueError("reference seed must be nonnegative")
@@ -690,7 +530,7 @@ class EDMRunner(BaseRunner):
         comparison_mode: str,
         reference_generation_config: Mapping[str, Any] | None = None,
     ) -> Mapping[str, Any]:
-        self._validate_mode(comparison_mode)
+        self.comparison_mode_spec(comparison_mode)
         ref_cfg = self.normalize_reference_generation_config(
             comparison_mode, reference_generation_config
         )
@@ -717,7 +557,7 @@ class EDMRunner(BaseRunner):
         generator=None,
         progress=None,
     ):
-        self._validate_mode(comparison_mode)
+        self.comparison_mode_spec(comparison_mode)
         if comparison_mode == "true_dist":
             raise ValueError("true_dist comparison does not require reference samples")
         ref_cfg = self.normalize_reference_generation_config(
@@ -725,7 +565,6 @@ class EDMRunner(BaseRunner):
         )
         if batch_size < 1:
             raise ValueError("batch_size must be at least 1")
-        ref_runner = None
         if comparison_mode == "edm_samples":
             ref_runner = self.with_sampling_config(
                 sampler=ref_cfg["sampler"],
@@ -735,85 +574,24 @@ class EDMRunner(BaseRunner):
                 rho=ref_cfg["rho"],
                 sampler_params=ref_cfg["sampler_params"],
             )
-        batches = []
-        output = None
-        offset = 0
-        if comparison_mode == "edm_samples":
-            output = torch.empty(
-                (int(num_samples), ref_runner.input_dim),
-                dtype=torch.float32,
-                device="cpu",
+            return ref_runner._sample_reference(
+                num_samples,
+                batch_size,
+                sample_dim=ref_runner.input_dim,
+                num_steps=ref_runner._sampling_steps,
+                generator=generator,
+                progress=progress,
             )
+        batches = []
         remaining = int(num_samples)
         with torch.inference_mode():
             while remaining > 0:
                 current = min(int(batch_size), remaining)
-                if comparison_mode == "true_samples":
-                    generated = type(self)._target_adapter().sample_target_spec(
-                        self._target_spec,
-                        current,
-                        self._device,
-                    )
-                else:
-                    x = ref_runner.sample_prior(current, generator=generator)
-                    if progress is not None:
-                        start_idx = ref_runner._schedule.index_for_sigma(float(ref_runner.start_time))
-                        end_idx = ref_runner._schedule.index_for_sigma(float(ref_runner.end_time))
-                        progress["start_steps"](end_idx - start_idx)
-                    try:
-                        generated = ref_runner.sample_segment(
-                            x,
-                            ref_runner.start_time,
-                            ref_runner.end_time,
-                            generator=generator,
-                            progress_callback=None if progress is None else progress["step"],
-                        )
-                    finally:
-                        if progress is not None:
-                            progress["finish_steps"]()
-                    generated = ref_runner.postprocess_samples(generated)
-                generated = generated.to(device="cpu", dtype=torch.float32)
-                if output is None:
-                    batches.append(generated)
-                else:
-                    if generated.shape != (current, ref_runner.input_dim):
-                        raise ValueError(
-                            "EDM reference generator returned unexpected shape "
-                            f"{tuple(generated.shape)}"
-                        )
-                    output[offset : offset + current].copy_(generated)
-                    offset += current
+                generated = type(self).target_adapter.sample_target_spec(
+                    self._target_spec, current, self._device
+                )
+                batches.append(generated.to(device="cpu", dtype=torch.float32))
                 remaining -= current
                 if progress is not None:
                     progress["batch"](1)
-        if output is not None:
-            return output
         return torch.cat(batches, dim=0)
-
-    def prepare_comparison_state(
-        self,
-        *,
-        comparison_mode: str,
-        reference_samples=None,
-        metric_params=None,
-    ):
-        return super().prepare_comparison_state(
-            comparison_mode=comparison_mode,
-            reference_samples=reference_samples,
-            metric_params=metric_params,
-        )
-
-    def compute_ks_distance(
-        self,
-        parts,
-        *,
-        comparison_mode: str,
-        comparison_state=None,
-        part_weights=None,
-    ) -> float:
-        return super().compute_ks_distance(
-            parts,
-            comparison_mode=comparison_mode,
-            comparison_state=comparison_state,
-            part_weights=part_weights,
-        )

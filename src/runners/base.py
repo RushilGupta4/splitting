@@ -5,10 +5,9 @@ import os
 from abc import ABC, abstractmethod
 from collections.abc import Mapping as MappingABC
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
-import numpy as np
 import torch
 
 from metrics.ks import (
@@ -19,19 +18,13 @@ from metrics.ks import (
     warm_reference_ks_kernel,
 )
 from metrics.utils import coerce_samples_np
-
-
-@dataclass(frozen=True)
-class SamplingConfig:
-    values: Mapping[str, Any] = field(default_factory=dict)
+from runners.splitting import run_split_trajectory_batch, trajectory_segment_costs
 
 
 @dataclass(frozen=True)
 class ComparisonModeSpec:
     name: str
     requires_reference_cache: bool
-    reference_uses_sampling_config: bool = False
-    description: str = ""
 
 
 @dataclass(frozen=True)
@@ -248,24 +241,6 @@ def _sampler_for_step_schedules(
     )
 
 
-def sampling_steps_for_sampler_budget(
-    cfg: Mapping[str, Any],
-    sampler: str,
-    budget: int,
-    step_schedule: str | None = None,
-) -> int | None:
-    """Return configured steps for (sampler, budget), or None when unset."""
-    schedules_map = _step_schedules_map(cfg)
-    if not schedules_map:
-        return None
-
-    sampler_name = str(sampler)
-    schedule = _schedule_for_name(
-        step_schedules_for_sampler(cfg, sampler_name), sampler_name, step_schedule
-    )
-    return steps_for_budget(schedule, sampler_name, budget)
-
-
 def resolve_sampling_config_for_budget(
     cfg: Mapping[str, Any],
     sampling_config: Mapping[str, Any],
@@ -328,6 +303,8 @@ class BaseRunner(ABC):
     runner_name: str
     config_module: str | None = None
     supported_metrics: Sequence[str] = ("ks", "mmd")
+    supported_solvers: Sequence[str] = ()
+    comparison_mode_specs: Sequence[ComparisonModeSpec] = ()
     # What postprocess_samples returns: "state" (low-dimensional SDE/EDM state),
     # "pixel" (flat images in [0, 1]) or "latent" (a decoder's input); see metrics.spaces.
     sample_space: str = "state"
@@ -347,14 +324,11 @@ class BaseRunner(ABC):
         return os.path.join(cls.runner_dir(), "model_final.pt")
 
     @classmethod
-    def load_configs(cls) -> dict[str, dict]:
-        module_name = cls.config_module or f"runners.{cls.runner_name}.configs"
-        module = importlib.import_module(module_name)
-        return deepcopy(dict(module.CONFIGS))
-
-    @classmethod
     def get_config(cls, name: str) -> dict:
-        configs = cls.load_configs()
+        module = importlib.import_module(
+            cls.config_module or f"runners.{cls.runner_name}.configs"
+        )
+        configs = deepcopy(dict(module.CONFIGS))
         if name not in configs:
             raise ValueError(
                 f"Runner {cls.runner_name!r} has no config {name!r}. "
@@ -369,22 +343,12 @@ class BaseRunner(ABC):
         return cfg
 
     @classmethod
-    @abstractmethod
     def add_train_args(cls, parser) -> None:
         """Register runner-specific training args."""
 
     @classmethod
-    def add_compare_args(cls, parser) -> None:
-        """Register runner-specific compare/sweep args. Default: no extra args."""
-
-    @classmethod
-    def add_reference_args(cls, parser) -> None:
-        """Register runner-specific reference-cache args. Default: no extra args."""
-
-    @classmethod
-    @abstractmethod
     def train_from_args(cls, args) -> None:
-        """Train this runner from CLI args and save a checkpoint."""
+        raise RuntimeError(f"{cls.runner_name} has no training step")
 
     @classmethod
     @abstractmethod
@@ -413,42 +377,26 @@ class BaseRunner(ABC):
         """Return a cheap copy using the same loaded model but a different sampling config."""
 
     @property
-    @abstractmethod
     def device(self) -> str:
-        ...
+        return self._device
+
+    @property
+    def target_spec(self) -> Mapping[str, Any]:
+        """Runner-owned target description. JSON-serializable when possible."""
+        return self._target_spec
+
+    @property
+    def checkpoint_path(self) -> str | None:
+        return self._checkpoint_path
 
     @property
     @abstractmethod
     def input_dim(self) -> int:
         ...
 
-    @property
-    def phase1_query_space(self) -> str:
-        """Space the phase-1 queries and labels live in.
-
-        ``"target"`` labels on the postprocessed terminal sample, which is the
-        space the metric uses. ``"model"`` labels on the raw terminal state
-        instead -- the space the path state itself lives in. A latent diffusion
-        runner needs ``"model"``: its queries are drawn at ``input_dim`` (the
-        latent), so labelling on a decoded image would put the query's
-        coordinate indices in a different space from the state the regressor
-        conditions on.
-        """
-        return "target"
-
-    @property
     @abstractmethod
-    def target_spec(self) -> Mapping[str, Any]:
-        """Runner-owned target description. JSON-serializable when possible."""
-
-    @property
-    @abstractmethod
-    def sampling_config(self) -> SamplingConfig:
-        ...
-
     def sampling_cache_key(self) -> Mapping[str, Any]:
         """Return JSON-safe identity for the current sampler configuration."""
-        return dict(self.sampling_config.values)
 
     def parse_baseline_name(self, name: str) -> dict:
         """Parse a config baseline name into a generic compare spec."""
@@ -508,9 +456,8 @@ class BaseRunner(ABC):
     def end_time(self) -> Any:
         """Native terminal point for the runner trajectory."""
 
-    @abstractmethod
     def comparison_modes(self) -> Sequence[ComparisonModeSpec]:
-        """Return modes supported by this runner."""
+        return tuple(type(self).comparison_mode_specs)
 
     def comparison_mode_spec(self, comparison_mode: str) -> ComparisonModeSpec:
         """Resolve one supported comparison mode or raise a stable error."""
@@ -535,6 +482,7 @@ class BaseRunner(ABC):
         end_time: Any,
         *,
         generator=None,
+        progress_callback=None,
     ) -> torch.Tensor:
         """Propagate native samples from start_time to end_time."""
 
@@ -550,19 +498,16 @@ class BaseRunner(ABC):
     def segment_cost(self, start_time: Any, end_time: Any) -> float:
         """Return cost/NFE for one particle over a segment."""
 
-    @abstractmethod
+    def _split_point(self, point):
+        """Canonical runner-native form of one split point."""
+        return point
+
     def segment_costs(self, split_points: Sequence[Any]) -> list:
         """Return costs for all segments implied by split_points."""
+        return trajectory_segment_costs(
+            self, [self._split_point(p) for p in split_points]
+        )
 
-    @abstractmethod
-    def expected_cost_per_root(
-        self,
-        split_points: Sequence[Any],
-        split_factors: Sequence[float],
-    ) -> float:
-        """Expected total cost from one root under split factors."""
-
-    @abstractmethod
     def run_split_batch(
         self,
         *,
@@ -572,11 +517,19 @@ class BaseRunner(ABC):
         generator=None,
         max_sampling_batch_size=None,
     ):
-        """Return (samples_by_run, realized_costs, sampling_time). Samples must be postprocessed."""
+        """Return (samples_by_run, realized_costs, sampling_time). Samples are postprocessed."""
+        return run_split_trajectory_batch(
+            self,
+            n0_by_run=n0_by_run,
+            split_points=[self._split_point(p) for p in split_points],
+            split_factors_by_run=split_factors_by_run,
+            generator=generator,
+            max_sampling_batch_size=max_sampling_batch_size,
+        )
 
-    @abstractmethod
     def solver_names(self) -> Sequence[str]:
         """Return supported full-trajectory baseline solvers."""
+        return tuple(type(self).supported_solvers)
 
     @abstractmethod
     def solver_cost(self, solver: str, **solver_kwargs) -> float:
@@ -632,6 +585,48 @@ class BaseRunner(ABC):
     ) -> torch.Tensor:
         """Generate or load raw reference samples for modes that need cached samples."""
 
+    def _sample_reference(
+        self,
+        num_samples: int,
+        batch_size: int,
+        *,
+        sample_dim: int,
+        num_steps: int,
+        generator=None,
+        progress=None,
+    ) -> torch.Tensor:
+        """Full trajectories from this runner, batched into a CPU float32 tensor."""
+        output = torch.empty((int(num_samples), int(sample_dim)), dtype=torch.float32)
+        offset = 0
+        with torch.inference_mode():
+            while offset < int(num_samples):
+                current = min(int(batch_size), int(num_samples) - offset)
+                x = self.sample_prior(current, generator=generator)
+                if progress is not None:
+                    progress["start_steps"](int(num_steps))
+                try:
+                    x = self.sample_segment(
+                        x,
+                        self.start_time,
+                        self.end_time,
+                        generator=generator,
+                        progress_callback=None if progress is None else progress["step"],
+                    )
+                finally:
+                    if progress is not None:
+                        progress["finish_steps"]()
+                x = self.postprocess_samples(x).to(device="cpu", dtype=torch.float32)
+                if x.shape != (current, int(sample_dim)):
+                    raise ValueError(
+                        f"{type(self).__name__} reference generator returned "
+                        f"unexpected shape {tuple(x.shape)}"
+                    )
+                output[offset : offset + current].copy_(x)
+                offset += current
+                if progress is not None:
+                    progress["batch"](1)
+        return output
+
     def prepare_comparison_state(
         self,
         *,
@@ -680,11 +675,11 @@ class BaseRunner(ABC):
                     "comparison_state is required for "
                     f"comparison_mode={comparison_mode!r}"
                 )
-            value, _, _ = compute_reference_ks_distance(
+            value = compute_reference_ks_distance(
                 parts, comparison_state, part_weights=part_weights
             )
         else:
-            value, _, _ = compute_target_ks_distance(
+            value = compute_target_ks_distance(
                 parts, dict(self.target_spec), part_weights=part_weights
             )
         return float(value)

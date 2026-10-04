@@ -29,10 +29,6 @@ def diffusion(t: float, x: torch.Tensor) -> torch.Tensor:
     return torch.full_like(x, SIGMA)
 
 
-def diffusion_derivative(t: float, x: torch.Tensor) -> torch.Tensor:
-    del t
-    return torch.zeros_like(x)
-
 
 def target_spec(terminal_time: float, dimension: int) -> dict:
     return {
@@ -57,13 +53,9 @@ def target_spec(terminal_time: float, dimension: int) -> dict:
 
 
 SPEC = SDECase(
-    name="simple_ou",
-    label="Simple OU",
     initial_mean=INITIAL_MEAN,
     initial_variance=INITIAL_VARIANCE,
     drift=drift,
     diffusion=diffusion,
-    diffusion_derivative=diffusion_derivative,
     target_spec_factory=target_spec,
-    description="dX_t = 1.35(-0.2-X_t)dt + 0.65dW_t, X_0 ~ N(0, 1).",
 )

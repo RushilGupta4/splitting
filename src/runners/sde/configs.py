@@ -13,16 +13,6 @@ from runners.common_configs import (
     split_schedules,
 )
 
-SDE_SPLITS = split_schedules()
-
-SDE_DIMENSION = 2
-SDE_SAMPLER = "euler"
-SDE_COMPARISON_MODE = "true_samples"
-SDE_REFERENCE_METHOD = "sde_terminal_samples"
-SDE_REFERENCE_SAMPLER = "euler"
-SDE_REFERENCE_SAMPLING_STEPS = 20_000
-SDE_MAX_SAMPLING_BATCH_SIZE = 50_000
-
 _EULER_CALIBRATED = {
     10_000: 60,
     20_000: 75,
@@ -39,10 +29,10 @@ _EULER_CALIBRATED = {
 # Everything here is independent of terminal_time.
 _SAMPLING_BASE = {
     "sampling_configs": [
-        {"sampler": SDE_SAMPLER},
+        {"sampler": "euler"},
     ],
     "step_schedules": {
-        "calibrated": {SDE_SAMPLER: _EULER_CALIBRATED},
+        "calibrated": {"euler": _EULER_CALIBRATED},
     },
     "B_list": [
         100_000,
@@ -59,11 +49,11 @@ _SAMPLING_BASE = {
         "fixed_N",
         "uniform_c",
     ],
-    "max_sampling_batch_size": SDE_MAX_SAMPLING_BATCH_SIZE,
+    "max_sampling_batch_size": 50_000,
 }
 
 _METADATA_BASE = {
-    "split_percentages_list": [list(split) for split in SDE_SPLITS],
+    "split_percentages_list": split_schedules(),
     "optimization_modes": OPTIMIZATION_MODES_WITH_LEARNED_C,
     "crossfit_q_mlp_losses": ["mse"],
     "num_base_samples": 2_500_000,
@@ -96,16 +86,16 @@ def sde_case_configs(*, terminal_time: float, description: str) -> dict[str, dic
     default_config = {
         **_SAMPLING_BASE,
         **_METADATA_BASE,
-        "comparison_mode": SDE_COMPARISON_MODE,
+        "comparison_mode": "true_samples",
         "runner_defaults": {
-            "dimension": SDE_DIMENSION,
+            "dimension": 2,
             "terminal_time": terminal_time,
         },
         "sampling_defaults": {"terminal_time": terminal_time},
         "reference_generation_config": {
-            "method": SDE_REFERENCE_METHOD,
-            "sampler": SDE_REFERENCE_SAMPLER,
-            "sampling_steps": SDE_REFERENCE_SAMPLING_STEPS,
+            "method": "sde_terminal_samples",
+            "sampler": "euler",
+            "sampling_steps": 20_000,
             "terminal_time": terminal_time,
         },
         "description": str(description),
@@ -123,6 +113,3 @@ def sde_case_configs(*, terminal_time: float, description: str) -> dict[str, dic
             )
         ),
     }
-
-
-__all__ = ["sde_case_configs"]

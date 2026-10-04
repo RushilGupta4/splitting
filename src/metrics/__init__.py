@@ -14,7 +14,6 @@ from __future__ import annotations
 from typing import Any, Mapping, Sequence
 
 import numpy as np
-import torch
 
 from metrics import spaces
 from metrics.mmd import (
@@ -27,7 +26,6 @@ from metrics.mmd import (
 
 MMD_SPACE_METRICS = tuple(f"mmd_{space}" for space in spaces.SPACES)
 SUPPORTED_METRICS = ("ks", "mmd", *MMD_SPACE_METRICS)
-REFERENCE_SAMPLE_METRICS = frozenset(SUPPORTED_METRICS)
 
 
 def is_mmd(metric: str) -> bool:
@@ -55,7 +53,6 @@ def normalize_metrics(
         raw_metrics = [raw_metrics]
     supported_set = set(SUPPORTED_METRICS if supported is None else supported)
     metrics: list[str] = []
-    seen = set()
     for raw_metric in raw_metrics:
         metric = str(raw_metric).lower()
         if metric not in SUPPORTED_METRICS:
@@ -64,9 +61,8 @@ def normalize_metrics(
             )
         if metric not in supported_set and not (is_mmd(metric) and "mmd" in supported_set):
             raise ValueError(f"Metric {metric!r} is not supported by this runner")
-        if metric not in seen:
+        if metric not in metrics:
             metrics.append(metric)
-            seen.add(metric)
     if not metrics:
         raise ValueError("metrics must be non-empty")
     return metrics
@@ -97,10 +93,6 @@ def normalize_metric_params(raw_params=None) -> dict[str, dict[str, Any]]:
     return params
 
 
-def uses_reference_samples(metrics: Sequence[str]) -> bool:
-    return bool(REFERENCE_SAMPLE_METRICS.intersection(metrics))
-
-
 def validate_metric_dimensions(runner, metrics: Sequence[str]) -> None:
     if "ks" in metrics and int(runner.input_dim) > 2:
         raise ValueError(
@@ -110,27 +102,18 @@ def validate_metric_dimensions(runner, metrics: Sequence[str]) -> None:
 
 
 def metric_cache_key(runner, metrics: Sequence[str], metric_params: Mapping[str, Any]):
-    normalized_params = normalize_metric_params(metric_params)
-    validate_metric_dimensions(runner, metrics)
-    key: dict[str, Any] = {
-        "metrics": list(metrics),
-    }
-    params = normalized_params.get("mmd") or {}
-    if "mmd" in metrics:
-        key["mmd"] = _mmd_metric_cache_key(
-            params,
-            representation=_mmd_representation(runner, params),
-        )
+    params = _normalize_mmd_params(metric_params.get("mmd"))
+    key: dict[str, Any] = {"metrics": list(metrics)}
     for metric in metrics:
-        if metric in MMD_SPACE_METRICS:
-            space = mmd_space(metric, runner)
-            key[metric] = {
-                **_mmd_metric_cache_key(
-                    params,
-                    representation=_mmd_representation(spaces.space_runner(runner, space), params),
-                ),
-                **spaces.space_cache_key(space),
-            }
+        if not is_mmd(metric):
+            continue
+        space = mmd_space(metric, runner)
+        key[metric] = _mmd_metric_cache_key(
+            params,
+            representation=_mmd_representation(spaces.space_runner(runner, space), params),
+        )
+        if metric != "mmd":
+            key[metric].update(spaces.space_cache_key(space))
     return key
 
 
@@ -145,7 +128,8 @@ def prepare_metric_states(
     scoring_batch_size: int = spaces.DEFAULT_BATCH_SIZE,
 ):
     """``space_references`` maps each space in ``metric_spaces`` to its reference samples."""
-    metric_params = normalize_metric_params(metric_params)
+    metric_params = metric_params or {}
+    mmd_params = _normalize_mmd_params(metric_params.get("mmd"))
     validate_metric_dimensions(runner, metrics)
     states: dict[str, Any] = {"scoring_batch_size": int(scoring_batch_size)}
     if "ks" in metrics:
@@ -165,7 +149,7 @@ def prepare_metric_states(
                 reference_samples if space == runner.sample_space
                 else (space_references or {}).get(space)
             ),
-            params=metric_params.get("mmd") or {},
+            params=mmd_params,
         )
         states[metric]["space"] = space
     return states
@@ -199,7 +183,6 @@ def compute_trial_metrics(
         )
     mmd_metrics = [metric for metric in metrics if is_mmd(metric)]
     if mmd_metrics:
-        parts = parts if isinstance(parts, (list, tuple)) else [parts]
         mapped = spaces.map_parts(
             runner,
             parts,
@@ -219,17 +202,13 @@ def summarize_metric_trials(
 ):
     summary: dict[str, Any] = {}
     for metric in metrics:
-
-        def metric_value(trial):
-            values = trial.get("metrics") or {}
-            if metric in values:
-                return values[metric]
-            if metric == "ks":
-                return trial.get("ks_distance", np.nan)
-            return np.nan
-
         values = np.array(
-            [metric_value(trial) for trial in trial_results],
+            [
+                (trial.get("metrics") or {}).get(
+                    metric, trial.get("ks_distance", np.nan) if metric == "ks" else np.nan
+                )
+                for trial in trial_results
+            ],
             dtype=float,
         )
         valid = values[~np.isnan(values)]
@@ -239,11 +218,3 @@ def summarize_metric_trials(
         )
         summary[f"n_valid_{metric}"] = int(valid.size)
     return summary
-
-
-def aggregate_cached_metric_rows(
-    trials: Sequence[Mapping[str, Any]], metrics: Sequence[str]
-):
-    return summarize_metric_trials(trials, metrics)
-
-

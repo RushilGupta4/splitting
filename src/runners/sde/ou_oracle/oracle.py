@@ -40,9 +40,9 @@ OU_RATES = (1.35, 1.60)
 OU_SIGMA = 0.65
 
 
-# This optimizer block is copied from src/adaptive.py so the paper scripts are
-# standalone.  It additionally retains the convex-combination profile and the
-# final primal-dual gap, which the production allocator does not need to expose.
+# A variant of the optimizer in src/adaptive.py that also returns the
+# convex-combination profile and the final primal-dual gap. It is not
+# interchangeable with it: the ou_oracle cache key records its output.
 def _objective_values(M: np.ndarray, y: np.ndarray) -> np.ndarray:
     return M @ (1.0 / y)
 
@@ -364,7 +364,7 @@ def query_variance_contributions(
 
 
 @functools.lru_cache(maxsize=None)
-def _minimax_solution(
+def minimax_solution(
     schedule: tuple[float, ...], *, steps: int = 280
 ) -> tuple[np.ndarray, np.ndarray, float]:
     contributions = query_variance_contributions(schedule, steps=steps)
@@ -381,25 +381,3 @@ def _minimax_solution(
     allocation /= float(cost_w @ allocation)
     cumulative = allocation / allocation[0]
     return cumulative, profile, relative_gap
-
-
-def ou_oracle_allocation(
-    schedule: tuple[float, ...], *, steps: int = 280
-) -> np.ndarray:
-    """Return the finite-query minimax cumulative allocation."""
-    allocation, _, _ = _minimax_solution(schedule, steps=steps)
-    return allocation.copy()
-
-
-def ou_oracle_variance_contributions(
-    schedule: tuple[float, ...], *, steps: int = 280
-) -> np.ndarray:
-    """Return the least-favorable convex-mixture variance profile."""
-    _, profile, _ = _minimax_solution(schedule, steps=steps)
-    return profile.copy()
-
-
-def ou_oracle_relative_gap(schedule: tuple[float, ...], *, steps: int = 280) -> float:
-    """Return the finite-query Frank--Wolfe relative primal-dual gap."""
-    _, _, relative_gap = _minimax_solution(schedule, steps=steps)
-    return float(relative_gap)

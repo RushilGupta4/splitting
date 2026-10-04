@@ -6,22 +6,18 @@ import os
 import torch
 from tqdm import tqdm
 
-from metrics import (
-    metric_spaces,
-    normalize_metrics,
-    uses_reference_samples,
-    validate_metric_dimensions,
-)
+from metrics import metric_spaces, normalize_metrics, spaces, validate_metric_dimensions
 from reference_cache import (
     load_reference_samples_checked,
     load_reference_samples_if_sufficient,
     load_space_references,
+    reference_path_for_runner,
     reference_preview_path,
-    reference_samples_path_for_key,
     save_reference_preview,
     save_reference_samples_with_key,
 )
 from runners.registry import get_runner_class, names
+from trials import make_torch_generator
 
 log = logging.getLogger("ensure_samples")
 
@@ -44,14 +40,6 @@ def parse_args():
     parser.add_argument("--no_compile", action="store_true")
     parser.add_argument("--debug", action="store_true")
     return parser.parse_args()
-
-
-def _reference_cache_path(runner, comparison_mode, reference_generation_config):
-    cache_key = runner.reference_cache_key(comparison_mode, reference_generation_config)
-    return (
-        reference_samples_path_for_key(runner.checkpoint_path, cache_key),
-        cache_key,
-    )
 
 
 def _use_existing_cache(
@@ -92,16 +80,9 @@ def _ensure_for_runner(
 ):
     if int(batch_size) < 1:
         raise ValueError("batch_size must be at least 1")
-    path, cache_key = _reference_cache_path(
+    path, cache_key = reference_path_for_runner(
         runner, comparison_mode, reference_generation_config
     )
-    if _use_existing_cache(
-        runner.target_spec,
-        path,
-        reference_generation_config,
-        num_base_samples,
-    ):
-        return
     log.info(
         "Building reference samples for runner=%s mode=%s -> %s",
         runner.runner_name,
@@ -114,14 +95,9 @@ def _ensure_for_runner(
         nonlocal step_bar
         if total_steps <= 0:
             return
-        if step_bar is not None:
-            step_bar.close()
+        finish_step_progress()
         step_bar = tqdm(
-            total=total_steps,
-            desc="Diffusion steps",
-            unit="step",
-            leave=False,
-            position=1,
+            total=total_steps, desc="Diffusion steps", unit="step", leave=False, position=1
         )
 
     def update_step_progress(n=1):
@@ -135,12 +111,7 @@ def _ensure_for_runner(
             step_bar = None
 
     num_batches = math.ceil(int(num_base_samples) / int(batch_size))
-    with tqdm(
-        total=num_batches,
-        desc="Batches",
-        unit="batch",
-        position=0,
-    ) as batch_bar:
+    with tqdm(total=num_batches, desc="Batches", unit="batch", position=0) as batch_bar:
         progress = {
             "batch": batch_bar.update,
             "start_steps": start_step_progress,
@@ -148,17 +119,14 @@ def _ensure_for_runner(
             "finish_steps": finish_step_progress,
         }
         try:
-            seed = reference_generation_config.get("seed")
-            generator = None
-            if seed is not None:
-                generator = torch.Generator(device=torch.device(runner.device))
-                generator.manual_seed(int(seed))
             samples = runner.generate_reference_samples(
                 comparison_mode=comparison_mode,
                 reference_generation_config=reference_generation_config,
                 num_samples=num_base_samples,
                 batch_size=batch_size,
-                generator=generator,
+                generator=make_torch_generator(
+                    reference_generation_config.get("seed"), runner.device
+                ),
                 progress=progress,
             )
         finally:
@@ -237,23 +205,6 @@ def _validate_cifar_model_reference(
         )
 
 
-def _check_comparison_mode(runner, runner_name, comparison_mode):
-    if not any(s.name == comparison_mode for s in runner.comparison_modes()):
-        raise ValueError(
-            f"Runner {runner_name!r} does not support comparison_mode {comparison_mode!r}"
-        )
-
-
-def _reference_cache_required(runner, comparison_mode):
-    if runner.comparison_mode_spec(comparison_mode).requires_reference_cache:
-        return True
-    log.info(
-        "comparison_mode=%s does not require reference samples; nothing to do",
-        comparison_mode,
-    )
-    return False
-
-
 def _reference_generation_config(cfg, comparison_mode):
     if "reference_generation_config" not in cfg:
         raise ValueError(
@@ -261,6 +212,82 @@ def _reference_generation_config(cfg, comparison_mode):
             f"{comparison_mode!r} requires cached reference samples"
         )
     return cfg["reference_generation_config"]
+
+
+def _reference_ready(runner, cfg, comparison_mode):
+    """True when no base reference has to be built: none is required, or a valid cache exists."""
+    if not runner.comparison_mode_spec(comparison_mode).requires_reference_cache:
+        log.info(
+            "comparison_mode=%s does not require reference samples; nothing to do",
+            comparison_mode,
+        )
+        return True
+    reference_generation_config = runner.normalize_reference_generation_config(
+        comparison_mode, _reference_generation_config(cfg, comparison_mode)
+    )
+    path, _ = reference_path_for_runner(
+        runner, comparison_mode, reference_generation_config
+    )
+    return _use_existing_cache(
+        runner.target_spec,
+        path,
+        reference_generation_config,
+        int(cfg["num_base_samples"]),
+    )
+
+
+def _ensure_base_reference(args, runner_cls, cfg, metrics, comparison_mode, runner_defaults):
+    """Build the base reference unless it is cached; returns the loaded runner, if any."""
+    probe = runner_cls.load_without_model(device=args.device, **runner_defaults)
+    if probe is not None and _reference_ready(probe, cfg, comparison_mode):
+        return None
+    runner = runner_cls.load_from_checkpoint(
+        device=args.device, no_compile=args.no_compile, **runner_defaults
+    )
+    validate_metric_dimensions(runner, metrics)
+    if not _reference_ready(runner, cfg, comparison_mode):
+        _ensure_for_runner(
+            runner,
+            comparison_mode,
+            runner.normalize_reference_generation_config(
+                comparison_mode, _reference_generation_config(cfg, comparison_mode)
+            ),
+            int(cfg["num_base_samples"]),
+            int(args.batch_size),
+        )
+    return runner
+
+
+def _ensure_space_references(args, runner_cls, cfg, metrics, comparison_mode, runner):
+    """Decode/embed the base reference into each MMD space the config measures in."""
+    needed = metric_spaces(runner_cls, metrics)
+    if not needed:
+        return
+    if runner is None:
+        runner = runner_cls.load_from_checkpoint(
+            device=args.device,
+            no_compile=args.no_compile,
+            **dict(cfg.get("runner_defaults") or {}),
+        )
+    reference_generation_config = runner.normalize_reference_generation_config(
+        comparison_mode, _reference_generation_config(cfg, comparison_mode)
+    )
+    path, _ = reference_path_for_runner(
+        runner, comparison_mode, reference_generation_config
+    )
+    count = int(cfg["num_base_samples"])
+    log.info("Ensuring %s references for runner=%s", needed, runner.runner_name)
+    load_space_references(
+        runner,
+        comparison_mode,
+        reference_generation_config,
+        load_reference_samples_checked(path, count),
+        needed,
+        count,
+        batch_size=int(
+            (cfg.get("batching") or {}).get("scoring", spaces.DEFAULT_BATCH_SIZE)
+        ),
+    )
 
 
 def main():
@@ -277,87 +304,16 @@ def main():
     metrics = normalize_metrics(
         cfg.get("metrics"), supported=getattr(runner_cls, "supported_metrics", ("ks",))
     )
-    if not uses_reference_samples(metrics):
-        log.info(
-            "config metrics=%s do not require cached reference samples; nothing to do",
-            metrics,
-        )
-        return
     comparison_mode = cfg["comparison_mode"]
-    runner_defaults = dict(cfg.get("runner_defaults") or {})
-    _ensure_base_reference(args, runner_cls, cfg, metrics, comparison_mode, runner_defaults)
-    _ensure_space_references(args, runner_cls, cfg, metrics, comparison_mode, runner_defaults)
-
-
-
-
-def _ensure_space_references(args, runner_cls, cfg, metrics, comparison_mode, runner_defaults):
-    """Decode/embed the base reference into each MMD space the config measures in."""
-    needed = metric_spaces(runner_cls, metrics)
-    if not needed:
-        return
-    runner = runner_cls.load_from_checkpoint(
-        device=args.device, no_compile=args.no_compile, **runner_defaults
-    )
-    reference_generation_config = runner.normalize_reference_generation_config(
-        comparison_mode, _reference_generation_config(cfg, comparison_mode)
-    )
-    path, _ = _reference_cache_path(runner, comparison_mode, reference_generation_config)
-    count = int(cfg["num_base_samples"])
-    scoring = int((cfg.get("batching") or {}).get("scoring", 256))
-    log.info("Ensuring %s references for runner=%s", needed, runner.runner_name)
-    load_space_references(
-        runner,
+    runner = _ensure_base_reference(
+        args,
+        runner_cls,
+        cfg,
+        metrics,
         comparison_mode,
-        reference_generation_config,
-        load_reference_samples_checked(path, count),
-        needed,
-        count,
-        batch_size=scoring,
+        dict(cfg.get("runner_defaults") or {}),
     )
-
-
-def _ensure_base_reference(args, runner_cls, cfg, metrics, comparison_mode, runner_defaults):
-    probe = runner_cls.load_without_model(device=args.device, **runner_defaults)
-    if probe is not None:
-        _check_comparison_mode(probe, args.runner, comparison_mode)
-        if _reference_cache_required(probe, comparison_mode):
-            reference_generation_config = probe.normalize_reference_generation_config(
-                comparison_mode,
-                _reference_generation_config(cfg, comparison_mode),
-            )
-            path, _ = _reference_cache_path(
-                probe, comparison_mode, reference_generation_config
-            )
-            if _use_existing_cache(
-                probe.target_spec,
-                path,
-                reference_generation_config,
-                int(cfg["num_base_samples"]),
-            ):
-                return
-
-    base_runner = runner_cls.load_from_checkpoint(
-        device=args.device,
-        no_compile=args.no_compile,
-        **runner_defaults,
-    )
-    validate_metric_dimensions(base_runner, metrics)
-    _check_comparison_mode(base_runner, args.runner, comparison_mode)
-    if not _reference_cache_required(base_runner, comparison_mode):
-        return
-
-    reference_generation_config = base_runner.normalize_reference_generation_config(
-        comparison_mode,
-        _reference_generation_config(cfg, comparison_mode),
-    )
-    _ensure_for_runner(
-        base_runner,
-        comparison_mode,
-        reference_generation_config,
-        int(cfg["num_base_samples"]),
-        int(args.batch_size),
-    )
+    _ensure_space_references(args, runner_cls, cfg, metrics, comparison_mode, runner)
 
 
 if __name__ == "__main__":

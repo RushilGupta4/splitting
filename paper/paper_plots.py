@@ -30,15 +30,13 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
 from matplotlib.ticker import FuncFormatter, MultipleLocator
 
 # A two-sided 90% interval leaves 5% in each tail, hence Phi^-1(0.95).
 Z_TWO_SIDED_90 = 1.6448536269514722
 FIGURE_DPI = 300
 
-# Shared styling for the three four-model, 2x2 publication figures.  Keeping
-# these values in one place prevents small visual differences between panels
-# that are intended to be read as a set.
 FOUR_MODEL_FIGSIZE = (8.4, 8.4 / 1.9)
 # 2520x1326 output for the standardized 1.9:1 figures at 300 DPI.
 DATA_LINEWIDTH = 1.5
@@ -49,8 +47,7 @@ UNIFORM_C_ALPHA = 0.8
 REFERENCE_LINEWIDTH = 0.8
 GRID_LINEWIDTH = 0.55
 INTERVAL_ALPHA = 0.14
-# Vertical margins are held in inches so that every figure in the set gets the
-# same room for its legend and shared x label whatever its height.
+# Margins in inches, so every figure gets the same legend and x-label room.
 MARGIN_BOTTOM_IN = 0.31
 MARGIN_TOP_IN = 0.37
 LEGEND_TOP_IN = 0.056
@@ -65,8 +62,6 @@ def _four_model_layout(height: float, *, h_pad: float, w_pad: float) -> dict[str
     }
 
 
-# Pads are in font-size units, so matching a fractional change in panel spacing
-# takes a different bump per figure.
 GAIN_LAYOUT = _four_model_layout(FOUR_MODEL_FIGSIZE[1], h_pad=0.76, w_pad=0.89)
 ALLOCATION_LAYOUT = _four_model_layout(FOUR_MODEL_FIGSIZE[1], h_pad=0.67, w_pad=1.65)
 # Five panels: the 2x2 grid plus a centred third row at the same panel size.
@@ -92,13 +87,9 @@ SCHEDULE_COLORS = {
     THIRTY_NINE: "#0072B2",
 }
 
-# Colour encodes the split count, dash pattern the allocation: learned stays solid.
-# The metric-gain panels carry one dash pattern per allocation family, not per c;
-# the tables keep every constant-c row.
+# Colour encodes the split count, dash pattern the allocation.
 UNIFORM_C_LINESTYLE = (0, (2, 1.4))
-# The optimizer that restricts the allocation to a single branching factor.
-# Its rows share mode "adaptive" with the free-allocation rows, so every lookup
-# that wants one of them must say which.
+# Shares mode "adaptive" with the free allocation; lookups must name the optimizer.
 LEARNED_C_OPTIMIZER = "learned_c"
 LEARNED_C_LINESTYLE = (0, (5, 1.6))
 LEARNED_C_LABEL = r"Learned $c$"
@@ -187,7 +178,6 @@ MODELS = (
         "runner": "simple_ou",
         "config_name": "default",
         "title": "OU Process",
-        "plot_title": "OU Process (KS)",
         "metric": "ks",
         "n_runs": 2_500,
         "num_queries": 1_024,
@@ -211,7 +201,6 @@ MODELS = (
         "runner": "coupled_double_well_langevin",
         "config_name": "default",
         "title": "Overdamped Langevin",
-        "plot_title": "Overdamped Langevin (KS)",
         "metric": "ks",
         "n_runs": 2_500,
         "num_queries": 1_024,
@@ -235,7 +224,6 @@ MODELS = (
         "runner": "edm_gmm2d",
         "config_name": "default",
         "title": "EDM Gaussian mixture",
-        "plot_title": "EDM Gaussian mixture (KS)",
         "metric": "ks",
         "n_runs": 2_500,
         "num_queries": 1_024,
@@ -261,7 +249,6 @@ MODELS = (
         "runner": "ddpm_cifar10_hf",
         "config_name": "mmd",
         "title": "CIFAR-10 DDPM",
-        "plot_title": "CIFAR-10 DDPM (Inception MMD)",
         "metric": "mmd_inception",
         "mmd_representations": {
             "mmd_inception": "float_target",
@@ -292,7 +279,6 @@ MODELS = (
         "runner": "ldm_ffhq",
         "config_name": "mmd",
         "title": "FFHQ LDM",
-        "plot_title": "FFHQ LDM (Inception MMD)",
         "metric": "mmd_inception",
         "mmd_representations": {
             "mmd_inception": "float_target",
@@ -345,6 +331,46 @@ OU_ORACLE_MODEL = {
 }
 
 
+TIMING_BUDGET = 500_000
+# Per-run timings from the `timing` configs: one run at a time after a warm-up.
+TIMING_MODELS = tuple(
+    {
+        **MODELS_BY_DIRECTORY[directory],
+        "directory": directory.replace("_mmd", "_timing"),
+        "title": f"{MODELS_BY_DIRECTORY[directory]['title']} timing",
+        "config_name": "timing",
+        "n_runs": 10,
+        "budgets": (TIMING_BUDGET,),
+        "steps": (
+            dict(zip(MODELS_BY_DIRECTORY[directory]["budgets"], MODELS_BY_DIRECTORY[directory]["steps"]))[
+                TIMING_BUDGET
+            ],
+        ),
+        "timing": True,
+    }
+    for directory in ("ddpm_cifar10_hf_mmd", "ldm_ffhq_mmd")
+)
+TIMING_FIELDS = (
+    "phase1_simulation_seconds",
+    "query_seconds",
+    "estimation_seconds",
+    "optimization_seconds",
+    "phase2_seconds",
+    "total_seconds",
+    "scoring_seconds",
+)
+# total_seconds is the sum of these; scoring is timed separately.
+TIMING_STAGES = TIMING_FIELDS[:5]
+PILOT_STAGES = TIMING_STAGES[:4]
+INDEPENDENT_TIMING_FIELDS = frozenset({"phase2_seconds", "total_seconds", "scoring_seconds"})
+TIMING_METHODS = (("Learned", "monotone"), (LEARNED_C_LABEL, LEARNED_C_OPTIMIZER))
+TIMING_SEGMENTS = (
+    ("Phase 1 pilot", ("phase1_simulation_seconds",), "#E69F00"),
+    ("Allocation design", ("query_seconds", "estimation_seconds", "optimization_seconds"), "#CC79A7"),
+    ("Phase 2", ("phase2_seconds",), "#56B4E9"),
+)
+
+
 @dataclass
 class ResultRow:
     model: dict[str, Any]
@@ -366,6 +392,7 @@ class ResultRow:
     samples: np.ndarray | None = None
     split_factors: np.ndarray | None = None
     uniform_c: float | None = None
+    timings: dict[str, np.ndarray] | None = None
 
     @property
     def is_adaptive(self) -> bool:
@@ -492,9 +519,7 @@ def _check_uniform_c_bracket(row: ResultRow) -> None:
         raise RuntimeError(
             f"uniform_c N_i below one for {row.csv_path.name}, B={row.budget}"
         )
-    profile = np.concatenate(
-        ([1.0], np.cumprod(factors.mean(axis=0) if factors.ndim == 2 else factors))
-    )
+    profile = np.concatenate(([1.0], np.cumprod(factors.mean(axis=0))))
     target = float(row.uniform_c) ** np.arange(profile.size)
     ratio = profile / target
     if np.any(ratio <= 0.5 - 1e-9) or np.any(ratio > 2.0 + 1e-9):
@@ -513,6 +538,104 @@ def _resolved_pilot_budget(model: dict[str, Any], budget: int) -> int:
     return math.floor(value)
 
 
+def _listed_csvs(
+    model: dict[str, Any],
+    experiment_dir: Path,
+    manifest_path: Path,
+    allow_partial_schedules: bool,
+) -> list[Path]:
+    expected_names = {
+        f"compare_results_{_schedule_name(schedule)}.csv" for schedule, _ in SCHEDULES
+    }
+    if allow_partial_schedules:
+        listed = [
+            experiment_dir / name
+            for name in sorted(expected_names)
+            if (experiment_dir / name).is_file()
+        ]
+        if not listed:
+            raise RuntimeError(f"No recognized split-schedule CSVs in {experiment_dir}")
+        return listed
+    with manifest_path.open() as handle:
+        manifest = json.load(handle)
+    if manifest.get("runner_name") != model["runner"]:
+        raise RuntimeError(f"Unexpected runner in {manifest_path}")
+    if manifest.get("config_name") != model["config_name"]:
+        raise RuntimeError(f"Unexpected config in {manifest_path}")
+    listed = manifest.get("csv_files", [])
+    if (
+        len(listed) != len(SCHEDULES)
+        or {Path(value).name for value in listed} != expected_names
+    ):
+        raise RuntimeError(
+            f"{manifest_path} must list all {len(SCHEDULES)} completed "
+            "split-schedule CSVs"
+        )
+    return [experiment_dir / Path(value).name for value in listed]
+
+
+def _accept_run_count(
+    n: int,
+    model: dict[str, Any],
+    csv_path: Path,
+    allow_partial_runs: bool,
+    partial_run_counts: set[int],
+) -> bool:
+    """False for a row with no valid runs, which partial loads skip."""
+    if allow_partial_runs and n == 0:
+        return False
+    if n != model["n_runs"]:
+        if not allow_partial_runs or not 1 <= n < model["n_runs"]:
+            raise RuntimeError(
+                f"{csv_path}: expected {model['n_runs']} runs, found {n}"
+            )
+        partial_run_counts.add(n)
+    return True
+
+
+def _check_loaded_schedules(
+    model: dict[str, Any],
+    schedule_rows: dict[tuple[float, ...], list[ResultRow]],
+    experiment_dir: Path,
+    manifest_path: Path,
+    *,
+    allow_partial_schedules: bool,
+    partial_run_counts: set[int],
+    skipped_zero_run_rows: int,
+) -> None:
+    expected_schedules = {schedule for schedule, _ in SCHEDULES}
+    if not allow_partial_schedules and set(schedule_rows) != expected_schedules:
+        raise RuntimeError(f"Missing split-schedule data in {manifest_path}")
+    missing_schedules = expected_schedules - set(schedule_rows)
+    partial = f"Loading partial {model['title']} results"
+    if missing_schedules:
+        missing_labels = ", ".join(
+            label for schedule, label in SCHEDULES if schedule in missing_schedules
+        )
+        warnings.warn(
+            f"{partial}; missing schedules: {missing_labels}.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+    if partial_run_counts:
+        low = min(partial_run_counts)
+        high = max(partial_run_counts)
+        observed = str(low) if low == high else f"between {low} and {high}"
+        warnings.warn(
+            f"{partial}: expected {model['n_runs']} runs, found {observed}.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+    if skipped_zero_run_rows:
+        warnings.warn(
+            f"{partial}: skipped {skipped_zero_run_rows} rows with no valid runs.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+    if not schedule_rows:
+        raise RuntimeError(f"No usable partial results in {experiment_dir}")
+
+
 def _load_manifest_rows(
     outputs_root: Path,
     models: tuple[dict[str, Any], ...] = MODELS,
@@ -521,63 +644,26 @@ def _load_manifest_rows(
     allow_partial_schedules: bool = False,
 ) -> dict[str, dict[tuple[float, ...], list[ResultRow]]]:
     all_rows: dict[str, dict[tuple[float, ...], list[ResultRow]]] = {}
-    expected_csv_names = {
-        f"compare_results_{_schedule_name(schedule)}.csv" for schedule, _ in SCHEDULES
-    }
-
     for model in models:
         partial_run_counts: set[int] = set()
         skipped_zero_run_rows = 0
         experiment_dir = outputs_root / model["directory"]
         manifest_path = experiment_dir / "compare_outputs.json"
-        if allow_partial_schedules:
-            listed = [
-                str(experiment_dir / name)
-                for name in sorted(expected_csv_names)
-                if (experiment_dir / name).is_file()
-            ]
-            if not listed:
-                raise RuntimeError(
-                    f"No recognized split-schedule CSVs in {experiment_dir}"
-                )
-        else:
-            with manifest_path.open() as handle:
-                manifest = json.load(handle)
-            if manifest.get("runner_name") != model["runner"]:
-                raise RuntimeError(f"Unexpected runner in {manifest_path}")
-            if manifest.get("config_name") != model["config_name"]:
-                raise RuntimeError(f"Unexpected config in {manifest_path}")
-
-            listed = manifest.get("csv_files", [])
-            if (
-                len(listed) != len(SCHEDULES)
-                or {Path(value).name for value in listed} != expected_csv_names
-            ):
-                raise RuntimeError(
-                    f"{manifest_path} must list all {len(SCHEDULES)} completed "
-                    "split-schedule CSVs"
-                )
-
+        metric = model["metric"]
         schedule_rows: dict[tuple[float, ...], list[ResultRow]] = {}
-        for listed_path_text in listed:
-            csv_path = experiment_dir / Path(listed_path_text).name
+        for csv_path in _listed_csvs(
+            model, experiment_dir, manifest_path, allow_partial_schedules
+        ):
             schedule = _schedule_from_filename(csv_path)
             rows: list[ResultRow] = []
             with csv_path.open(newline="") as handle:
                 for raw in csv.DictReader(handle):
-                    metric = model["metric"]
-                    metric_n = raw.get(f"n_valid_{metric}", "")
-                    n = int(metric_n or raw["n_valid_ks"])
-                    if allow_partial_runs and n == 0:
+                    n = int(raw.get(f"n_valid_{metric}", "") or raw["n_valid_ks"])
+                    if not _accept_run_count(
+                        n, model, csv_path, allow_partial_runs, partial_run_counts
+                    ):
                         skipped_zero_run_rows += 1
                         continue
-                    if n != model["n_runs"]:
-                        if not allow_partial_runs or not 1 <= n < model["n_runs"]:
-                            raise RuntimeError(
-                                f"{csv_path}: expected {model['n_runs']} runs, "
-                                f"found {n}"
-                            )
-                        partial_run_counts.add(n)
                     row = ResultRow(
                         model=model,
                         schedule=schedule,
@@ -681,39 +767,15 @@ def _load_manifest_rows(
             if rows:
                 schedule_rows[schedule] = rows
 
-        expected_schedules = {schedule for schedule, _ in SCHEDULES}
-        if not allow_partial_schedules and set(schedule_rows) != expected_schedules:
-            raise RuntimeError(f"Missing split-schedule data in {manifest_path}")
-        missing_schedules = expected_schedules - set(schedule_rows)
-        if missing_schedules:
-            missing_labels = ", ".join(
-                label for schedule, label in SCHEDULES if schedule in missing_schedules
-            )
-            warnings.warn(
-                f"Loading partial {model['title']} results; "
-                f"missing schedules: {missing_labels}.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-        if partial_run_counts:
-            low = min(partial_run_counts)
-            high = max(partial_run_counts)
-            observed = str(low) if low == high else f"between {low} and {high}"
-            warnings.warn(
-                f"Loading partial {model['title']} results: "
-                f"expected {model['n_runs']} runs, found {observed}.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-        if skipped_zero_run_rows:
-            warnings.warn(
-                f"Loading partial {model['title']} results: skipped "
-                f"{skipped_zero_run_rows} rows with no valid runs.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-        if not schedule_rows:
-            raise RuntimeError(f"No usable partial results in {experiment_dir}")
+        _check_loaded_schedules(
+            model,
+            schedule_rows,
+            experiment_dir,
+            manifest_path,
+            allow_partial_schedules=allow_partial_schedules,
+            partial_run_counts=partial_run_counts,
+            skipped_zero_run_rows=skipped_zero_run_rows,
+        )
         all_rows[model["directory"]] = schedule_rows
     return all_rows
 
@@ -727,92 +789,57 @@ def _load_ou_oracle_rows(
     model = OU_ORACLE_MODEL
     experiment_dir = outputs_root / model["directory"]
     manifest_path = experiment_dir / "compare_outputs.json"
-    expected_names = {
-        f"compare_results_{_schedule_name(schedule)}.csv" for schedule, _ in SCHEDULES
-    }
-    if allow_partial_schedules:
-        listed = [
-            str(experiment_dir / name)
-            for name in sorted(expected_names)
-            if (experiment_dir / name).is_file()
-        ]
-        if not listed:
-            raise RuntimeError(f"No recognized oracle CSVs in {experiment_dir}")
-    else:
-        with manifest_path.open() as handle:
-            manifest = json.load(handle)
-        if (
-            manifest.get("runner_name") != model["runner"]
-            or manifest.get("config_name") != model["config_name"]
-        ):
-            raise RuntimeError(f"Unexpected OU oracle manifest {manifest_path}")
-        listed = manifest.get("csv_files", [])
-        if (
-            len(listed) != len(expected_names)
-            or {Path(value).name for value in listed} != expected_names
-        ):
-            raise RuntimeError(f"{manifest_path} does not list every oracle schedule")
-
     expected_steps = dict(zip(model["budgets"], model["steps"]))
     by_schedule: dict[tuple[float, ...], list[ResultRow]] = {}
     partial_run_counts: set[int] = set()
     skipped_zero_run_rows = 0
-    for listed_path in listed:
-        csv_path = experiment_dir / Path(listed_path).name
+    for csv_path in _listed_csvs(
+        model, experiment_dir, manifest_path, allow_partial_schedules
+    ):
         schedule = _schedule_from_filename(csv_path)
         rows: list[ResultRow] = []
         with csv_path.open(newline="") as handle:
             for raw in csv.DictReader(handle):
-                if raw["mode"] not in {"fixed_N", "ou_oracle"}:
+                if raw["mode"] != "ou_oracle":
                     raise RuntimeError(f"Unexpected oracle mode in {csv_path}")
-                if raw["mode"] == "fixed_N":
-                    # Legacy oracle runs included a separate independent baseline.
-                    # Paper comparisons always use the ordinary Simple OU fixed_N row.
-                    continue
                 n = int(raw["n_valid_ks"])
-                if allow_partial_runs and n == 0:
+                if not _accept_run_count(
+                    n, model, csv_path, allow_partial_runs, partial_run_counts
+                ):
                     skipped_zero_run_rows += 1
                     continue
-                if n != model["n_runs"] and not (
-                    allow_partial_runs and 1 <= n < model["n_runs"]
+                factors = [float(value) for value in raw["N_i"].split(",")]
+                factor_stds = [float(value) for value in raw["N_i_std"].split(",")]
+                if (
+                    len(factors) != len(schedule)
+                    or any(value < 1.0 for value in factors)
+                    or len(factor_stds) != len(schedule)
+                    or any(value != 0.0 for value in factor_stds)
+                    or raw["optimizer"] != "finite_query_minimax"
+                    or float(raw["oracle_gap"]) > 1e-6
+                    or int(raw["n0"]) < 1
                 ):
-                    raise RuntimeError(
-                        f"{csv_path}: expected {model['n_runs']} runs, found {n}"
+                    raise RuntimeError(f"Invalid OU oracle row in {csv_path}")
+                rows.append(
+                    ResultRow(
+                        model=model,
+                        schedule=schedule,
+                        mode=raw["mode"],
+                        budget=int(raw["B"]),
+                        pilot_budget=None,
+                        pilot_rule=None,
+                        sampler=raw["sampler"],
+                        sampling_steps=int(raw["sampling_steps"]),
+                        optimizer=raw["optimizer"],
+                        loss=None,
+                        reuse=None,
+                        mean=float(raw["mean_ks"]),
+                        std=float(raw["std_ks"]),
+                        n=n,
+                        csv_path=csv_path,
+                        raw=raw,
                     )
-                if n != model["n_runs"]:
-                    partial_run_counts.add(n)
-                row = ResultRow(
-                    model=model,
-                    schedule=schedule,
-                    mode=raw["mode"],
-                    budget=int(raw["B"]),
-                    pilot_budget=None,
-                    pilot_rule=None,
-                    sampler=raw["sampler"],
-                    sampling_steps=int(raw["sampling_steps"]),
-                    optimizer=raw["optimizer"] or None,
-                    loss=None,
-                    reuse=None,
-                    mean=float(raw["mean_ks"]),
-                    std=float(raw["std_ks"]),
-                    n=n,
-                    csv_path=csv_path,
-                    raw=raw,
                 )
-                if row.is_oracle:
-                    factors = [float(value) for value in raw["N_i"].split(",")]
-                    factor_stds = [float(value) for value in raw["N_i_std"].split(",")]
-                    if (
-                        len(factors) != len(schedule)
-                        or any(value < 1.0 for value in factors)
-                        or len(factor_stds) != len(schedule)
-                        or any(value != 0.0 for value in factor_stds)
-                        or row.optimizer != "finite_query_minimax"
-                        or float(raw["oracle_gap"]) > 1e-6
-                        or int(raw["n0"]) < 1
-                    ):
-                        raise RuntimeError(f"Invalid OU oracle row in {csv_path}")
-                rows.append(row)
 
         budgets = {row.budget for row in rows}
         expected_budgets = set(model["budgets"])
@@ -822,10 +849,9 @@ def _load_ou_oracle_rows(
             raise RuntimeError(f"Unexpected oracle budgets in {csv_path}")
         for budget in sorted(budgets):
             group = [row for row in rows if row.budget == budget]
-            oracle_count = sum(row.is_oracle for row in group)
             if (
-                oracle_count > 1
-                or (not allow_partial_runs and oracle_count != 1)
+                len(group) > 1
+                or (not allow_partial_runs and len(group) != 1)
                 or any(
                     row.sampler != model["sampler"]
                     or row.sampling_steps != expected_steps[budget]
@@ -836,39 +862,15 @@ def _load_ou_oracle_rows(
         if rows:
             by_schedule[schedule] = rows
 
-    expected_schedules = {schedule for schedule, _ in SCHEDULES}
-    if not allow_partial_schedules and set(by_schedule) != expected_schedules:
-        raise RuntimeError(f"Missing OU oracle schedules in {manifest_path}")
-    missing_schedules = expected_schedules - set(by_schedule)
-    if missing_schedules:
-        missing_labels = ", ".join(
-            label for schedule, label in SCHEDULES if schedule in missing_schedules
-        )
-        warnings.warn(
-            f"Loading partial OU oracle results; missing schedules: "
-            f"{missing_labels}.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-    if partial_run_counts:
-        low = min(partial_run_counts)
-        high = max(partial_run_counts)
-        observed = str(low) if low == high else f"between {low} and {high}"
-        warnings.warn(
-            f"Loading partial OU oracle results: expected {model['n_runs']} runs, "
-            f"found {observed}.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-    if skipped_zero_run_rows:
-        warnings.warn(
-            f"Loading partial OU oracle results: skipped {skipped_zero_run_rows} "
-            "rows with no valid runs.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-    if not by_schedule:
-        raise RuntimeError(f"No usable partial oracle results in {experiment_dir}")
+    _check_loaded_schedules(
+        model,
+        by_schedule,
+        experiment_dir,
+        manifest_path,
+        allow_partial_schedules=allow_partial_schedules,
+        partial_run_counts=partial_run_counts,
+        skipped_zero_run_rows=skipped_zero_run_rows,
+    )
     return by_schedule
 
 
@@ -992,6 +994,8 @@ def _config_matches(row: ResultRow, config: dict[str, Any]) -> bool:
     spec = key.get("spec", {})
     if not _static_config_is_expected(row.model, key):
         return False
+    if row.model.get("timing") and (key.get("batching") or {}).get("n_parallel") != 1:
+        return False
     if spec.get("B") != row.budget or not _sampling_config_is_expected(
         row.model, spec.get("runner_sampling_config", {}), row.sampling_steps
     ):
@@ -1034,18 +1038,20 @@ def _config_matches(row: ResultRow, config: dict[str, Any]) -> bool:
 
 
 def _read_valid_records(
-    path: Path, metric: str, n_runs: int
-) -> tuple[np.ndarray, np.ndarray | None] | None:
-    """The first n_runs valid records, or None if the cache holds fewer."""
+    path: Path, metric: str, n_runs: int, timing: bool = False
+) -> tuple[np.ndarray, np.ndarray | None, dict[str, np.ndarray] | None] | None:
+    """The first n_runs valid records, or None if the cache holds fewer.
+
+    With ``timing``, also each timing field per run (NaN where a record lacks it).
+    """
     values: list[float] = []
     factors: list[list[float]] = []
+    timings: dict[str, list[float]] = {field: [] for field in TIMING_FIELDS}
     factor_presence: bool | None = None
     with path.open() as handle:
         for line in handle:
             record = json.loads(line)
-            value = record.get("metrics", {}).get(metric)
-            if value is None and metric == "ks":
-                value = record.get("ks_distance")
+            value = record["metrics"].get(metric)
             if value is None or not math.isfinite(float(value)):
                 continue
             has_factors = "N_i" in record
@@ -1056,12 +1062,48 @@ def _read_valid_records(
             values.append(float(value))
             if has_factors:
                 factors.append([float(item) for item in record["N_i"]])
+            for field in TIMING_FIELDS:
+                timings[field].append(float(record.get(field, math.nan)))
             if len(values) == n_runs:
                 break
     if len(values) != n_runs:
         return None
     factor_array = np.asarray(factors, dtype=float) if factors else None
-    return np.asarray(values, dtype=float), factor_array
+    timing_arrays = (
+        {field: np.asarray(items, dtype=float) for field, items in timings.items()}
+        if timing
+        else None
+    )
+    return np.asarray(values, dtype=float), factor_array, timing_arrays
+
+
+def _check_timings(row: ResultRow) -> None:
+    """Stage times must be complete, add up to total_seconds and match the CSV."""
+    timings = row.timings
+    name = f"{row.csv_path.name}, B={row.budget}, {row.mode} {row.optimizer or ''}".rstrip()
+    expected = set(TIMING_FIELDS) if row.is_adaptive else INDEPENDENT_TIMING_FIELDS
+    for field in TIMING_FIELDS:
+        values = timings[field]
+        csv_mean, csv_std = row.raw[f"mean_{field}"], row.raw[f"std_{field}"]
+        if field not in expected:
+            if not np.all(np.isnan(values)) or csv_mean or csv_std:
+                raise RuntimeError(f"Unexpected {field} for {name}")
+            continue
+        if not np.all(np.isfinite(values)) or np.any(values < 0.0):
+            raise RuntimeError(f"Invalid {field} for {name}")
+        mean_matches = math.isclose(
+            float(values.mean()), float(csv_mean), rel_tol=1e-11, abs_tol=1e-13
+        )
+        std_matches = row.n == 1 or math.isclose(
+            float(values.std(ddof=1)), float(csv_std), rel_tol=1e-11, abs_tol=1e-13
+        )
+        if not mean_matches or not std_matches:
+            raise RuntimeError(f"{field} aggregate mismatch for {name}")
+    if int(row.raw["n_valid_timing"]) != row.n:
+        raise RuntimeError(f"n_valid_timing != {row.n} for {name}")
+    stages = sum(np.nan_to_num(timings[field]) for field in TIMING_STAGES)
+    if not np.allclose(stages, timings["total_seconds"], rtol=1e-9, atol=0.0):
+        raise RuntimeError(f"Stage times do not add up to total_seconds for {name}")
 
 
 def _attach_and_verify_caches(
@@ -1070,7 +1112,8 @@ def _attach_and_verify_caches(
     models: tuple[dict[str, Any], ...] = MODELS,
 ) -> None:
     record_cache: dict[
-        tuple[Path, str, int], tuple[np.ndarray, np.ndarray | None] | None
+        tuple[Path, str, int],
+        tuple[np.ndarray, np.ndarray | None, dict[str, np.ndarray] | None] | None,
     ] = {}
     for model in models:
         run_root = outputs_root / model["directory"] / "runs"
@@ -1081,7 +1124,9 @@ def _attach_and_verify_caches(
 
         for rows in all_rows[model["directory"]].values():
             for row in rows:
-                matches: list[tuple[np.ndarray, np.ndarray | None]] = []
+                matches: list[
+                    tuple[np.ndarray, np.ndarray | None, dict[str, np.ndarray] | None]
+                ] = []
                 for config_path, config in configs:
                     if not _config_matches(row, config):
                         continue
@@ -1091,11 +1136,11 @@ def _attach_and_verify_caches(
                     cache_key = (runs_path, model["metric"], row.n)
                     if cache_key not in record_cache:
                         record_cache[cache_key] = _read_valid_records(
-                            runs_path, model["metric"], row.n
+                            runs_path, model["metric"], row.n, bool(model.get("timing"))
                         )
                     if record_cache[cache_key] is None:
                         continue
-                    samples, factors = record_cache[cache_key]
+                    samples, factors, timings = record_cache[cache_key]
                     mean_matches = math.isclose(
                         float(samples.mean()), row.mean, rel_tol=1e-11, abs_tol=1e-13
                     )
@@ -1106,13 +1151,15 @@ def _attach_and_verify_caches(
                         abs_tol=1e-13,
                     )
                     if mean_matches and std_matches:
-                        matches.append((samples, factors))
+                        matches.append((samples, factors, timings))
                 if len(matches) != 1:
                     raise RuntimeError(
                         f"Expected one validated cache for {row.csv_path.name}, "
                         f"B={row.budget}, B1={row.pilot_budget}; found {len(matches)}"
                     )
-                row.samples, row.split_factors = matches[0]
+                row.samples, row.split_factors, row.timings = matches[0]
+                if model.get("timing"):
+                    _check_timings(row)
                 if row.is_uniform_c:
                     if row.split_factors is None:
                         raise RuntimeError("uniform_c cache is missing N_i")
@@ -1146,13 +1193,13 @@ def _load_and_verify_rows(
     debug: bool,
 ) -> dict[str, dict[tuple[float, ...], list[ResultRow]]]:
     if not debug:
-        all_rows = _load_manifest_rows(outputs_root)
-        _attach_and_verify_caches(outputs_root, all_rows)
+        all_rows = _load_manifest_rows(outputs_root, (*MODELS, *TIMING_MODELS))
+        _attach_and_verify_caches(outputs_root, all_rows, (*MODELS, *TIMING_MODELS))
         all_rows["ou_oracle"] = _load_ou_oracle_rows(outputs_root)
         return all_rows
 
     all_rows: dict[str, dict[tuple[float, ...], list[ResultRow]]] = {}
-    for model in MODELS:
+    for model in (*MODELS, *TIMING_MODELS):
         try:
             model_rows = _load_manifest_rows(
                 outputs_root,
@@ -1189,19 +1236,16 @@ def _row_at_budget(
     budget: int,
     mode: str,
     optimizer: str | None = None,
+    uniform_c: float | None = None,
 ) -> ResultRow | None:
-    """One row for a (budget, mode), optionally narrowed to one optimizer.
-
-    Adaptive rows share a mode across optimizers, so an "adaptive" lookup must
-    name the optimizer or it will see the free-allocation and learned-c rows as
-    duplicates.
-    """
+    """One row for a (budget, mode); adaptive lookups must name the optimizer."""
     matches = [
         row
         for row in rows
         if row.budget == budget
         and row.mode == mode
         and (optimizer is None or row.optimizer == optimizer)
+        and (uniform_c is None or row.uniform_c == uniform_c)
     ]
     if len(matches) > 1:
         raise RuntimeError(f"Duplicate {mode} result at B={budget}")
@@ -1258,14 +1302,33 @@ def _uniform_rows_at_budget(
 def _normal_reduction(
     independent: ResultRow, splitting: ResultRow
 ) -> tuple[float, float, float]:
-    if independent.mean <= 0.0:
+    return _delta_reduction(
+        independent.mean,
+        independent.std,
+        independent.n,
+        splitting.mean,
+        splitting.std,
+        splitting.n,
+    )
+
+
+def _delta_reduction(
+    independent_mean: float,
+    independent_std: float,
+    independent_n: int,
+    mean: float,
+    std: float,
+    n: int,
+) -> tuple[float, float, float]:
+    """Percent reduction of ``mean`` against the independent mean, with a 90% CI."""
+    if independent_mean <= 0.0:
         raise RuntimeError("Independent-path mean metric must be positive")
-    observed = 100.0 * (1.0 - splitting.mean / independent.mean)
-    if independent.n < 2 or splitting.n < 2:
+    observed = 100.0 * (1.0 - mean / independent_mean)
+    if independent_n < 2 or n < 2:
         return observed, math.nan, math.nan
     variance = 100.0**2 * (
-        splitting.mean**2 * independent.std**2 / (independent.mean**4 * independent.n)
-        + splitting.std**2 / (independent.mean**2 * splitting.n)
+        mean**2 * independent_std**2 / (independent_mean**4 * independent_n)
+        + std**2 / (independent_mean**2 * n)
     )
     if not math.isfinite(variance) or variance < 0.0:
         raise RuntimeError("Invalid delta-method variance for metric reduction")
@@ -1364,6 +1427,8 @@ def _four_model_title(model: dict[str, Any], *, include_metric: bool = True) -> 
         "edm_default": "EDM-GMM",
         "ddpm_cifar10_hf_mmd": "CIFAR-10",
         "ldm_ffhq_mmd": "FFHQ",
+        "ddpm_cifar10_hf_timing": "CIFAR-10",
+        "ldm_ffhq_timing": "FFHQ",
     }[model["directory"]]
     return f"{title} ({model['metric'].upper()})" if include_metric else title
 
@@ -1429,16 +1494,11 @@ def _set_shared_axis_labels(
 
 
 def _save_figure(
-    fig: plt.Figure,
-    output_dir: Path,
-    stem: str,
-    *,
-    tight: bool = True,
-    dpi: float | None = None,
+    fig: plt.Figure, output_dir: Path, stem: str, *, tight: bool = True
 ) -> None:
     fig.savefig(
         output_dir / f"{stem}.png",
-        dpi=dpi if dpi is not None else FIGURE_DPI,
+        dpi=FIGURE_DPI,
         bbox_inches="tight" if tight else None,
         metadata={"Software": "paper_plots.py"},
     )
@@ -1450,21 +1510,19 @@ def _finish_four_model_figure(
     legend_handles: list[Any],
     legend_labels: list[str],
     *,
-    legend_ncol: int | None = None,
-    layout: dict[str, Any] | None = None,
+    layout: dict[str, Any],
 ) -> None:
-    """Apply the common legend, spacing, and exact-size export layout."""
     fig.legend(
         legend_handles,
         legend_labels,
         loc="upper center",
-        ncol=legend_ncol if legend_ncol is not None else len(legend_labels),
+        ncol=len(legend_labels),
         frameon=False,
         bbox_to_anchor=(0.5, 1.0 - LEGEND_TOP_IN / fig.get_figheight()),
         columnspacing=1.4,
         handletextpad=0.5,
     )
-    fig.tight_layout(**(layout if layout is not None else FOUR_MODEL_LAYOUT))
+    fig.tight_layout(**layout)
 
 
 def _plot_splitting_diagram(output_dir: Path) -> None:
@@ -1475,8 +1533,6 @@ def _plot_splitting_diagram(output_dir: Path) -> None:
         }
     )
     height = 6.0
-    # The label rows below the tree hang from its bottom edge in points, so the
-    # bottom margin is fixed in inches and the tree takes the remaining height.
     fig, ax = plt.subplots(figsize=(15, height))
     fig.subplots_adjust(left=0.035, right=0.965, bottom=1.15 / height, top=0.97)
     path_color = "#2b2b2b"
@@ -1485,53 +1541,16 @@ def _plot_splitting_diagram(output_dir: Path) -> None:
     label_fontsize = 28.6
     guide_bottom = -3.8
     x = [0.0, 1.6, 3.2, 4.8, 6.4, 8.0]
+    level_heights = [
+        [0.0],
+        [0.70, -0.80],
+        [2.20, 1.45, 0.85, -0.45, -1.25, -1.95],
+        [2.45, 1.15, 1.05, -0.15, -1.55, -2.25],
+        [3.20, 2.70, 1.95, 1.35, 1.55, 0.70, 0.25, -0.40, -1.05, -1.75, -1.95, -2.60],
+        [3.00, 3.35, 1.75, 1.65, 1.15, 0.95, 0.50, -0.10, -0.85, -1.55, -2.15, -2.80],
+    ]
     levels = [
-        [(x[0], 0.0)],
-        [(x[1], 0.70), (x[1], -0.80)],
-        [
-            (x[2], 2.20),
-            (x[2], 1.45),
-            (x[2], 0.85),
-            (x[2], -0.45),
-            (x[2], -1.25),
-            (x[2], -1.95),
-        ],
-        [
-            (x[3], 2.45),
-            (x[3], 1.15),
-            (x[3], 1.05),
-            (x[3], -0.15),
-            (x[3], -1.55),
-            (x[3], -2.25),
-        ],
-        [
-            (x[4], 3.20),
-            (x[4], 2.70),
-            (x[4], 1.95),
-            (x[4], 1.35),
-            (x[4], 1.55),
-            (x[4], 0.70),
-            (x[4], 0.25),
-            (x[4], -0.40),
-            (x[4], -1.05),
-            (x[4], -1.75),
-            (x[4], -1.95),
-            (x[4], -2.60),
-        ],
-        [
-            (x[5], 3.00),
-            (x[5], 3.35),
-            (x[5], 1.75),
-            (x[5], 1.65),
-            (x[5], 1.15),
-            (x[5], 0.95),
-            (x[5], 0.50),
-            (x[5], -0.10),
-            (x[5], -0.85),
-            (x[5], -1.55),
-            (x[5], -2.15),
-            (x[5], -2.80),
-        ],
+        [(x_value, y) for y in heights] for x_value, heights in zip(x, level_heights)
     ]
 
     for x_value in x:
@@ -1608,13 +1627,7 @@ def _plot_splitting_diagram(output_dir: Path) -> None:
     ax.set_xlim(-0.4, 8.4)
     ax.set_ylim(guide_bottom, 4.30)
     ax.axis("off")
-    fig.savefig(
-        output_dir / "splitting_diagram.png",
-        dpi=FIGURE_DPI,
-        bbox_inches="tight",
-        metadata={"Software": "paper_plots.py"},
-    )
-    plt.close(fig)
+    _save_figure(fig, output_dir, "splitting_diagram")
 
 
 def _reduction_legend_handles(
@@ -1667,13 +1680,25 @@ def _reduction_legend_handles(
     return handles
 
 
+def _reduction_series(
+    reductions: dict[tuple[str, tuple[float, ...], int, Any], tuple[float, float, float]],
+    directory: str,
+    schedule: tuple[float, ...],
+    budgets: list[int],
+    kind: Any,
+) -> tuple[list[int], np.ndarray]:
+    points = [(budget, reductions.get((directory, schedule, budget, kind))) for budget in budgets]
+    points = [(budget, value) for budget, value in points if value is not None]
+    return [budget for budget, _ in points], np.asarray([value for _, value in points])
+
+
 def _plot_reductions(
     all_rows: dict[str, dict[tuple[float, ...], list[ResultRow]]],
     reductions: dict[
         tuple[str, tuple[float, ...], int, Any], tuple[float, float, float]
     ],
     output_dir: Path,
-) -> bool:
+) -> None:
     _four_model_style()
     fig, axes = plt.subplots(2, 2, figsize=FOUR_MODEL_FIGSIZE, sharey=True)
     interval_extrema: list[float] = []
@@ -1683,10 +1708,11 @@ def _plot_reductions(
     plotted_learned_c = False
 
     for ax, model in zip(axes.flat, PLOT_MODELS):
-        if model["directory"] not in all_rows:
+        directory = model["directory"]
+        if directory not in all_rows:
             ax.set_visible(False)
             continue
-        rows_by_schedule = all_rows[model["directory"]]
+        rows_by_schedule = all_rows[directory]
         panel_has_data = False
         for schedule, label in SCHEDULES:
             if schedule not in rows_by_schedule:
@@ -1694,19 +1720,11 @@ def _plot_reductions(
             candidate_budgets = sorted(
                 {row.budget for row in rows_by_schedule[schedule]}
             )
-            learned = [
-                (
-                    budget,
-                    reductions.get((model["directory"], schedule, budget, "learned")),
-                )
-                for budget in candidate_budgets
-            ]
-            learned = [
-                (budget, value) for budget, value in learned if value is not None
-            ]
-            if learned:
-                budgets = [budget for budget, _ in learned]
-                values = np.asarray([value for _, value in learned])
+            color = SCHEDULE_COLORS[schedule]
+            budgets, values = _reduction_series(
+                reductions, directory, schedule, candidate_budgets, "learned"
+            )
+            if budgets:
                 observed, lower, upper = values.T
                 interval_extrema.extend(observed.tolist())
                 finite = np.isfinite(lower) & np.isfinite(upper)
@@ -1718,14 +1736,14 @@ def _plot_reductions(
                         lower,
                         upper,
                         where=finite,
-                        color=SCHEDULE_COLORS[schedule],
+                        color=color,
                         alpha=INTERVAL_ALPHA,
                         linewidth=0,
                     )
                 ax.plot(
                     budgets,
                     observed,
-                    color=SCHEDULE_COLORS[schedule],
+                    color=color,
                     linestyle="-",
                     linewidth=LEARNED_LINEWIDTH,
                     label=label,
@@ -1734,26 +1752,16 @@ def _plot_reductions(
                 panel_has_data = True
                 plotted_schedules.add(schedule)
                 plotted_learned = True
-            learned_c = [
-                (
-                    budget,
-                    reductions.get((model["directory"], schedule, budget, "learned_c")),
-                )
-                for budget in candidate_budgets
-            ]
-            learned_c = [
-                (budget, value) for budget, value in learned_c if value is not None
-            ]
-            if learned_c:
-                learned_c_budgets = [budget for budget, _ in learned_c]
-                learned_c_values = np.asarray([value for _, value in learned_c])
-                observed = learned_c_values[:, 0]
-                # No band: the learned curve carries the uncertainty, tables the rest.
+            budgets, values = _reduction_series(
+                reductions, directory, schedule, candidate_budgets, "learned_c"
+            )
+            if budgets:
+                observed = values[:, 0]
                 interval_extrema.extend(observed.tolist())
                 ax.plot(
-                    learned_c_budgets,
+                    budgets,
                     observed,
-                    color=SCHEDULE_COLORS[schedule],
+                    color=color,
                     linestyle=LEARNED_C_LINESTYLE,
                     linewidth=LEARNED_C_LINEWIDTH,
                     zorder=3,
@@ -1761,45 +1769,26 @@ def _plot_reductions(
                 panel_has_data = True
                 plotted_schedules.add(schedule)
                 plotted_learned_c = True
-            # One dotted curve per schedule: the strongest constant-c baseline, so
-            # the comparison against it is conservative.  Tables keep every c.
+            # Only the strongest constant c is drawn, and only if it beats
+            # independent paths on average; the tables keep every c.
             uniform_curves = []
             for c in _expected_uniform_c(model, schedule):
-                uniform = [
-                    (
-                        budget,
-                        reductions.get(
-                            (model["directory"], schedule, budget, ("uniform", c))
-                        ),
-                    )
-                    for budget in candidate_budgets
-                ]
-                uniform = [
-                    (budget, value) for budget, value in uniform if value is not None
-                ]
-                if not uniform:
-                    continue
-                uniform_budgets = [budget for budget, _ in uniform]
-                uniform_observed = [value[0] for _, value in uniform]
-                uniform_curves.append(
-                    (
-                        float(np.mean(uniform_observed)),
-                        uniform_budgets,
-                        uniform_observed,
-                    )
+                budgets, values = _reduction_series(
+                    reductions, directory, schedule, candidate_budgets, ("uniform", c)
                 )
+                if budgets:
+                    observed = values[:, 0].tolist()
+                    uniform_curves.append((float(np.mean(observed)), budgets, observed))
             if uniform_curves:
-                mean_gain, uniform_budgets, uniform_observed = max(
+                mean_gain, budgets, observed = max(
                     uniform_curves, key=lambda curve: curve[0]
                 )
-                # A constant-c baseline that is worse than independent paths on
-                # average carries no visual information; tables keep every row.
                 if mean_gain >= 0.0:
-                    interval_extrema.extend(uniform_observed)
+                    interval_extrema.extend(observed)
                     ax.plot(
-                        uniform_budgets,
-                        uniform_observed,
-                        color=SCHEDULE_COLORS[schedule],
+                        budgets,
+                        observed,
+                        color=color,
                         linestyle=UNIFORM_C_LINESTYLE,
                         linewidth=UNIFORM_C_LINEWIDTH,
                         alpha=UNIFORM_C_ALPHA,
@@ -1826,7 +1815,7 @@ def _plot_reductions(
             RuntimeWarning,
             stacklevel=2,
         )
-        return False
+        return
     low = min(interval_extrema)
     high = max(interval_extrema)
     pad = 0.08 * max(high - low, 1.0)
@@ -1838,7 +1827,6 @@ def _plot_reductions(
         any(ax.get_visible() for ax in axes[row, :]) for row in range(axes.shape[0])
     )
     if visible_row_count > 1:
-        _label_visible_grid(axes, xlabel="", ylabel="")
         _set_shared_axis_labels(
             fig,
             xlabel="Budget $B$",
@@ -1859,23 +1847,57 @@ def _plot_reductions(
         fig,
         legend_handles,
         legend_labels,
-        legend_ncol=len(legend_labels),
         layout=GAIN_LAYOUT,
     )
-    _save_figure(
-        fig,
-        output_dir,
-        "experiment_metric_gain",
-        tight=False,
-        dpi=FIGURE_DPI,
+    _save_figure(fig, output_dir, "experiment_metric_gain", tight=False)
+
+
+def _collect_legend(ax: plt.Axes, handles: list[Any], labels: list[str]) -> None:
+    for handle, label in zip(*ax.get_legend_handles_labels()):
+        if label not in labels:
+            handles.append(handle)
+            labels.append(label)
+
+
+def _plot_mean_with_interval(
+    ax: plt.Axes,
+    rows: list[ResultRow],
+    *,
+    color: str,
+    linestyle: str,
+    label: str,
+    error: str,
+) -> None:
+    budgets = [row.budget for row in rows]
+    means = np.asarray([row.mean for row in rows])
+    intervals = np.asarray([row.mean_ci() for row in rows])
+    if np.any(means <= 0.0):
+        raise RuntimeError(error)
+    positive_interval = intervals[:, 0] > 0.0
+    if positive_interval.any():
+        ax.fill_between(
+            budgets,
+            intervals[:, 0],
+            intervals[:, 1],
+            where=positive_interval,
+            color=color,
+            alpha=INTERVAL_ALPHA,
+            linewidth=0,
+        )
+    ax.plot(
+        budgets,
+        means,
+        color=color,
+        linestyle=linestyle,
+        linewidth=DATA_LINEWIDTH,
+        label=label,
     )
-    return True
 
 
 def _plot_absolute_metrics(
     all_rows: dict[str, dict[tuple[float, ...], list[ResultRow]]],
     output_dir: Path,
-) -> bool:
+) -> None:
     _four_model_style()
     fig = plt.figure(figsize=ABSOLUTE_FIGSIZE)
     grid = fig.add_gridspec(3, 4)
@@ -1896,69 +1918,36 @@ def _plot_absolute_metrics(
         rows_by_schedule = all_rows[model["directory"]]
         panel_has_data = False
         independent_by_budget = _validated_independent_rows(rows_by_schedule)
-        baseline_budgets = sorted(independent_by_budget)
-        baseline_rows = [independent_by_budget[budget] for budget in baseline_budgets]
-        baseline_means = np.asarray([row.mean for row in baseline_rows])
-        baseline_intervals = np.asarray([row.mean_ci() for row in baseline_rows])
-
-        if np.any(baseline_means <= 0.0):
-            raise RuntimeError("Absolute metric plot requires positive baseline values")
-        if baseline_rows:
-            positive_interval = baseline_intervals[:, 0] > 0.0
-            if positive_interval.any():
-                ax.fill_between(
-                    baseline_budgets,
-                    baseline_intervals[:, 0],
-                    baseline_intervals[:, 1],
-                    where=positive_interval,
-                    color="#333333",
-                    alpha=INTERVAL_ALPHA,
-                    linewidth=0,
-                )
-            ax.plot(
-                baseline_budgets,
-                baseline_means,
+        if independent_by_budget:
+            _plot_mean_with_interval(
+                ax,
+                [independent_by_budget[budget] for budget in sorted(independent_by_budget)],
                 color="#333333",
                 linestyle="--",
-                linewidth=DATA_LINEWIDTH,
                 label="Independent MC",
+                error="Absolute metric plot requires positive baseline values",
             )
             panel_has_data = True
 
         for schedule, label in SCHEDULES:
-            if schedule not in rows_by_schedule:
-                continue
             splitting_rows = sorted(
-                (row for row in rows_by_schedule[schedule] if row.is_free_allocation),
+                (
+                    row
+                    for row in rows_by_schedule.get(schedule, [])
+                    if row.is_free_allocation
+                ),
                 key=lambda row: row.budget,
             )
-            if not splitting_rows:
-                continue
-            budgets = [row.budget for row in splitting_rows]
-            means = np.asarray([row.mean for row in splitting_rows])
-            intervals = np.asarray([row.mean_ci() for row in splitting_rows])
-            if np.any(means <= 0.0):
-                raise RuntimeError("Absolute metric plot requires positive values")
-            positive_interval = intervals[:, 0] > 0.0
-            if positive_interval.any():
-                ax.fill_between(
-                    budgets,
-                    intervals[:, 0],
-                    intervals[:, 1],
-                    where=positive_interval,
+            if splitting_rows:
+                _plot_mean_with_interval(
+                    ax,
+                    splitting_rows,
                     color=SCHEDULE_COLORS[schedule],
-                    alpha=INTERVAL_ALPHA,
-                    linewidth=0,
+                    linestyle="-",
+                    label=label,
+                    error="Absolute metric plot requires positive values",
                 )
-            ax.plot(
-                budgets,
-                means,
-                color=SCHEDULE_COLORS[schedule],
-                linestyle="-",
-                linewidth=DATA_LINEWIDTH,
-                label=label,
-            )
-            panel_has_data = True
+                panel_has_data = True
 
         if not panel_has_data:
             ax.set_visible(False)
@@ -1972,11 +1961,7 @@ def _plot_absolute_metrics(
         ax.grid(axis="y", which="both", color="#D8D8D8", linewidth=GRID_LINEWIDTH)
         _set_budget_ticks(ax, panel_budgets)
         ax.tick_params(axis="x", which="minor", bottom=False)
-        axis_handles, axis_labels = ax.get_legend_handles_labels()
-        for handle, label in zip(axis_handles, axis_labels):
-            if label not in legend_labels:
-                legend_handles.append(handle)
-                legend_labels.append(label)
+        _collect_legend(ax, legend_handles, legend_labels)
 
     if not plotted_any:
         plt.close(fig)
@@ -1985,7 +1970,7 @@ def _plot_absolute_metrics(
             RuntimeWarning,
             stacklevel=2,
         )
-        return False
+        return
     _set_shared_axis_labels(
         fig,
         xlabel="Budget $B$",
@@ -1997,50 +1982,24 @@ def _plot_absolute_metrics(
         legend_labels,
         layout=ABSOLUTE_LAYOUT,
     )
-    _save_figure(
-        fig,
-        output_dir,
-        "experiment_metric_absolute",
-        tight=False,
-        dpi=FIGURE_DPI,
-    )
-    return True
+    _save_figure(fig, output_dir, "experiment_metric_absolute", tight=False)
 
 
 def _allocation_curve(
     schedule: tuple[float, ...], cumulative: np.ndarray
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Return post-step coordinates and pointwise confidence limits for R(t)."""
+) -> tuple[np.ndarray, np.ndarray]:
+    """Post-step coordinates of the mean cumulative allocation R(t)."""
     split_times = 1.0 - np.asarray(schedule, dtype=float)
     if np.any(np.diff(split_times) <= 0.0):
         raise RuntimeError("Split times must be strictly increasing")
-
     mean_at_splits = cumulative.mean(axis=0)
-    if cumulative.shape[0] > 1:
-        standard_error = cumulative.std(axis=0, ddof=1) / math.sqrt(cumulative.shape[0])
-        lower_at_splits = mean_at_splits - Z_TWO_SIDED_90 * standard_error
-        upper_at_splits = mean_at_splits + Z_TWO_SIDED_90 * standard_error
-    else:
-        lower_at_splits = mean_at_splits
-        upper_at_splits = mean_at_splits
-
     times = np.concatenate(([0.0], split_times, [1.0]))
-
-    def extend(values: np.ndarray, initial: float) -> np.ndarray:
-        return np.concatenate(([initial], values, [values[-1]]))
-
-    return (
-        times,
-        extend(mean_at_splits, 1.0),
-        extend(lower_at_splits, 1.0),
-        extend(upper_at_splits, 1.0),
-    )
+    return times, np.concatenate(([1.0], mean_at_splits, [mean_at_splits[-1]]))
 
 
 def _plot_ou_oracle_allocations(
     all_rows: dict[str, dict[tuple[float, ...], list[ResultRow]]], output_dir: Path
-) -> bool:
-    """Compare finite-query minimax and learned OU allocations."""
+) -> None:
     rows_by_schedule = all_rows["simple_ou"]
     oracle_rows_by_schedule = all_rows["ou_oracle"]
     _style()
@@ -2065,7 +2024,7 @@ def _plot_ou_oracle_allocations(
         if splitting.split_factors is None:
             raise RuntimeError("Missing OU split-factor samples")
         cumulative = np.cumprod(splitting.split_factors, axis=1)
-        times, learned_mean, _, _ = _allocation_curve(schedule, cumulative)
+        times, learned_mean = _allocation_curve(schedule, cumulative)
         factors = np.asarray(
             [float(value) for value in oracle_row.raw["N_i"].split(",")],
             dtype=float,
@@ -2097,11 +2056,7 @@ def _plot_ou_oracle_allocations(
         ax.set_xlim(0.0, 1.0)
         ax.set_ylim(0.95, 3.5)
         ax.grid(axis="y", color="#D8D8D8", linewidth=0.55)
-        axis_handles, axis_labels = ax.get_legend_handles_labels()
-        for handle, label in zip(axis_handles, axis_labels):
-            if label not in legend_labels:
-                legend_handles.append(handle)
-                legend_labels.append(label)
+        _collect_legend(ax, legend_handles, legend_labels)
         plotted_any = True
 
     if not plotted_any:
@@ -2111,7 +2066,7 @@ def _plot_ou_oracle_allocations(
             RuntimeWarning,
             stacklevel=2,
         )
-        return False
+        return
     for ax in axes:
         if ax.get_visible():
             ax.set_xlabel("Elapsed fraction of trajectory")
@@ -2127,8 +2082,7 @@ def _plot_ou_oracle_allocations(
         bbox_to_anchor=(0.5, 1.03),
     )
     fig.tight_layout(rect=(0, 0, 1, 0.88), w_pad=1.0)
-    _save_figure(fig, output_dir, "ou_oracle_allocations", dpi=FIGURE_DPI)
-    return True
+    _save_figure(fig, output_dir, "ou_oracle_allocations")
 
 
 def _mean_allocation(
@@ -2147,13 +2101,12 @@ def _mean_allocation(
         np.diff(cumulative, axis=1) < -1e-10
     ):
         raise RuntimeError(f"Invalid allocation for {model['directory']}")
-    times, mean, _, _ = _allocation_curve(schedule, cumulative)
-    return times, mean
+    return _allocation_curve(schedule, cumulative)
 
 
 def _plot_allocations(
     all_rows: dict[str, dict[tuple[float, ...], list[ResultRow]]], output_dir: Path
-) -> bool:
+) -> None:
     _four_model_style()
     fig, axes = plt.subplots(2, 2, figsize=FOUR_MODEL_FIGSIZE)
     plotted_schedules: set[tuple[float, ...]] = set()
@@ -2179,8 +2132,7 @@ def _plot_allocations(
             continue
         plotted_any = True
 
-        # Dense schedules go down first; shorter schedules stay visible where
-        # their horizontal segments overlap the denser curves.
+        # Dense schedules first, so shorter ones stay visible where they overlap.
         for schedule, (times, mean) in reversed(curves):
             ax.step(
                 times,
@@ -2207,8 +2159,7 @@ def _plot_allocations(
             RuntimeWarning,
             stacklevel=2,
         )
-        return False
-    _label_visible_grid(axes, xlabel="", ylabel="")
+        return
     _hide_repeated_x_ticklabels(axes)
     _set_shared_axis_labels(
         fig,
@@ -2227,14 +2178,146 @@ def _plot_allocations(
         legend_labels,
         layout=ALLOCATION_LAYOUT,
     )
-    _save_figure(
-        fig,
-        output_dir,
-        "experiment_allocations_four_models",
-        tight=False,
-        dpi=FIGURE_DPI,
+    _save_figure(fig, output_dir, "experiment_allocations_four_models", tight=False)
+
+
+def _timing_rows(
+    model: dict[str, Any],
+    all_rows: dict[str, dict[tuple[float, ...], list[ResultRow]]],
+) -> list[tuple[tuple[float, ...] | None, str | None, ResultRow]]:
+    """Independent first, then each (schedule, optimizer) present, in figure order."""
+    rows_by_schedule = all_rows.get(model["directory"], {})
+    entries: list[tuple[tuple[float, ...] | None, str | None, ResultRow]] = []
+    independent = _validated_independent_rows(rows_by_schedule).get(TIMING_BUDGET)
+    if independent is not None:
+        entries.append((None, None, independent))
+    for schedule, _ in SCHEDULES:
+        for _, optimizer in TIMING_METHODS:
+            row = _row_at_budget(
+                rows_by_schedule.get(schedule, []), TIMING_BUDGET, "adaptive", optimizer
+            )
+            if row is not None:
+                entries.append((schedule, optimizer, row))
+    return entries
+
+
+def _timing_mean_ci(values: np.ndarray) -> tuple[float, float, float]:
+    mean = float(values.mean())
+    if values.size < 2:
+        return mean, math.nan, math.nan
+    half = Z_TWO_SIDED_90 * float(values.std(ddof=1)) / math.sqrt(values.size)
+    return mean, mean - half, mean + half
+
+
+def _timing_overhead(
+    independent: ResultRow, method: ResultRow
+) -> tuple[float, float, float]:
+    """Percent increase in mean total time over independent paths, with a 90% CI."""
+    base = independent.timings["total_seconds"]
+    total = method.timings["total_seconds"]
+    observed, lower, upper = _delta_reduction(
+        float(base.mean()),
+        float(base.std(ddof=1)) if base.size > 1 else 0.0,
+        base.size,
+        float(total.mean()),
+        float(total.std(ddof=1)) if total.size > 1 else 0.0,
+        total.size,
     )
-    return True
+    return -observed, -upper, -lower
+
+
+def _timing_label(schedule: tuple[float, ...] | None, optimizer: str | None) -> str:
+    if schedule is None:
+        return "Independent"
+    method = dict((key, label) for label, key in TIMING_METHODS)[optimizer]
+    return f"{method}, {len(schedule)} splits"
+
+
+def _plot_timings(
+    all_rows: dict[str, dict[tuple[float, ...], list[ResultRow]]], output_dir: Path
+) -> None:
+    models = [model for model in TIMING_MODELS if model["directory"] in all_rows]
+    if not models:
+        warnings.warn(
+            "No timing results; timing figure was not generated.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return
+    entries = {model["directory"]: _timing_rows(model, all_rows) for model in models}
+    order = [(None, None)] + [
+        (schedule, optimizer)
+        for schedule, _ in SCHEDULES
+        for _, optimizer in TIMING_METHODS
+    ]
+    keys = [
+        key
+        for key in order
+        if any(key == (schedule, optimizer) for rows in entries.values() for schedule, optimizer, _ in rows)
+    ]
+    _four_model_style()
+    height = 1.0 + 0.36 * len(keys)
+    fig, axes = plt.subplots(
+        1, len(models), figsize=(FOUR_MODEL_FIGSIZE[0], height), sharey=True, squeeze=False
+    )
+    for ax, model in zip(axes[0], models):
+        by_key = {(schedule, optimizer): row for schedule, optimizer, row in entries[model["directory"]]}
+        independent = by_key.get((None, None))
+        right = 0.0
+        for y, key in enumerate(keys):
+            row = by_key.get(key)
+            if row is None:
+                continue
+            left = 0.0
+            for _, fields, color in TIMING_SEGMENTS:
+                width = sum(float(np.nan_to_num(row.timings[field]).mean()) for field in fields)
+                ax.barh(y, width, left=left, height=0.64, color=color, edgecolor="white", linewidth=0.8)
+                left += width
+            mean, lower, upper = _timing_mean_ci(row.timings["total_seconds"])
+            end = mean
+            if math.isfinite(lower):
+                ax.errorbar(
+                    mean,
+                    y,
+                    xerr=[[mean - lower], [upper - mean]],
+                    fmt="none",
+                    ecolor="#333333",
+                    elinewidth=0.9,
+                    capsize=2.5,
+                )
+                end = upper
+            text = f"{mean:.1f} s"
+            if independent is not None and row is not independent:
+                text += f" ({_timing_overhead(independent, row)[0]:+.1f}%)"
+            ax.annotate(
+                text,
+                (end, y),
+                xytext=(4, 0),
+                textcoords="offset points",
+                va="center",
+                fontsize=plt.rcParams["xtick.labelsize"],
+                color="#333333",
+            )
+            right = max(right, end)
+        ax.set_xlim(0.0, 1.35 * right)
+        ax.set_title(f"{_four_model_title(model, include_metric=False)}, $B$ = {_budget_tick(TIMING_BUDGET, 0)}")
+        ax.set_xlabel("Mean time per run (s)")
+        ax.grid(axis="x", color="#D8D8D8", linewidth=GRID_LINEWIDTH)
+        ax.set_axisbelow(True)
+        ax.tick_params(axis="y", length=0)
+    axes[0, 0].set_yticks(range(len(keys)), [_timing_label(*key) for key in keys])
+    axes[0, 0].invert_yaxis()
+    legend_handles = [Patch(color=color, label=label) for label, _, color in TIMING_SEGMENTS]
+    legend_handles.append(
+        Line2D([], [], color="#333333", linewidth=0.9, marker="|", markersize=6, label="90% CI of total")
+    )
+    _finish_four_model_figure(
+        fig,
+        legend_handles,
+        [handle.get_label() for handle in legend_handles],
+        layout={"rect": (0.0, 0.0, 1.0, 1.0 - MARGIN_TOP_IN / height), "w_pad": 1.2},
+    )
+    _save_figure(fig, output_dir, "experiment_timing", tight=False)
 
 
 def main() -> None:
@@ -2252,6 +2335,7 @@ def main() -> None:
         _plot_allocations(all_rows, output_dir)
         if "simple_ou" in all_rows and "ou_oracle" in all_rows:
             _plot_ou_oracle_allocations(all_rows, output_dir)
+        _plot_timings(all_rows, output_dir)
     else:
         warnings.warn(
             "No complete runners found; experiment figures were not generated.",
@@ -2259,7 +2343,7 @@ def main() -> None:
             stacklevel=2,
         )
 
-    publication_models = (*MODELS, OU_ORACLE_MODEL)
+    publication_models = (*MODELS, OU_ORACLE_MODEL, *TIMING_MODELS)
     completed_models = [
         model for model in publication_models if model["directory"] in all_rows
     ]

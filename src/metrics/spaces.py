@@ -9,6 +9,7 @@ before embedding, as image files would be.
 
 from __future__ import annotations
 
+import math
 import os
 import threading
 from functools import lru_cache
@@ -56,14 +57,13 @@ def space_runner(runner, space: str):
     if space == runner.sample_space:
         return runner
     if space == "pixel":
-        dim = int(torch.tensor(runner.pixel_shape).prod())
-        target_spec = {"sample_dim": dim, "image_shape": list(runner.pixel_shape)}
+        target_spec = {
+            "sample_dim": math.prod(runner.pixel_shape),
+            "image_shape": list(runner.pixel_shape),
+        }
     else:
-        dim = EMBEDDINGS[space]["dim"]
-        target_spec = {"sample_dim": dim}
-    return SimpleNamespace(
-        target_spec=target_spec, device=runner.device, input_dim=dim, runner_name=runner.runner_name
-    )
+        target_spec = {"sample_dim": EMBEDDINGS[space]["dim"]}
+    return SimpleNamespace(target_spec=target_spec, device=runner.device)
 
 
 @lru_cache(maxsize=None)
@@ -87,6 +87,8 @@ def _dino(device: str):
 def _embed(space, pixels, shape, device, batch_size):
     out = torch.empty((pixels.shape[0], EMBEDDINGS[space]["dim"]), dtype=torch.float32, device=pixels.device)
     model = _inception(device) if space == "inception" else _dino(device)
+    mean = torch.tensor(IMAGENET_MEAN, device=device).view(1, 3, 1, 1)
+    std = torch.tensor(IMAGENET_STD, device=device).view(1, 3, 1, 1)
     for start in range(0, pixels.shape[0], batch_size):
         x = pixels[start : start + batch_size].to(device, torch.float32)
         x = x.clamp(0, 1).mul(255).round().div(255).reshape(-1, *shape)
@@ -94,8 +96,6 @@ def _embed(space, pixels, shape, device, batch_size):
             y = model(x)[0].flatten(1)
         else:
             x = F.interpolate(x, size=(224, 224), mode="bicubic", align_corners=False, antialias=True)
-            mean = torch.tensor(IMAGENET_MEAN, device=device).view(1, 3, 1, 1)
-            std = torch.tensor(IMAGENET_STD, device=device).view(1, 3, 1, 1)
             y = model((x.clamp(0, 1) - mean) / std)
         out[start : start + y.shape[0]] = y.to(out.device)
     return out

@@ -83,8 +83,8 @@ CONFIGS = {
     # Per-run timings at one budget (run with compare.py --timing).
     "timing": {
         **_MMD,
-        "B_list": [200_000],
+        "B_list": [500_000],
         "n_runs": 10,
-        "description": "CIFAR-10 per-run stage timings at B=200k",
+        "description": "CIFAR-10 per-run stage timings at B=500k",
     },
 }

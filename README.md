@@ -25,7 +25,7 @@ script also runs on CPU (`--device cpu`), slowly.
 | OU minimax oracle | `ou_oracle` | `default` | – |
 
 `default` configs score samples with KS; `mmd` configs use MMD. The image
-runners also have `timing` (per-run stage timings at B = 200k, run with
+runners also have `timing` (per-run stage timings at B = 500k, run with
 `--timing`). The CIFAR-10 DDPM samples with the posterior variance
 (`fixed_small`) rather than the checkpoint's `fixed_large`.
 
@@ -60,9 +60,11 @@ uv run python src/plots.py outputs_paper_final/simple_ou/compare_results_<splits
 Every run records synchronized stage timings (`phase1_seconds`,
 `phase2_seconds`, `total_seconds`, and `scoring_seconds`, which is excluded
 from the total), including for `fixed_N`. For clean timings pass `--timing`: it
-runs one trial at a time and discards a warm-up run per setting.
+runs one trial at a time, first compiles the sampler for small and large
+batches, and discards a warm-up run per setting.
 
-Once all six experiments are complete, the paper's figures and tables are
+Once all six experiments and the two image timing runs are complete, the paper's
+figures and tables (including `experiment_timing.png` and `timing.csv`) are
 rebuilt with:
 
 ```bash
@@ -72,8 +74,9 @@ uv run python paper/paper_tables.py    # -> tables/
 
 ## Configs
 
-Each runner lives in `src/runners/<family>/<case>/` as a `runner.py` (the
-sampler) and a `configs.py`. The `configs.py` exports a dict
+Each runner lives in `src/runners/<family>/<case>/` with a `configs.py` and
+either a `runner.py` (the sampler) or, for the SDE cases, a `spec.py` (drift and
+diffusion). The `configs.py` exports a dict
 `CONFIGS = {"default": {...}, "mmd": {...}}`, and `--config` picks an entry.
 Shared defaults are in `src/runners/common_configs.py` and, for the SDE cases,
 `src/runners/sde/configs.py`. To change an experiment, edit these dicts or add

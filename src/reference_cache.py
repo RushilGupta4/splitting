@@ -49,14 +49,8 @@ def reference_samples_path_for_key(
     )
 
 
-def _try_load(
-    path: str,
-    required_count: int,
-    *,
-    expected_sampling_steps: int | None = None,
-    expected_eta: float | None = None,
-):
-    """Return truncated samples tensor or None on miss/mismatch/insufficient."""
+def load_reference_samples_if_sufficient(path: str, required_count: int):
+    """Truncated samples tensor, or None on a miss or too few samples; mmap avoids an eager copy."""
     if not os.path.exists(path):
         return None
     try:
@@ -80,29 +74,11 @@ def _try_load(
         return None
     if int(samples.shape[0]) < int(required_count):
         return None
-    if isinstance(payload, dict):
-        steps = payload.get("sampling_steps")
-        eta = payload.get("eta")
-        if expected_sampling_steps is not None and steps is not None and int(steps) != int(expected_sampling_steps):
-            return None
-        if expected_eta is not None and eta is not None and float(eta) != float(expected_eta):
-            return None
     return samples[: int(required_count)]
 
 
-def load_reference_samples_checked(
-    path: str,
-    required_count: int,
-    *,
-    expected_sampling_steps: int | None = None,
-    expected_eta: float | None = None,
-) -> torch.Tensor:
-    samples = _try_load(
-        path,
-        required_count,
-        expected_sampling_steps=expected_sampling_steps,
-        expected_eta=expected_eta,
-    )
+def load_reference_samples_checked(path: str, required_count: int) -> torch.Tensor:
+    samples = load_reference_samples_if_sufficient(path, required_count)
     if samples is None:
         raise FileNotFoundError(
             f"Missing/insufficient reference samples at {path}; "
@@ -111,16 +87,10 @@ def load_reference_samples_checked(
     return samples
 
 
-def reference_is_sufficient(path: str, required_count: int) -> bool:
-    return _try_load(path, required_count) is not None
-
-
-def load_reference_samples_if_sufficient(
-    path: str,
-    required_count: int,
-) -> torch.Tensor | None:
-    """Load a sufficient cache once, using mmap to avoid an eager full copy."""
-    return _try_load(path, required_count)
+def reference_path_for_runner(runner, comparison_mode, reference_generation_config):
+    """``(path, cache_key)`` of a runner's base reference samples."""
+    cache_key = runner.reference_cache_key(comparison_mode, reference_generation_config)
+    return reference_samples_path_for_key(runner.checkpoint_path, cache_key), cache_key
 
 
 def reference_preview_path(reference_path: str) -> str:
@@ -139,6 +109,23 @@ def _fingerprint_file(real_path: str, size: int, mtime_ns: int) -> dict[str, obj
         "size": int(size),
         "sha256": digest.hexdigest(),
     }
+
+
+def _atomic_write(path: str, suffix: str, write) -> None:
+    """``write(temp_path)`` next to ``path``, then move it into place."""
+    parent = os.path.dirname(path) or "."
+    os.makedirs(parent, exist_ok=True)
+    handle = tempfile.NamedTemporaryFile(
+        prefix=f".{os.path.basename(path)}.", suffix=suffix, dir=parent, delete=False
+    )
+    temp_path = handle.name
+    handle.close()
+    try:
+        write(temp_path)
+        os.replace(temp_path, path)
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
 
 
 def checkpoint_fingerprint(path: str | None) -> dict[str, object] | None:
@@ -183,29 +170,13 @@ def save_reference_preview(
     from torchvision.utils import save_image
 
     path = reference_preview_path(reference_path)
-    parent = os.path.dirname(path) or "."
-    os.makedirs(parent, exist_ok=True)
-    handle = tempfile.NamedTemporaryFile(
-        prefix=f".{os.path.basename(path)}.",
-        suffix=".png",
-        dir=parent,
-        delete=False,
+    _atomic_write(
+        path,
+        ".png",
+        lambda temp_path: save_image(
+            images, temp_path, nrow=5, padding=2, pad_value=1.0, normalize=False
+        ),
     )
-    temp_path = handle.name
-    handle.close()
-    try:
-        save_image(
-            images,
-            temp_path,
-            nrow=5,
-            padding=2,
-            pad_value=1.0,
-            normalize=False,
-        )
-        os.replace(temp_path, path)
-    finally:
-        if os.path.exists(temp_path):
-            os.unlink(temp_path)
     return path
 
 
@@ -215,9 +186,6 @@ def save_reference_samples_with_key(
     *,
     cache_key: Mapping[str, object],
 ):
-    parent = os.path.dirname(path)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
     payload: dict[str, Any] = {
         "runner": cache_key.get("runner"),
         "comparison_mode": cache_key.get("comparison_mode"),
@@ -225,21 +193,7 @@ def save_reference_samples_with_key(
         "num_samples": int(samples.shape[0]),
         "samples": samples.cpu(),
     }
-    directory = parent or "."
-    handle = tempfile.NamedTemporaryFile(
-        prefix=f".{os.path.basename(path)}.",
-        suffix=".tmp",
-        dir=directory,
-        delete=False,
-    )
-    temp_path = handle.name
-    handle.close()
-    try:
-        torch.save(payload, temp_path)
-        os.replace(temp_path, path)
-    finally:
-        if os.path.exists(temp_path):
-            os.unlink(temp_path)
+    _atomic_write(path, ".tmp", lambda temp_path: torch.save(payload, temp_path))
 
 
 def load_reference_samples_for_runner(
@@ -251,15 +205,10 @@ def load_reference_samples_for_runner(
     """Load reference samples by the runner's cache key."""
     if runner.checkpoint_path is None:
         raise ValueError("runner must have a checkpoint_path to load reference samples")
-    cache_key = runner.reference_cache_key(comparison_mode, reference_generation_config)
-    primary = reference_samples_path_for_key(runner.checkpoint_path, cache_key)
-    samples = _try_load(primary, required_count)
-    if samples is not None:
-        return samples
-    raise FileNotFoundError(
-        f"Missing/insufficient reference samples at {primary}; "
-        f"need >= {required_count}. Run ensure_samples.py first."
+    path, _ = reference_path_for_runner(
+        runner, comparison_mode, reference_generation_config
     )
+    return load_reference_samples_checked(path, required_count)
 
 
 def load_space_references(
@@ -284,7 +233,7 @@ def load_space_references(
     for space in spaces_needed:
         key = {**dict(base_key), "space": spaces.space_cache_key(space)}
         path = reference_samples_path_for_key(runner.checkpoint_path, key)
-        samples = _try_load(path, required_count)
+        samples = load_reference_samples_if_sufficient(path, required_count)
         if samples is None:
             samples = spaces.features_in_chunks(
                 runner, space, base_samples[: int(required_count)], batch_size=batch_size

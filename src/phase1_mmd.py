@@ -15,16 +15,12 @@ from typing import Any, Mapping
 import numpy as np
 import torch
 
-from adaptive import (
-    _sample_prior_by_run_batches,
-    _sample_segment_by_run_batches,
-    _solve_optimal_split_factors,
-    _synchronize_runner_device,
-    _weighted_pava_non_decreasing,
-)
+from adaptive import _solve_optimal_split_factors, _weighted_pava_non_decreasing
 from metrics.mmd import mmd_features
 from metrics.utils import coerce_samples_np
+from runners.splitting import sample_prior_by_run_batches, sample_segment_by_run_batches
 from runners.trees import cumulative_profile
+from trials import synchronize
 from uniform_c import DEFAULT_N0_MIN
 
 MMD_SIBLING = "mmd_sibling"
@@ -128,12 +124,9 @@ def floor_for_min_roots(variance2, tau2, seg_costs, B2: int, optimization_mode: 
     costs = np.asarray(seg_costs, dtype=float)
     cost_w = costs / costs.sum()
 
-    def floored(floor):
-        return np.maximum(w, floor)
-
     def affordable(floor):
         factors = _solve_optimal_split_factors(
-            floored(floor)[:, None], np.zeros(1), cost_w, "monotone"
+            np.maximum(w, floor)[:, None], np.zeros(1), cost_w, "monotone"
         )
         return DEFAULT_N0_MIN * float(costs @ cumulative_profile(factors)) <= B2
 
@@ -147,7 +140,7 @@ def floor_for_min_roots(variance2, tau2, seg_costs, B2: int, optimization_mode: 
             else:
                 lo = mid
         floor = float(np.exp(hi))
-    return floored(floor)[:, None], np.zeros(1)
+    return np.maximum(w, floor)[:, None], np.zeros(1)
 
 
 def _simulate_sibling_pilot(
@@ -167,7 +160,7 @@ def _simulate_sibling_pilot(
     """
     starts = [runner.start_time] + list(split_points)
     ends = list(split_points) + [runner.end_time]
-    x, run_ids = _sample_prior_by_run_batches(
+    x, run_ids = sample_prior_by_run_batches(
         runner,
         [J] * chunk_size,
         max_sampling_batch_size=max_sampling_batch_size,
@@ -183,7 +176,7 @@ def _simulate_sibling_pilot(
             x = torch.cat([x, x[:num_main][mask].clone()])
             run_ids = torch.cat([run_ids, run_ids[:num_main][mask]])
             positions = torch.cat([positions, torch.nonzero(mask).flatten()])
-        x = _sample_segment_by_run_batches(
+        x = sample_segment_by_run_batches(
             runner,
             x,
             run_ids,
@@ -214,17 +207,17 @@ def run_mmd_sibling_phase1_batch(
 ):
     """Phase-1 payloads for ``chunk_size`` runs, in the format ``_solve_phase1_allocation`` consumes.
 
-    Both endpoints of every pilot path are exact draws from the discretized law, so the reused
-    Phase-1 sample is their concatenation at equal weight.
+    ``phase1`` is normalized by ``normalize_mmd_sibling_params``. Both endpoints of every
+    pilot path are exact draws from the discretized law, so the reused Phase-1 sample is
+    their concatenation at equal weight.
     """
-    params = normalize_mmd_sibling_params(phase1)
     _, split_points = runner.resolve_split_percentages(split_percentages)
     seg_costs = runner.segment_costs(split_points)
     J, anchors, assignment, used_B1 = sibling_geometry(
-        seg_costs, int(B1), params["min_pairs"]
+        seg_costs, int(B1), phase1["min_pairs"]
     )
 
-    _synchronize_runner_device(runner)
+    synchronize(runner.device)
     started = time.perf_counter()
     main, branch = _simulate_sibling_pilot(
         runner,
@@ -236,7 +229,7 @@ def run_mmd_sibling_phase1_batch(
         max_sampling_batch_size=max_sampling_batch_size,
         generator=generator,
     )
-    _synchronize_runner_device(runner)
+    synchronize(runner.device)
     simulation_seconds = (time.perf_counter() - started) / int(chunk_size)
 
     payloads = []

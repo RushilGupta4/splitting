@@ -4,5 +4,3 @@ CONFIGS = sde_case_configs(
     terminal_time=2.0,
     description="Coupled double-well overdamped Langevin adaptive splitting",
 )
-
-__all__ = ["CONFIGS"]

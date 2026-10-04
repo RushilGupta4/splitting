@@ -48,7 +48,7 @@ CONFIGS = {name: mmd_sibling_config(deepcopy(_DEFAULT)) for name in ("default", 
 # Per-run timings at one budget (run with compare.py --timing).
 CONFIGS["timing"] = {
     **deepcopy(CONFIGS["mmd"]),
-    "B_list": [200_000],
+    "B_list": [500_000],
     "n_runs": 10,
-    "description": "FFHQ per-run stage timings at B=200k",
+    "description": "FFHQ per-run stage timings at B=500k",
 }

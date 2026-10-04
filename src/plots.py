@@ -4,8 +4,8 @@ import json
 import math
 import os
 from collections import defaultdict
-from dataclasses import dataclass
-from decimal import Decimal, DecimalException
+from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Any
 
 import matplotlib
@@ -18,7 +18,6 @@ from matplotlib.ticker import ScalarFormatter
 SOLVER_LINESTYLES = ("--", "-.", ":", (0, (3, 1, 1, 1)))
 SOLVER_MARKERS = ("^", "D", "x", "P", "v", "*", "h")
 ADAPTIVE_MARKERS = ("o", "s", "D", "^", "v", "P", "X", "h")
-LAYOUT_PADS = {"w_pad": 0.16, "h_pad": 0.16, "wspace": 0.08, "hspace": 0.09}
 
 STRUCTURAL_CSV_FIELDS = {
     "mode",
@@ -49,10 +48,6 @@ METRIC_ORDER = ("mmd", *MMD_SPACE_LABELS, "ks")
 
 PLOT_SPECS = {
     "main": {"filename_suffix": None, "title": "Metrics vs B"},
-    # "best_config": {
-    #     "filename_suffix": "best_config",
-    #     "title": "Best adaptive config by B",
-    # },
     "optimal_b1": {"filename_suffix": "optimal_B1", "title": "Optimal B'"},
     "optimal_ni": {"filename_suffix": "optimal_Ni", "title": "Chosen N_i"},
     "cumulative_splits": {
@@ -72,7 +67,6 @@ DEFAULT_PLOTS = ("main", "percent_change", "cumulative_splits")
 class Row:
     mode: str
     sampler: str
-    sampling_steps: int | None
     sampling_params: dict[str, Any]
     step_schedule: str
     B: int
@@ -85,13 +79,11 @@ class Row:
     solver: str
     solver_steps: int | None
     solver_params: dict[str, Any]
-    nfe_per_sample: float | None
     metrics: dict[str, dict[str, float | int | None]]
-    mean_ks: float
-    std_ks: float | None
-    n_valid_ks: int | None
     N_i: list[float]
     N_i_std: list[float]
+    sampling_steps: int | None = None
+    R_i: list[float] | None = None
 
 
 def parse_args():
@@ -124,13 +116,13 @@ def parse_args():
     intervals.add_argument(
         "--std",
         action="store_true",
-        help="Show mean +/- std intervals on main / best_config plots",
+        help="Show mean +/- std intervals on the main plot",
     )
     intervals.add_argument(
         "--ci",
         type=float,
         default=None,
-        help="Show CI half-widths at this level on main / best_config plots",
+        help="Show CI half-widths at this level on the main and optimal_ni plots",
     )
     return parser.parse_args()
 
@@ -165,68 +157,6 @@ def _parse_float(value: str):
     if math.isnan(parsed):
         return None
     return parsed
-
-
-def _canonical_decimal_text(value: Decimal) -> str:
-    if value == 0:
-        return "0"
-    return format(value.normalize(), "f")
-
-
-def _normalize_b1_spec(raw_spec: str, B1: int | None, legacy_ratio) -> str:
-    raw_spec = (raw_spec or "").strip()
-    if not raw_spec:
-        if legacy_ratio is not None:
-            ratio = Decimal(str(legacy_ratio))
-            if not ratio.is_finite() or not Decimal(0) < ratio < Decimal(1):
-                raise ValueError(f"Invalid legacy B1_ratio value: {legacy_ratio!r}")
-            return f"ratio:{_canonical_decimal_text(ratio)}"
-        return f"absolute:{B1}" if B1 is not None else ""
-
-    try:
-        mode, payload = raw_spec.split(":", 1)
-    except ValueError as exc:
-        raise ValueError(f"Invalid B1_spec {raw_spec!r}") from exc
-
-    if mode == "absolute":
-        try:
-            absolute = int(payload)
-        except ValueError as exc:
-            raise ValueError(f"Invalid absolute B1_spec {raw_spec!r}") from exc
-        if absolute < 1 or (B1 is not None and absolute != B1):
-            raise ValueError(
-                f"Absolute B1_spec {raw_spec!r} does not match resolved B1={B1}"
-            )
-        return f"absolute:{absolute}"
-
-    if mode == "ratio":
-        try:
-            ratio = Decimal(payload)
-        except DecimalException as exc:
-            raise ValueError(f"Invalid ratio B1_spec {raw_spec!r}") from exc
-        if not ratio.is_finite() or not Decimal(0) < ratio < Decimal(1):
-            raise ValueError(f"Invalid ratio B1_spec {raw_spec!r}")
-        return f"ratio:{_canonical_decimal_text(ratio)}"
-
-    if mode == "power":
-        parts = [part.strip() for part in payload.split(",")]
-        if len(parts) != 2 or not all(parts):
-            raise ValueError(f"Invalid power B1_spec {raw_spec!r}")
-        try:
-            coefficient = Decimal(parts[0])
-            exponent = Decimal(parts[1])
-        except DecimalException as exc:
-            raise ValueError(f"Invalid power B1_spec {raw_spec!r}") from exc
-        if not coefficient.is_finite() or coefficient <= 0:
-            raise ValueError(f"Invalid power B1_spec {raw_spec!r}")
-        if not exponent.is_finite() or not Decimal(0) <= exponent <= Decimal(1):
-            raise ValueError(f"Invalid power B1_spec {raw_spec!r}")
-        return (
-            f"power:{_canonical_decimal_text(coefficient)},"
-            f"{_canonical_decimal_text(exponent)}"
-        )
-
-    raise ValueError(f"Unknown B1_spec mode {mode!r}")
 
 
 def _parse_float_list(value: str):
@@ -289,19 +219,8 @@ def _available_metrics(rows) -> list[str]:
     return sorted(metrics, key=_metric_sort_key)
 
 
-def _metric_value(row: Row, metric: str):
-    entry = row.metrics.get(metric) or {}
-    return entry.get("mean")
-
-
-def _metric_std(row: Row, metric: str):
-    entry = row.metrics.get(metric) or {}
-    return entry.get("std")
-
-
-def _metric_n_valid(row: Row, metric: str):
-    entry = row.metrics.get(metric) or {}
-    return entry.get("n_valid")
+def _metric_value(row: Row, metric: str, field: str = "mean"):
+    return (row.metrics.get(metric) or {}).get(field)
 
 
 def _metric_label(metric: str):
@@ -348,49 +267,31 @@ def _load_rows(csv_path: str):
             metric_values = _parse_metric_values(raw_row, metrics)
             if not metric_values:
                 continue
-            mean_ks = metric_values.get("ks", {}).get("mean")
             mode = (raw_row.get("mode") or "").strip()
-            if mode == "estimate_and_sample":
-                mode = "adaptive"
             if mode not in {"fixed_N", "solver_baseline", "adaptive"}:
                 continue
-
-            reuse = _parse_bool(raw_row.get("reuse", ""))
-            optimizer = (raw_row.get("optimizer") or "").strip()
-            crossfit_q_mlp_loss = (raw_row.get("crossfit_q_mlp_loss") or "").strip()
-            crossfit_q_folds = _parse_int(raw_row.get("crossfit_q_folds", "")) or 1
-            B1 = _parse_int(raw_row.get("B1", ""))
-            B1_spec = _normalize_b1_spec(
-                raw_row.get("B1_spec", ""),
-                B1,
-                _parse_float(raw_row.get("B1_ratio", "")),
-            )
             rows.append(
                 Row(
                     mode=mode,
                     sampler=(raw_row.get("sampler") or "").strip(),
-                    sampling_steps=_parse_int(raw_row.get("sampling_steps", "")),
                     sampling_params=_parse_json_dict(
                         raw_row.get("sampling_params", "")
                     ),
                     step_schedule=(raw_row.get("step_schedule") or "default").strip(),
                     B=B,
-                    B1=B1,
-                    B1_spec=B1_spec,
-                    crossfit_q_folds=crossfit_q_folds,
-                    crossfit_q_mlp_loss=crossfit_q_mlp_loss,
-                    reuse=reuse,
-                    optimizer=optimizer,
+                    B1=_parse_int(raw_row.get("B1", "")),
+                    B1_spec=(raw_row.get("B1_spec") or "").strip(),
+                    crossfit_q_folds=_parse_int(raw_row.get("crossfit_q_folds", "")) or 1,
+                    crossfit_q_mlp_loss=(raw_row.get("crossfit_q_mlp_loss") or "").strip(),
+                    reuse=_parse_bool(raw_row.get("reuse", "")),
+                    optimizer=(raw_row.get("optimizer") or "").strip(),
                     solver=(raw_row.get("solver") or "").strip(),
                     solver_steps=_parse_int(raw_row.get("solver_steps", "")),
                     solver_params=_parse_json_dict(raw_row.get("solver_params", "")),
-                    nfe_per_sample=_parse_float(raw_row.get("nfe_per_sample", "")),
                     metrics=metric_values,
-                    mean_ks=float(mean_ks) if mean_ks is not None else float("nan"),
-                    std_ks=metric_values.get("ks", {}).get("std"),
-                    n_valid_ks=metric_values.get("ks", {}).get("n_valid"),
                     N_i=_parse_float_list(raw_row.get("N_i", "")),
                     N_i_std=_parse_float_list(raw_row.get("N_i_std", "")),
+                    sampling_steps=_parse_int(raw_row.get("sampling_steps", "")),
                 )
             )
     return rows
@@ -403,10 +304,8 @@ def _json_key(value: dict[str, Any]) -> str:
 def _format_value(value):
     if isinstance(value, float):
         return f"{value:g}"
-    if isinstance(value, dict):
-        return json.dumps(value, sort_keys=True, separators=(",", ":"))
-    if isinstance(value, list):
-        return json.dumps(value, sort_keys=True, separators=(",", ":"))
+    if isinstance(value, (dict, list)):
+        return _json_key(value)
     return str(value)
 
 
@@ -417,10 +316,6 @@ def _format_count(value) -> str:
     if value >= 1_000:
         return f"{value / 1_000:g}k"
     return str(value)
-
-
-def _b1_series_key(row: Row):
-    return row.B1_spec
 
 
 def _format_b1_series_label(series_key) -> str:
@@ -576,7 +471,7 @@ def _row_stable_label(row: Row) -> str:
                 else row.step_schedule
             ),
             (
-                _format_b1_series_label(_b1_series_key(row))
+                _format_b1_series_label(row.B1_spec)
                 if row.mode == "adaptive"
                 else ""
             ),
@@ -652,7 +547,7 @@ def _baseline_series_label(series_key) -> str:
 
 def _main_series_key(row: Row):
     if row.mode == "adaptive":
-        return ("adaptive", _method_key(row), _b1_series_key(row))
+        return ("adaptive", _method_key(row), row.B1_spec)
     return _baseline_series_key(row)
 
 
@@ -685,7 +580,7 @@ def _build_method_style_map(rows):
 
 
 def _build_b1_marker_map(rows):
-    b1_values = sorted({_b1_series_key(row) for row in _adaptive_rows(rows)})
+    b1_values = sorted({row.B1_spec for row in _adaptive_rows(rows)})
     return {
         b1: ADAPTIVE_MARKERS[i % len(ADAPTIVE_MARKERS)]
         for i, b1 in enumerate(b1_values)
@@ -696,15 +591,7 @@ def _build_mode_style_map(rows):
     mode_keys = _mode_keys(rows)
     cmap = plt.get_cmap("tab10") if len(mode_keys) <= 10 else plt.get_cmap("tab20")
     return {
-        mode_key: (
-            cmap(i % cmap.N),
-            (
-                "--"
-                if mode_key[0] == "independent"
-                else ":" if mode_key[0] == "joint" else "-"
-            ),
-            ADAPTIVE_MARKERS[i % len(ADAPTIVE_MARKERS)],
-        )
+        mode_key: (cmap(i % cmap.N), "-", ADAPTIVE_MARKERS[i % len(ADAPTIVE_MARKERS)])
         for i, mode_key in enumerate(mode_keys)
     }
 
@@ -782,30 +669,14 @@ def _make_subplot_grid(count: int, max_cols: int = 2):
     return nrows, ncols
 
 
-def _legend_rows(label_count: int, ncol: int) -> int:
-    return math.ceil(int(label_count) / max(1, int(ncol))) if label_count else 0
-
-
 def _with_top_legend_height(figsize, label_count: int, ncol: int):
     width, height = figsize
-    return width, height + 0.45 * _legend_rows(label_count, ncol)
+    legend_rows = math.ceil(int(label_count) / max(1, int(ncol))) if label_count else 0
+    return width, height + 0.45 * legend_rows
 
 
-def _main_legend_labels(rows, b1_markers):
-    baseline_labels = [
-        _baseline_series_label(series_key)
-        for series_key in sorted(
-            {_baseline_series_key(row) for row in _all_baseline_rows(rows)}, key=str
-        )
-    ]
-    adaptive_labels = [
-        _method_display_label(method_key)
-        for method_key in sorted({_method_key(row) for row in _adaptive_rows(rows)}, key=str)
-    ]
-    b1_labels = [
-        _format_b1_series_label(b1_key) for b1_key in sorted(b1_markers)
-    ]
-    return baseline_labels + adaptive_labels + b1_labels
+def _legend_line(color, linestyle, marker, **kwargs):
+    return Line2D([0], [0], color=color, linestyle=linestyle, marker=marker, **kwargs)
 
 
 def _main_legend_ncol(labels) -> int:
@@ -825,10 +696,6 @@ def _apply_scalar_formatters(ax, format_x: bool = True, format_y: bool = True):
         ax.yaxis.set_major_formatter(y_formatter)
 
 
-def _series_points(rows):
-    return sorted(rows, key=lambda row: row.B)
-
-
 def _plot_series(
     ax,
     rows,
@@ -842,7 +709,11 @@ def _plot_series(
     ci_level=None,
     zorder=3,
 ):
-    points = [row for row in _series_points(rows) if _metric_value(row, metric) is not None]
+    points = [
+        row
+        for row in sorted(rows, key=lambda row: row.B)
+        if _metric_value(row, metric) is not None
+    ]
     if not points:
         return False
     x_values = [row.B for row in points]
@@ -852,7 +723,7 @@ def _plot_series(
             ax,
             x_values,
             y_values,
-            [_metric_std(row, metric) for row in points],
+            [_metric_value(row, metric, "std") for row in points],
             color,
             zorder - 1,
         )
@@ -863,8 +734,8 @@ def _plot_series(
             y_values,
             [
                 _ci_half_width(
-                    _metric_std(row, metric),
-                    _metric_n_valid(row, metric),
+                    _metric_value(row, metric, "std"),
+                    _metric_value(row, metric, "n_valid"),
                     ci_level,
                 )
                 for row in points
@@ -930,13 +801,7 @@ def _plot_main_panel(
             )
             zorder = 5
         elif kind == "adaptive":
-            b1 = series_key[2]
-            marker = b1_markers.get(b1, "o")
-            linestyle = (
-                "--"
-                if method_key[1] == "independent"
-                else ":" if method_key[1] == "joint" else "-"
-            )
+            marker = b1_markers.get(series_key[2], "o")
             zorder = 2
         else:
             zorder = 4
@@ -964,58 +829,32 @@ def _plot_main_panel(
     _apply_scalar_formatters(ax, format_x=True, format_y=True)
 
 
-def _make_main_legend(fig, rows, method_styles, b1_markers, legend_ncol):
+def _main_legend_entries(rows, method_styles, b1_markers):
     handles = []
     labels = []
-
     baseline_series_keys = sorted(
         {_baseline_series_key(row) for row in _all_baseline_rows(rows)}, key=str
     )
     for series_key in baseline_series_keys:
-        method_key = _baseline_method_key(series_key)
-        color = method_styles.get(method_key, "#1f77b4")
-        marker = "o"
-        linestyle = "-"
+        color = method_styles.get(_baseline_method_key(series_key), "#1f77b4")
+        linestyle, marker = "-", "o"
         if series_key[0] == "solver":
             color, linestyle, marker = _main_solver_series_style(
                 series_key, rows, method_styles
             )
-        handles.append(
-            Line2D(
-                [0], [0], color=color, linestyle=linestyle, marker=marker, linewidth=2.0
-            )
-        )
+        handles.append(_legend_line(color, linestyle, marker, linewidth=2.0))
         labels.append(_baseline_series_label(series_key))
-
-    adaptive_method_keys = sorted(
-        {_method_key(row) for row in _adaptive_rows(rows)}, key=str
-    )
-    for method_key in adaptive_method_keys:
+    for method_key in sorted({_method_key(row) for row in _adaptive_rows(rows)}, key=str):
         color = method_styles.get(method_key, "#1f77b4")
-        linestyle = (
-            "--"
-            if method_key[1] == "independent"
-            else ":" if method_key[1] == "joint" else "-"
-        )
-        handles.append(
-            Line2D(
-                [0], [0], color=color, linestyle=linestyle, marker="o", linewidth=2.0
-            )
-        )
+        handles.append(_legend_line(color, "-", "o", linewidth=2.0))
         labels.append(_method_display_label(method_key))
-
     for b1_key, marker in sorted(b1_markers.items()):
-        handles.append(
-            Line2D(
-                [0],
-                [0],
-                color="0.35",
-                linestyle="None",
-                marker=marker,
-                markersize=6,
-            )
-        )
+        handles.append(_legend_line("0.35", "None", marker, markersize=6))
         labels.append(_format_b1_series_label(b1_key))
+    return handles, labels
+
+
+def _make_main_legend(fig, handles, labels, legend_ncol):
     if handles:
         fig.legend(
             handles,
@@ -1036,7 +875,7 @@ def _plot_main(rows, args):
     schedules = sorted({key[1] for key in facet_keys})
     method_styles = _build_method_style_map(rows)
     b1_markers = _build_b1_marker_map(rows)
-    legend_labels = _main_legend_labels(rows, b1_markers)
+    legend_handles, legend_labels = _main_legend_entries(rows, method_styles, b1_markers)
     legend_count = len(legend_labels)
     legend_ncol = _main_legend_ncol(legend_labels)
 
@@ -1118,165 +957,7 @@ def _plot_main(rows, args):
 
     if args.title:
         fig.suptitle(args.title)
-    _make_main_legend(fig, rows, method_styles, b1_markers, legend_ncol)
-    return fig
-
-
-def _best_adaptive_rows(rows, *, metric: str = "ks"):
-    candidates = [
-        row for row in _adaptive_rows(rows)
-    ]
-    selected = _best_by_group(
-        candidates, key_fn=lambda row: (_schedule_key(row), row.B), metric=metric
-    )
-    return sorted(
-        selected.values(),
-        key=lambda row: (_format_schedule_key(_schedule_key(row)), row.B),
-    )
-
-
-def _best_solver_rows(rows, metric: str = "ks"):
-    selected = _best_by_group(
-        _solver_rows(rows),
-        key_fn=lambda row: (_solver_family_key(row), row.step_schedule, row.B),
-        metric=metric,
-    )
-    return sorted(
-        selected.values(),
-        key=lambda row: (_solver_family_key(row), row.step_schedule, row.B),
-    )
-
-
-def _best_config_series_key(row: Row):
-    if row.mode == "fixed_N":
-        return ("fixed_N", _schedule_key(row))
-    if row.mode == "solver_baseline":
-        return ("solver", _solver_family_key(row), row.step_schedule)
-    return ("best_adaptive", _schedule_key(row))
-
-
-def _format_best_config_label(series_key):
-    kind = series_key[0]
-    if kind == "fixed_N":
-        return f"fixed, {_format_schedule_short(series_key[1])}"
-    if kind == "solver":
-        return f"{_method_display_label(('solver', *series_key[1]))}, {series_key[2]}"
-    return f"best, {_format_schedule_short(series_key[1])}"
-
-
-def _best_adaptive_improvement_points(rows, metric: str = "ks"):
-    best_adaptive = _best_by_group(
-        _adaptive_rows(rows),
-        key_fn=lambda row: row.B,
-        metric=metric,
-    )
-    best_baseline = _best_by_group(
-        (row for row in rows if row.mode in {"fixed_N", "solver_baseline"}),
-        key_fn=lambda row: row.B,
-        metric=metric,
-    )
-    x_values, y_values = [], []
-    for budget in sorted(set(best_adaptive) & set(best_baseline)):
-        baseline = best_baseline[budget]
-        adaptive = best_adaptive[budget]
-        baseline_value = _metric_value(baseline, metric)
-        adaptive_value = _metric_value(adaptive, metric)
-        if baseline_value in {None, 0} or adaptive_value is None:
-            continue
-        x_values.append(budget)
-        y_values.append(
-            100.0 * (baseline_value - adaptive_value) / baseline_value
-        )
-    return x_values, y_values
-
-
-def _plot_best_config(rows, metric: str, show_std, ci_level, title=None):
-    selected_rows = []
-    selected_rows.extend(_baseline_rows(rows))
-    selected_rows.extend(_best_solver_rows(rows, metric=metric))
-    selected_rows.extend(_best_adaptive_rows(rows, metric=metric))
-    if not selected_rows:
-        return None
-
-    grouped = defaultdict(list)
-    for row in selected_rows:
-        grouped[_best_config_series_key(row)].append(row)
-    method_styles = _build_method_style_map(selected_rows)
-    solver_styles = _build_solver_style_map(selected_rows)
-    figsize = (13.0 + 0.25 * min(len(grouped), 8), 10.0)
-
-    fig, (ax, improvement_ax) = plt.subplots(
-        2,
-        1,
-        figsize=figsize,
-        sharex=True,
-        gridspec_kw={"height_ratios": [3.0, 1.0]},
-        constrained_layout=True,
-    )
-    for series_key, series_rows in sorted(
-        grouped.items(), key=lambda item: str(item[0])
-    ):
-        kind = series_key[0]
-        if kind == "solver":
-            color, linestyle, marker, _ = _solver_style(series_key[1], solver_styles)
-        elif kind == "best_adaptive":
-            color = method_styles.get(_method_key(series_rows[0]), "#2ca02c")
-            linestyle, marker = ":", "*"
-        else:
-            color = method_styles.get(("fixed_N",), "#1f77b4")
-            linestyle, marker = "-", "o"
-        _plot_series(
-            ax,
-            series_rows,
-            metric=metric,
-            color=color,
-            linestyle=linestyle,
-            marker=marker,
-            label=_format_best_config_label(series_key),
-            show_std=show_std,
-            ci_level=ci_level,
-        )
-
-    ax.grid(alpha=0.25)
-    ax.set_ylabel(_metric_label(metric))
-    ax.set_yscale("log")
-    ax.set_title(title or PLOT_SPECS["best_config"]["title"])
-    ax.legend(
-        loc="center left",
-        bbox_to_anchor=(1.01, 0.5),
-        frameon=False,
-        borderaxespad=0.8,
-        labelspacing=0.6,
-    )
-    _apply_scalar_formatters(ax, format_x=True, format_y=True)
-
-    improvement_x, improvement_y = _best_adaptive_improvement_points(rows, metric=metric)
-    if improvement_x:
-        improvement_ax.plot(
-            improvement_x,
-            improvement_y,
-            color="black",
-            linestyle="-",
-            marker="o",
-            linewidth=2.0,
-            markersize=5,
-            label="adaptive vs baseline",
-        )
-        improvement_ax.legend(frameon=False, loc="best")
-    else:
-        improvement_ax.text(
-            0.5,
-            0.5,
-            "no matched adaptive/baseline data",
-            ha="center",
-            va="center",
-            transform=improvement_ax.transAxes,
-        )
-    improvement_ax.axhline(0.0, color="0.35", linestyle="--", linewidth=1.0)
-    improvement_ax.grid(alpha=0.25)
-    improvement_ax.set_xlabel("Total B")
-    improvement_ax.set_ylabel(f"{_metric_label(metric)} improvement (%)")
-    _apply_scalar_formatters(improvement_ax, format_x=True, format_y=True)
+    _make_main_legend(fig, legend_handles, legend_labels, legend_ncol)
     return fig
 
 
@@ -1286,15 +967,7 @@ def _make_mode_legend(fig, mode_keys, mode_styles):
     for mode_key in mode_keys:
         color, linestyle, marker = _mode_style(mode_key, mode_styles)
         handles.append(
-            Line2D(
-                [0],
-                [0],
-                color=color,
-                linestyle=linestyle,
-                marker=marker,
-                linewidth=1.8,
-                markersize=5,
-            )
+            _legend_line(color, linestyle, marker, linewidth=1.8, markersize=5)
         )
         labels.append(_mode_title(mode_key))
     if handles:
@@ -1308,6 +981,14 @@ def _make_mode_legend(fig, mode_keys, mode_styles):
             columnspacing=1.4,
             labelspacing=0.8,
         )
+
+
+def _best_per_mode(rows, metric):
+    return _best_by_group(
+        rows,
+        key_fn=lambda row: (_schedule_key(row), _mode_key(row), row.B),
+        metric=metric,
+    )
 
 
 def _plot_optimal_b1_panel(ax, selected_rows, mode_keys, mode_styles):
@@ -1362,13 +1043,8 @@ def _plot_optimal_b1(rows, title_prefix, mode_styles):
     axes_flat = axes.flatten()
     selected_by_metric_and_schedule = {}
     for metric in metrics:
-        selected = _best_by_group(
-            rows,
-            key_fn=lambda row: (_schedule_key(row), _mode_key(row), row.B),
-            metric=metric,
-        )
         selected_by_schedule = defaultdict(list)
-        for (schedule, _, _), row in selected.items():
+        for (schedule, _, _), row in _best_per_mode(rows, metric).items():
             selected_by_schedule[schedule].append(row)
         selected_by_metric_and_schedule[metric] = selected_by_schedule
     for ax, (metric, schedule) in zip(axes_flat, panels):
@@ -1390,103 +1066,6 @@ def _plot_optimal_b1(rows, title_prefix, mode_styles):
     return fig
 
 
-def _plot_optimal_ni_panel(
-    ax, selected_rows, max_levels, mode_keys, mode_styles, metric="ks", ci_level=None
-):
-    plotted_any = False
-    for mode_key in mode_keys:
-        row = best_row((row for row in selected_rows if _mode_key(row) == mode_key), metric=metric)
-        if row is None or not row.N_i:
-            continue
-        color, linestyle, marker = _mode_style(mode_key, mode_styles)
-        x_values = list(range(1, len(row.N_i) + 1))
-        if ci_level is not None and len(row.N_i_std) == len(row.N_i):
-            _fill_interval(
-                ax,
-                x_values,
-                row.N_i,
-                [
-                    _ci_half_width(std, _metric_n_valid(row, metric), ci_level)
-                    for std in row.N_i_std
-                ],
-                color,
-                1,
-            )
-        ax.plot(
-            x_values,
-            row.N_i,
-            color=color,
-            linestyle=linestyle,
-            marker=marker,
-            linewidth=1.8,
-            markersize=5,
-        )
-        plotted_any = True
-    if not plotted_any:
-        ax.text(0.5, 0.5, "no data", ha="center", va="center", transform=ax.transAxes)
-    if max_levels > 0:
-        ax.set_xticks(list(range(1, max_levels + 1)))
-    ax.grid(alpha=0.25)
-    _apply_scalar_formatters(ax, format_x=False, format_y=True)
-
-
-def _plot_optimal_ni(rows, title_prefix, mode_styles, ci_level=None):
-    rows = _adaptive_rows(rows)
-    metrics = _available_metrics(rows)
-    mode_keys = _mode_keys(rows)
-    schedules = sorted({_schedule_key(row) for row in rows}, key=_format_schedule_key)
-    budgets = sorted({row.B for row in rows})
-    selected_by_metric_schedule_and_budget = {}
-    selected_values = []
-    for metric in metrics:
-        selected = _best_by_group(
-            rows,
-            key_fn=lambda row: (_schedule_key(row), _mode_key(row), row.B),
-            metric=metric,
-        )
-        selected_by_schedule_and_budget = defaultdict(list)
-        for (schedule, _, budget), row in selected.items():
-            selected_by_schedule_and_budget[(schedule, budget)].append(row)
-            selected_values.append(row)
-        selected_by_metric_schedule_and_budget[metric] = selected_by_schedule_and_budget
-    max_levels = max((len(row.N_i) for row in selected_values), default=0)
-    legend_count = len(mode_keys)
-    legend_ncol = min(3, max(1, legend_count))
-    figsize = _with_top_legend_height(
-        (4.8 * max(1, len(budgets)), 4.0 * max(1, len(schedules) * len(metrics))),
-        legend_count,
-        legend_ncol,
-    )
-
-    fig, axes = plt.subplots(
-        max(1, len(schedules) * len(metrics)),
-        max(1, len(budgets)),
-        figsize=figsize,
-        squeeze=False,
-        constrained_layout=True,
-    )
-    row_keys = [(metric, schedule) for metric in metrics for schedule in schedules]
-    for row_idx, (metric, schedule) in enumerate(row_keys):
-        for col_idx, budget in enumerate(budgets):
-            ax = axes[row_idx][col_idx]
-            panel_rows = selected_by_metric_schedule_and_budget.get(metric, {}).get((schedule, budget), [])
-            _plot_optimal_ni_panel(
-                ax, panel_rows, max_levels, mode_keys, mode_styles, metric, ci_level
-            )
-            if row_idx == 0:
-                ax.set_title(f"B={_format_count(budget)}")
-            if col_idx == 0:
-                ax.set_ylabel(
-                    f"Chosen N_i\n{_format_schedule_short(schedule)}\n{_metric_label(metric)}"
-                )
-            if row_idx == len(row_keys) - 1:
-                ax.set_xlabel("Split level i")
-    if title_prefix:
-        fig.suptitle(f"{title_prefix}: {PLOT_SPECS['optimal_ni']['title']}")
-    _make_mode_legend(fig, mode_keys, mode_styles)
-    return fig
-
-
 def _cumulative_products(values):
     products = []
     running_product = 1.0
@@ -1496,8 +1075,78 @@ def _cumulative_products(values):
     return products
 
 
-def _plot_cumulative_splits_panel(
-    ax, selected_rows, max_levels, mode_keys, mode_styles, metric="ks"
+def _load_cumulative_allocations(csv_path, rows):
+    """Average cumulative allocations from the runs underlying each CSV row."""
+    path = Path(csv_path)
+    prefix = "compare_results_"
+    if not path.stem.startswith(prefix):
+        raise ValueError(f"Cannot resolve split schedule from CSV path: {csv_path}")
+    schedule = [float(value) for value in path.stem[len(prefix):].split("_")]
+    configs = []
+    for config_path in sorted((path.parent / "runs").glob("*/config.json")):
+        with config_path.open() as handle:
+            configs.append((config_path.parent, json.load(handle)["cache_key"]))
+
+    resolved = []
+    for row in rows:
+        if row.mode != "adaptive" or not row.N_i:
+            resolved.append(row)
+            continue
+        candidates = []
+        for run_dir, key in configs:
+            spec = key.get("spec", {})
+            sampling = spec.get("runner_sampling_config", {})
+            if (
+                spec.get("mode") != "estimate_and_sample"
+                or spec.get("B") != row.B
+                or spec.get("B1") != row.B1
+                or spec.get("split_percentages") != schedule
+                or spec.get("optimization_mode") != row.optimizer
+                or spec.get("reuse_phase1_samples") != row.reuse
+                or sampling.get("sampler") != row.sampler
+                or sampling.get("sampling_steps") != row.sampling_steps
+                or any(sampling.get(k) != v for k, v in row.sampling_params.items())
+                or int(key.get("crossfit_q_folds", 1)) != row.crossfit_q_folds
+                or (
+                    row.crossfit_q_mlp_loss
+                    and (key.get("crossfit_q_mlp_params") or {}).get("loss")
+                    != row.crossfit_q_mlp_loss
+                )
+            ):
+                continue
+            n = max(int(values.get("n_valid") or 0) for values in row.metrics.values())
+            with (run_dir / "runs.jsonl").open() as handle:
+                records = [json.loads(line) for line in handle if line.strip()][:n]
+            factors = [record.get("N_i", []) for record in records]
+            if len(factors) != n or not n:
+                continue
+            if any(len(values) != len(row.N_i) for values in factors):
+                continue
+            if any(
+                not math.isfinite(v) or v < 1.0 - 1e-8
+                for values in factors for v in values
+            ):
+                raise ValueError(f"Invalid cached split factors in {run_dir}")
+            means = [sum(values) / n for values in zip(*factors)]
+            if not all(
+                math.isclose(a, b, rel_tol=1e-5, abs_tol=1e-8)
+                for a, b in zip(means, row.N_i)
+            ):
+                continue
+            cumulative = [_cumulative_products(values) for values in factors]
+            candidates.append([sum(values) / n for values in zip(*cumulative)])
+        if len(candidates) != 1:
+            raise ValueError(
+                f"Expected one matching allocation cache for {csv_path}, "
+                f"B={row.B}, B1={row.B1}, optimizer={row.optimizer}; "
+                f"found {len(candidates)}. Cumulative plots require per-run N_i."
+            )
+        resolved.append(replace(row, R_i=candidates[0]))
+    return resolved
+
+
+def _plot_split_levels_panel(
+    ax, selected_rows, max_levels, mode_keys, mode_styles, metric, ci_level, cumulative
 ):
     plotted_any = False
     for mode_key in mode_keys:
@@ -1509,9 +1158,23 @@ def _plot_cumulative_splits_panel(
             continue
         color, linestyle, marker = _mode_style(mode_key, mode_styles)
         x_values = list(range(1, len(row.N_i) + 1))
+        if (
+            not cumulative
+            and ci_level is not None
+            and len(row.N_i_std) == len(row.N_i)
+        ):
+            n_valid = _metric_value(row, metric, "n_valid")
+            _fill_interval(
+                ax,
+                x_values,
+                row.N_i,
+                [_ci_half_width(std, n_valid, ci_level) for std in row.N_i_std],
+                color,
+                1,
+            )
         ax.plot(
             x_values,
-            _cumulative_products(row.N_i),
+            row.R_i if cumulative else row.N_i,
             color=color,
             linestyle=linestyle,
             marker=marker,
@@ -1527,25 +1190,25 @@ def _plot_cumulative_splits_panel(
     _apply_scalar_formatters(ax, format_x=False, format_y=True)
 
 
-def _plot_cumulative_splits(rows, title_prefix, mode_styles):
+def _plot_split_levels(rows, title_prefix, mode_styles, plot_name, ci_level=None):
+    """Mean split factors or mean per-run cumulative allocations."""
+    cumulative = plot_name == "cumulative_splits"
+    if cumulative and any(row.R_i is None for row in _adaptive_rows(rows) if row.N_i):
+        raise ValueError("Cumulative plots require per-run allocations from the cache")
+    ylabel = "Cumulative splits $R_i$" if cumulative else "Chosen N_i"
     rows = _adaptive_rows(rows)
     metrics = _available_metrics(rows)
     mode_keys = _mode_keys(rows)
     schedules = sorted({_schedule_key(row) for row in rows}, key=_format_schedule_key)
     budgets = sorted({row.B for row in rows})
-    selected_by_metric_schedule_and_budget = {}
+    selected_by_metric = {}
     selected_values = []
     for metric in metrics:
-        selected = _best_by_group(
-            rows,
-            key_fn=lambda row: (_schedule_key(row), _mode_key(row), row.B),
-            metric=metric,
-        )
-        selected_by_schedule_and_budget = defaultdict(list)
-        for (schedule, _, budget), row in selected.items():
-            selected_by_schedule_and_budget[(schedule, budget)].append(row)
+        selected = defaultdict(list)
+        for (schedule, _, budget), row in _best_per_mode(rows, metric).items():
+            selected[(schedule, budget)].append(row)
             selected_values.append(row)
-        selected_by_metric_schedule_and_budget[metric] = selected_by_schedule_and_budget
+        selected_by_metric[metric] = selected
     max_levels = max((len(row.N_i) for row in selected_values), default=0)
     legend_count = len(mode_keys)
     legend_ncol = min(3, max(1, legend_count))
@@ -1566,59 +1229,51 @@ def _plot_cumulative_splits(rows, title_prefix, mode_styles):
     for row_idx, (metric, schedule) in enumerate(row_keys):
         for col_idx, budget in enumerate(budgets):
             ax = axes[row_idx][col_idx]
-            panel_rows = selected_by_metric_schedule_and_budget.get(metric, {}).get(
-                (schedule, budget), []
-            )
-            _plot_cumulative_splits_panel(
-                ax, panel_rows, max_levels, mode_keys, mode_styles, metric
+            _plot_split_levels_panel(
+                ax,
+                selected_by_metric.get(metric, {}).get((schedule, budget), []),
+                max_levels,
+                mode_keys,
+                mode_styles,
+                metric,
+                ci_level,
+                cumulative,
             )
             if row_idx == 0:
                 ax.set_title(f"B={_format_count(budget)}")
             if col_idx == 0:
                 ax.set_ylabel(
-                    "Cumulative splits $R_i$\n"
-                    f"{_format_schedule_short(schedule)}\n{_metric_label(metric)}"
+                    f"{ylabel}\n{_format_schedule_short(schedule)}\n{_metric_label(metric)}"
                 )
             if row_idx == len(row_keys) - 1:
                 ax.set_xlabel("Split level i")
     if title_prefix:
-        fig.suptitle(
-            f"{title_prefix}: {PLOT_SPECS['cumulative_splits']['title']}"
-        )
+        fig.suptitle(f"{title_prefix}: {PLOT_SPECS[plot_name]['title']}")
     _make_mode_legend(fig, mode_keys, mode_styles)
     return fig
-
-
-def _percent_change_points(baseline_by_budget, candidate_by_budget, metric="ks"):
-    x_values = []
-    y_values = []
-    for budget in sorted(set(baseline_by_budget) & set(candidate_by_budget)):
-        baseline = baseline_by_budget[budget]
-        candidate = candidate_by_budget[budget]
-        baseline_value = _metric_value(baseline, metric)
-        candidate_value = _metric_value(candidate, metric)
-        if baseline_value in {None, 0} or candidate_value is None:
-            continue
-        x_values.append(budget)
-        y_values.append(
-            100.0 * (baseline_value - candidate_value) / baseline_value
-        )
-    return x_values, y_values
 
 
 def _plot_percent_line(
     ax,
     baseline_by_budget,
     candidate_by_budget,
+    legend_handles,
     *,
     color,
     linestyle,
     marker,
     label,
-    metric="ks",
-    annotation_dy=None,
+    metric,
 ):
-    x_values, y_values = _percent_change_points(baseline_by_budget, candidate_by_budget, metric)
+    x_values = []
+    y_values = []
+    for budget in sorted(set(baseline_by_budget) & set(candidate_by_budget)):
+        baseline_value = _metric_value(baseline_by_budget[budget], metric)
+        candidate_value = _metric_value(candidate_by_budget[budget], metric)
+        if baseline_value in {None, 0} or candidate_value is None:
+            continue
+        x_values.append(budget)
+        y_values.append(100.0 * (baseline_value - candidate_value) / baseline_value)
     if not x_values:
         return False
     ax.plot(
@@ -1631,26 +1286,10 @@ def _plot_percent_line(
         markersize=5,
         label=label,
     )
-    if annotation_dy is not None:
-        for x_value, y_value in zip(x_values, y_values):
-            ax.annotate(
-                f"{y_value:.1f}%",
-                (x_value, y_value),
-                textcoords="offset points",
-                xytext=(0, annotation_dy),
-                ha="center",
-                fontsize=8,
-                color=color,
-            )
-    return True
-
-
-def _adaptive_linestyle(method_key):
-    return (
-        "--"
-        if method_key[1] == "independent"
-        else ":" if method_key[1] == "joint" else "-"
+    legend_handles.setdefault(
+        label, _legend_line(color, linestyle, marker, linewidth=2.0)
     )
+    return True
 
 
 def _plot_percent_change_panel(
@@ -1683,45 +1322,21 @@ def _plot_percent_change_panel(
     for method_key, b1 in adaptive_series_keys:
         adaptive_by_budget = {
             budget: row
-            for (
-                group_schedule,
-                group_method_key,
-                group_b1,
-                budget,
-            ), row in adaptive_by_group.items()
-            if group_schedule == schedule
-            and group_method_key == method_key
-            and group_b1 == b1
+            for (group_schedule, group_method_key, group_b1, budget), row
+            in adaptive_by_group.items()
+            if (group_schedule, group_method_key, group_b1) == (schedule, method_key, b1)
         }
-        color = method_styles.get(method_key, "#1f77b4")
-        linestyle = _adaptive_linestyle(method_key)
-        marker = b1_markers.get(b1, "o")
-        label = (
-            f"{_method_display_label(method_key)}, "
-            f"{_format_b1_series_label(b1)}"
-        )
-        if _plot_percent_line(
+        plotted_any |= _plot_percent_line(
             ax,
             baseline_by_budget,
             adaptive_by_budget,
-            color=color,
-            linestyle=linestyle,
-            marker=marker,
-            label=label,
+            legend_handles,
+            color=method_styles.get(method_key, "#1f77b4"),
+            linestyle="-",
+            marker=b1_markers.get(b1, "o"),
+            label=f"{_method_display_label(method_key)}, {_format_b1_series_label(b1)}",
             metric=metric,
-        ):
-            plotted_any = True
-            legend_handles.setdefault(
-                label,
-                Line2D(
-                    [0],
-                    [0],
-                    color=color,
-                    linestyle=linestyle,
-                    marker=marker,
-                    linewidth=2.0,
-                ),
-            )
+        )
 
     solver_series_keys = sorted(
         {
@@ -1732,39 +1347,24 @@ def _plot_percent_change_panel(
     for solver_step_schedule, solver_key in solver_series_keys:
         solver_by_budget = {
             budget: row
-            for (
-                row_step_schedule,
-                budget,
-                group_solver_key,
-            ), row in solver_by_group.items()
-            if row_step_schedule == solver_step_schedule
-            and group_solver_key == solver_key
+            for (row_step_schedule, budget, group_solver_key), row
+            in solver_by_group.items()
+            if (row_step_schedule, group_solver_key) == (solver_step_schedule, solver_key)
         }
         color, linestyle, marker, label = _solver_style(solver_key, solver_styles)
         if solver_step_schedule:
             label = f"{label}, {solver_step_schedule}"
-        if _plot_percent_line(
+        plotted_any |= _plot_percent_line(
             ax,
             baseline_by_budget,
             solver_by_budget,
+            legend_handles,
             color=color,
             linestyle=linestyle,
             marker=marker,
             label=label,
             metric=metric,
-        ):
-            plotted_any = True
-            legend_handles.setdefault(
-                label,
-                Line2D(
-                    [0],
-                    [0],
-                    color=color,
-                    linestyle=linestyle,
-                    marker=marker,
-                    linewidth=2.0,
-                ),
-            )
+        )
 
     if plotted_any:
         ax.axhline(0.0, color="0.35", linestyle="--", linewidth=1.0)
@@ -1798,7 +1398,7 @@ def _plot_percent_change(rows, title_prefix, solver_styles, method_styles, b1_ma
                 key_fn=lambda row: (
                     _schedule_key(row),
                     _method_key(row),
-                    _b1_series_key(row),
+                    row.B1_spec,
                     row.B,
                 ),
                 metric=metric,
@@ -1813,7 +1413,7 @@ def _plot_percent_change(rows, title_prefix, solver_styles, method_styles, b1_ma
     label_count = len(
         {
             f"{_method_display_label(_method_key(row))}, "
-            f"{_format_b1_series_label(_b1_series_key(row))}"
+            f"{_format_b1_series_label(row.B1_spec)}"
             for row in _adaptive_rows(rows)
         }
     ) + len(_solver_series_keys(rows))
@@ -1866,37 +1466,21 @@ def _plot_percent_change(rows, title_prefix, solver_styles, method_styles, b1_ma
     return fig
 
 
-def _default_output_path(csv_path: str) -> str:
-    base, _ = os.path.splitext(csv_path)
-    if not base:
-        return csv_path + ".png"
-    return base + ".png"
-
-
-def _suffixed_output_path(csv_path: str, suffix: str) -> str:
-    base, _ = os.path.splitext(csv_path)
-    if not base:
-        base = csv_path
-    return f"{base}_{suffix}.png"
+def _output_path(csv_path: str, suffix: str | None = None) -> str:
+    base = os.path.splitext(csv_path)[0] or csv_path
+    return f"{base}_{suffix}.png" if suffix else f"{base}.png"
 
 
 def _dynamic_layout_pads(fig):
-    visible_axes = [ax for ax in fig.axes if ax.get_visible()]
-    legend_count = len(fig.legends)
+    axis_count = sum(ax.get_visible() for ax in fig.axes)
     legend_entries = sum(len(legend.texts) for legend in fig.legends)
-    axis_count = len(visible_axes)
-
-    pads = dict(LAYOUT_PADS)
-    pads["w_pad"] = max(pads["w_pad"], 0.18)
-    pads["h_pad"] = min(
-        0.52,
-        max(pads["h_pad"], 0.18 + 0.04 * legend_count + 0.01 * legend_entries),
-    )
-    if axis_count > 1:
-        spacing_boost = min(0.08, 0.015 * axis_count)
-        pads["wspace"] = max(pads["wspace"], 0.10 + spacing_boost)
-        pads["hspace"] = max(pads["hspace"], 0.10 + spacing_boost)
-    return pads
+    spacing = 0.10 + min(0.08, 0.015 * axis_count) if axis_count > 1 else None
+    return {
+        "w_pad": 0.18,
+        "h_pad": min(0.52, 0.18 + 0.04 * len(fig.legends) + 0.01 * legend_entries),
+        "wspace": 0.08 if spacing is None else spacing,
+        "hspace": 0.09 if spacing is None else spacing,
+    }
 
 
 def _savefig_pad_inches(fig) -> float:
@@ -1927,6 +1511,8 @@ def main():
         raise ValueError(
             "No valid rows found in CSV after filtering failed/invalid records"
         )
+    if "cumulative_splits" in plot_names:
+        rows = _load_cumulative_allocations(args.csv_file, rows)
 
     solver_styles = _build_solver_style_map(rows)
     mode_styles = _build_mode_style_map(rows)
@@ -1934,45 +1520,8 @@ def main():
     output_paths = []
     for plot_name in plot_names:
         if plot_name == "main":
-            output_path = args.output or _default_output_path(args.csv_file)
             fig = _plot_main(rows, args)
-        elif plot_name == "best_config":
-            output_path = _suffixed_output_path(
-                args.csv_file, PLOT_SPECS["best_config"]["filename_suffix"]
-            )
-            title = (
-                f"{args.title} - best adaptive config by B"
-                if args.title
-                else PLOT_SPECS["best_config"]["title"]
-            )
-            fig = _plot_best_config(rows, _available_metrics(rows)[0], args.std, args.ci, title)
-            if fig is None:
-                continue
-        elif plot_name == "optimal_b1":
-            if not _adaptive_rows(rows):
-                continue
-            output_path = _suffixed_output_path(
-                args.csv_file, PLOT_SPECS[plot_name]["filename_suffix"]
-            )
-            fig = _plot_optimal_b1(rows, args.title, mode_styles)
-        elif plot_name == "optimal_ni":
-            if not _adaptive_rows(rows):
-                continue
-            output_path = _suffixed_output_path(
-                args.csv_file, PLOT_SPECS[plot_name]["filename_suffix"]
-            )
-            fig = _plot_optimal_ni(rows, args.title, mode_styles, args.ci)
-        elif plot_name == "cumulative_splits":
-            if not _adaptive_rows(rows):
-                continue
-            output_path = _suffixed_output_path(
-                args.csv_file, PLOT_SPECS[plot_name]["filename_suffix"]
-            )
-            fig = _plot_cumulative_splits(rows, args.title, mode_styles)
         elif plot_name == "percent_change":
-            output_path = _suffixed_output_path(
-                args.csv_file, PLOT_SPECS[plot_name]["filename_suffix"]
-            )
             fig = _plot_percent_change(
                 rows,
                 args.title,
@@ -1980,9 +1529,19 @@ def main():
                 _build_method_style_map(rows),
                 _build_b1_marker_map(rows),
             )
-        else:
+        elif not _adaptive_rows(rows):
             continue
-
+        elif plot_name == "optimal_b1":
+            fig = _plot_optimal_b1(rows, args.title, mode_styles)
+        else:
+            ci_level = args.ci if plot_name == "optimal_ni" else None
+            fig = _plot_split_levels(rows, args.title, mode_styles, plot_name, ci_level)
+        if plot_name == "main":
+            output_path = args.output or _output_path(args.csv_file)
+        else:
+            output_path = _output_path(
+                args.csv_file, PLOT_SPECS[plot_name]["filename_suffix"]
+            )
         _save_figure(fig, output_path)
         output_paths.append(output_path)
 

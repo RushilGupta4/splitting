@@ -13,5 +13,3 @@ _default.update(
 )
 
 CONFIGS = {"default": _default}
-
-__all__ = ["CONFIGS"]

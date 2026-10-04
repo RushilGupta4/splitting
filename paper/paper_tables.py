@@ -8,29 +8,28 @@ import csv
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+import numpy as np
+
 from paper_plots import (
     LEARNED_C_OPTIMIZER,
     MODELS,
+    PILOT_STAGES,
     SCHEDULES,
+    TIMING_BUDGET,
+    TIMING_METHODS,
+    TIMING_MODELS,
+    TIMING_STAGES,
     ResultRow,
     _expected_uniform_c,
     _load_and_verify_rows,
     _normal_reduction,
+    _row_at_budget,
+    _timing_mean_ci,
+    _timing_overhead,
+    _timing_rows,
 )
 
 LEARNED_C_ALLOCATION = "Learned c"
-
-
-def _has_learned_c(rows: list[ResultRow], budget: int) -> bool:
-    """Whether this cell has a single-branching-factor row to report.
-
-    The mode is opt-in per runner config, so sweeps without it keep exactly the
-    table columns they had before.
-    """
-    return any(
-        row.budget == budget and row.optimizer == LEARNED_C_OPTIMIZER for row in rows
-    )
-
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_OUTPUT_DIR = ROOT / "tables"
 RESULT_TABLE_STEMS = {
@@ -40,6 +39,48 @@ RESULT_TABLE_STEMS = {
     "ddpm_cifar10_hf_mmd": "complete_ddpm",
     "ldm_ffhq_mmd": "complete_ffhq",
 }
+RESULT_FIELDS = [
+    "split_points",
+    "allocation",
+    "B",
+    "metric",
+    "mean_method",
+    "mean_independent",
+    "reduction_percent",
+    "reduction_ci_lower_percent",
+    "reduction_ci_upper_percent",
+    "n_method",
+    "n_independent",
+]
+ORACLE_FIELDS = [
+    "split_points",
+    "B",
+    "oracle_ks_reduction_percent",
+    "oracle_ks_reduction_ci_lower_percent",
+    "oracle_ks_reduction_ci_upper_percent",
+    "learned_ks_reduction_percent",
+    "learned_ks_reduction_ci_lower_percent",
+    "learned_ks_reduction_ci_upper_percent",
+    "learned_to_oracle_reduction_ratio_percent",
+]
+TIMING_TABLE_FIELDS = [
+    "model",
+    "split_points",
+    "allocation",
+    "B",
+    *TIMING_STAGES,
+    "total_seconds",
+    "total_ci_lower_seconds",
+    "total_ci_upper_seconds",
+    "scoring_seconds",
+    "overhead_percent",
+    "overhead_ci_lower_percent",
+    "overhead_ci_upper_percent",
+    "pilot_share_percent",
+    "n",
+]
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -158,50 +199,6 @@ def _reference_sample_rows() -> tuple[list[str], list[dict[str, Any]]]:
     return ["model", "reference_source", "samples"], rows
 
 
-def _row_at_budget(
-    rows: list[ResultRow],
-    budget: int,
-    *,
-    mode: str,
-    uniform_c: float | None = None,
-    optimizer: str | None = None,
-) -> ResultRow | None:
-    """One row for a (budget, mode), optionally narrowed further.
-
-    Adaptive rows share a mode across optimizers -- the free monotone
-    allocation and the single learned branching factor -- so an "adaptive"
-    lookup must name the optimizer or it will see them as duplicates.
-    """
-    matches = [
-        row
-        for row in rows
-        if row.budget == budget
-        and row.mode == mode
-        and (uniform_c is None or row.uniform_c == uniform_c)
-        and (optimizer is None or row.optimizer == optimizer)
-    ]
-    if len(matches) > 1:
-        raise RuntimeError(f"Duplicate {mode} result at B={budget}")
-    return matches[0] if matches else None
-
-
-def _metric_reduction(
-    rows: list[ResultRow],
-    budget: int,
-    *,
-    mode: str,
-    uniform_c: float | None = None,
-    optimizer: str | None = None,
-) -> tuple[float, float, float] | None:
-    independent = _row_at_budget(rows, budget, mode="fixed_N")
-    method = _row_at_budget(
-        rows, budget, mode=mode, uniform_c=uniform_c, optimizer=optimizer
-    )
-    if independent is None or method is None:
-        return None
-    return _normal_reduction(independent, method)
-
-
 def _complete_result_rows(
     model: dict[str, Any],
     all_rows: dict[str, dict[tuple[float, ...], list[ResultRow]]],
@@ -220,46 +217,28 @@ def _complete_result_rows(
         optimizer: str | None = None,
     ) -> dict[str, Any]:
         schedule_rows = rows_by_schedule.get(schedule, [])
-        reduction = _metric_reduction(
-            schedule_rows, budget, mode=mode, uniform_c=uniform_c, optimizer=optimizer
+        independent = _row_at_budget(schedule_rows, budget, "fixed_N")
+        method = _row_at_budget(
+            schedule_rows, budget, mode, optimizer=optimizer, uniform_c=uniform_c
         )
-        if reduction is None:
+        if independent is None or method is None:
             if not debug:
                 raise RuntimeError(
                     f"Missing {allocation} result or fixed_N baseline for "
                     f"{model['directory']}, {len(schedule)} splits, B={budget}"
                 )
-            observed = lower = upper = ""
-            n_method = n_independent = ""
-            mean_method = mean_independent = ""
+            values = [""] * 7
         else:
-            observed, lower, upper = reduction
-            independent = _row_at_budget(schedule_rows, budget, mode="fixed_N")
-            method = _row_at_budget(
-                schedule_rows,
-                budget,
-                mode=mode,
-                uniform_c=uniform_c,
-                optimizer=optimizer,
-            )
-            assert independent is not None and method is not None
-            n_method = method.n
-            n_independent = independent.n
-            mean_method = method.mean
-            mean_independent = independent.mean
-        return {
-            "split_points": len(schedule),
-            "allocation": allocation,
-            "B": budget,
-            "metric": model["metric"],
-            "mean_method": mean_method,
-            "mean_independent": mean_independent,
-            "reduction_percent": observed,
-            "reduction_ci_lower_percent": lower,
-            "reduction_ci_upper_percent": upper,
-            "n_method": n_method,
-            "n_independent": n_independent,
-        }
+            values = [
+                method.mean,
+                independent.mean,
+                *_normal_reduction(independent, method),
+                method.n,
+                independent.n,
+            ]
+        return dict(
+            zip(RESULT_FIELDS, [len(schedule), allocation, budget, model["metric"], *values])
+        )
 
     rows: list[dict[str, Any]] = []
     expected_keys: list[tuple[int, str, int]] = []
@@ -275,7 +254,10 @@ def _complete_result_rows(
                     optimizer="monotone",
                 )
             )
-            if _has_learned_c(rows_by_schedule.get(schedule, []), budget):
+            if any(
+                row.budget == budget and row.optimizer == LEARNED_C_OPTIMIZER
+                for row in rows_by_schedule.get(schedule, [])
+            ):
                 expected_keys.append((len(schedule), LEARNED_C_ALLOCATION, budget))
                 rows.append(
                     result_row(
@@ -329,20 +311,7 @@ def _complete_result_rows(
                 f"Invalid reduction confidence interval for {model['directory']}, "
                 f"{key[0]} splits, B={key[1]}, {row['allocation']}"
             )
-    fieldnames = [
-        "split_points",
-        "allocation",
-        "B",
-        "metric",
-        "mean_method",
-        "mean_independent",
-        "reduction_percent",
-        "reduction_ci_lower_percent",
-        "reduction_ci_upper_percent",
-        "n_method",
-        "n_independent",
-    ]
-    return fieldnames, rows
+    return RESULT_FIELDS, rows
 
 
 def _ou_oracle_rows(
@@ -364,83 +333,106 @@ def _ou_oracle_rows(
                 raise RuntimeError(
                     "OU learned and oracle results have no common budget"
                 )
-            rows.append(
-                {
-                    "split_points": len(schedule),
-                    "B": "",
-                    "oracle_ks_reduction_percent": "",
-                    "oracle_ks_reduction_ci_lower_percent": "",
-                    "oracle_ks_reduction_ci_upper_percent": "",
-                    "learned_ks_reduction_percent": "",
-                    "learned_ks_reduction_ci_lower_percent": "",
-                    "learned_ks_reduction_ci_upper_percent": "",
-                    "learned_to_oracle_reduction_ratio_percent": "",
-                }
-            )
+            rows.append(dict(zip(ORACLE_FIELDS, [len(schedule)] + [""] * 8)))
             continue
         display_budget = max(common_budgets)
-        oracle = _row_at_budget(oracle_rows, display_budget, mode="ou_oracle")
-        shared_independent = _row_at_budget(
-            learned_rows, display_budget, mode="fixed_N"
-        )
-        learned = _row_at_budget(
-            learned_rows,
-            display_budget,
-            mode="adaptive",
-            optimizer="monotone",
-        )
+        oracle = _row_at_budget(oracle_rows, display_budget, "ou_oracle")
+        independent = _row_at_budget(learned_rows, display_budget, "fixed_N")
+        learned = _row_at_budget(learned_rows, display_budget, "adaptive", "monotone")
         if debug:
-            shared_fixed_mean = (
-                "missing"
-                if shared_independent is None
-                else f"{shared_independent.mean:.12g}"
-            )
-            oracle_mean = "missing" if oracle is None else f"{oracle.mean:.12g}"
-            learned_mean = "missing" if learned is None else f"{learned.mean:.12g}"
+            means = [
+                "missing" if row is None else f"{row.mean:.12g}"
+                for row in (independent, oracle, learned)
+            ]
             print(
                 f"[debug] OU KS sanity: splits={len(schedule)}, B={display_budget}, "
-                f"shared fixed_N mean_ks={shared_fixed_mean}, "
-                f"oracle mean_ks={oracle_mean}, learned mean_ks={learned_mean}"
+                f"shared fixed_N mean_ks={means[0]}, "
+                f"oracle mean_ks={means[1]}, learned mean_ks={means[2]}"
             )
-        if any(value is None for value in (shared_independent, oracle, learned)):
-            oracle_reduction = learned_reduction = oracle_captured = ""
-            oracle_lower = oracle_upper = learned_lower = learned_upper = ""
+        if independent is None or oracle is None or learned is None:
+            values = [""] * 7
         else:
-            assert shared_independent is not None and oracle is not None
-            assert learned is not None
-            oracle_reduction, oracle_lower, oracle_upper = _normal_reduction(
-                shared_independent, oracle
-            )
-            learned_reduction, learned_lower, learned_upper = _normal_reduction(
-                shared_independent, learned
-            )
-            oracle_captured = 100.0 * learned_reduction / oracle_reduction
+            oracle_reduction = _normal_reduction(independent, oracle)
+            learned_reduction = _normal_reduction(independent, learned)
+            values = [
+                *oracle_reduction,
+                *learned_reduction,
+                100.0 * learned_reduction[0] / oracle_reduction[0],
+            ]
+        rows.append(dict(zip(ORACLE_FIELDS, [len(schedule), display_budget, *values])))
+    return ORACLE_FIELDS, rows
 
-        rows.append(
-            {
-                "split_points": len(schedule),
-                "B": display_budget,
-                "oracle_ks_reduction_percent": oracle_reduction,
-                "oracle_ks_reduction_ci_lower_percent": oracle_lower,
-                "oracle_ks_reduction_ci_upper_percent": oracle_upper,
-                "learned_ks_reduction_percent": learned_reduction,
-                "learned_ks_reduction_ci_lower_percent": learned_lower,
-                "learned_ks_reduction_ci_upper_percent": learned_upper,
-                "learned_to_oracle_reduction_ratio_percent": oracle_captured,
-            }
-        )
-    fieldnames = [
-        "split_points",
-        "B",
-        "oracle_ks_reduction_percent",
-        "oracle_ks_reduction_ci_lower_percent",
-        "oracle_ks_reduction_ci_upper_percent",
-        "learned_ks_reduction_percent",
-        "learned_ks_reduction_ci_lower_percent",
-        "learned_ks_reduction_ci_upper_percent",
-        "learned_to_oracle_reduction_ratio_percent",
+
+def _timing_table_rows(
+    all_rows: dict[str, dict[tuple[float, ...], list[ResultRow]]],
+    *,
+    debug: bool = False,
+) -> tuple[list[str], list[dict[str, Any]]]:
+    allocations = {"monotone": "Learned", LEARNED_C_OPTIMIZER: LEARNED_C_ALLOCATION}
+    expected = [(None, None)] + [
+        (schedule, optimizer)
+        for schedule, _ in SCHEDULES
+        for _, optimizer in TIMING_METHODS
     ]
-    return fieldnames, rows
+    rows: list[dict[str, Any]] = []
+    for model in TIMING_MODELS:
+        found = {
+            (schedule, optimizer): row
+            for schedule, optimizer, row in _timing_rows(model, all_rows)
+        }
+        independent = found.get((None, None))
+        for schedule, optimizer in expected:
+            allocation = "Independent" if optimizer is None else allocations[optimizer]
+            prefix = [
+                model["title"],
+                "" if schedule is None else len(schedule),
+                allocation,
+                TIMING_BUDGET,
+            ]
+            row = found.get((schedule, optimizer))
+            if row is None:
+                if not debug:
+                    raise RuntimeError(
+                        f"Missing {allocation} timing for {model['directory']}, "
+                        f"{'' if schedule is None else len(schedule)} splits"
+                    )
+                rows.append(dict(zip(TIMING_TABLE_FIELDS, prefix)))
+                continue
+            stages = [
+                float(row.timings[field].mean()) if np.all(np.isfinite(row.timings[field])) else ""
+                for field in TIMING_STAGES
+            ]
+            total = _timing_mean_ci(row.timings["total_seconds"])
+            if not total[1] <= total[0] <= total[2]:
+                raise RuntimeError(
+                    f"Invalid timing confidence interval for {model['directory']}, "
+                    f"{allocation}"
+                )
+            if row is independent or independent is None:
+                overhead = ["", "", ""]
+                pilot_share = ""
+            else:
+                overhead = list(_timing_overhead(independent, row))
+                pilot_share = 100.0 * sum(
+                    float(row.timings[field].mean()) for field in PILOT_STAGES
+                ) / total[0]
+            rows.append(
+                dict(
+                    zip(
+                        TIMING_TABLE_FIELDS,
+                        [
+                            *prefix,
+                            *stages,
+                            *total,
+                            float(row.timings["scoring_seconds"].mean()),
+                            *overhead,
+                            pilot_share,
+                            row.n,
+                        ],
+                    )
+                )
+            )
+    return TIMING_TABLE_FIELDS, rows
 
 
 def main() -> None:
@@ -464,6 +456,9 @@ def main() -> None:
         fieldnames, rows = _complete_result_rows(model, all_rows, debug=args.debug)
         stem = RESULT_TABLE_STEMS[model["directory"]]
         written.append(_write_csv(output_dir, stem, fieldnames, rows))
+
+    fieldnames, rows = _timing_table_rows(all_rows, debug=args.debug)
+    written.append(_write_csv(output_dir, "timing", fieldnames, rows))
 
     print(
         f"Validated publication records; wrote {len(written)} CSV tables "

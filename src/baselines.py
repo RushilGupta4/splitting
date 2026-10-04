@@ -1,81 +1,21 @@
-import logging
-import time
-from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable, Mapping, Sequence
-
-from tqdm import tqdm
+from typing import Any, Mapping, Sequence
 
 from runners.splitting import run_mixture_batch
-from runners.trees import design_cost, design_mixture, mean_split_factors
-from trials import (
-    PHASE2_SEED_OFFSET,
-    collect_sampling_trial_result_futures,
-    iter_run_chunks,
-    make_torch_generator,
-    submit_sampling_trial_result_futures,
-    summarize_sampling_trials,
-    synchronize,
-)
-
-log = logging.getLogger(__name__)
+from runners.trees import design_mixture, mean_split_factors
+from trials import run_phase2
 
 
-def _run_phase2_loop(
-    sample_batch_fn: Callable,
-    *,
-    runner,
-    comparison_mode: str,
-    metric_states: Any,
-    metrics: Sequence[str],
-    n_runs: int,
-    n_parallel: int,
-    seed: int | None,
-    run_offset: int,
-    weights=None,
-):
-    """Run n_runs Phase-2 trials.
+def _run_without_pilot(sample_batch_fn, weights, **phase2):
+    """Phase-2 trials of a method without a pilot: all sampling is "phase 2"."""
 
-    ``sample_batch_fn(chunk_size, generator)`` returns, per run, the list of
-    sample blocks making up that run's estimator; ``weights`` are their mixture
-    weights (``None`` means equal weight per observation).
-    """
-    trial_results: list = [None] * n_runs
-    seconds_per_run: list = [None] * n_runs
-    workers = max(1, min(int(n_parallel), n_runs))
-    futures: list = []
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        for start, end in tqdm(
-            list(iter_run_chunks(n_runs, n_parallel)), desc="Runs", leave=False
-        ):
-            chunk_size = end - start
-            run_seed = (
-                None
-                if seed is None
-                else seed + PHASE2_SEED_OFFSET + run_offset + start
-            )
-            synchronize(runner.device)
-            started = time.perf_counter()
-            samples_by_run = sample_batch_fn(
-                chunk_size, make_torch_generator(run_seed, runner.device)
-            )
-            synchronize(runner.device)
-            seconds_per_run[start:end] = [(time.perf_counter() - started) / chunk_size] * chunk_size
-            submit_sampling_trial_result_futures(
-                executor=executor,
-                futures=futures,
-                run_indices=range(start, end),
-                samples_by_run=samples_by_run,
-                runner=runner,
-                comparison_mode=comparison_mode,
-                metric_states=metric_states,
-                metrics=metrics,
-                weights_by_run=[weights] * len(samples_by_run),
-            )
-        collect_sampling_trial_result_futures(trial_results, futures)
-    for trial, seconds in zip(trial_results, seconds_per_run):
-        # All sampling is "phase 2" for methods without a pilot.
-        trial["phase2_seconds"] = float(seconds)
-        trial["total_seconds"] = float(seconds)
+    def sample_batch(start, end, generator):
+        samples_by_run = sample_batch_fn(end - start, generator)
+        return samples_by_run, [weights] * len(samples_by_run)
+
+    trial_results, seconds = run_phase2(sample_batch, **phase2)
+    for trial, run_seconds in zip(trial_results, seconds):
+        trial["phase2_seconds"] = float(run_seconds)
+        trial["total_seconds"] = float(run_seconds)
     return trial_results
 
 
@@ -90,10 +30,8 @@ def run_solver_baseline_sampling(
     solver_kwargs: Mapping[str, Any] | None = None,
     n_runs: int,
     seed: int | None,
-    debug: bool = False,
     n_parallel: int = 1,
     run_offset: int = 0,
-    return_trial_results: bool = False,
     max_sampling_batch_size=None,
 ):
     solver_kwargs = dict(solver_kwargs or {})
@@ -117,8 +55,9 @@ def run_solver_baseline_sampling(
         )
         return [[sample] for sample in samples]
 
-    trial_results = _run_phase2_loop(
+    return _run_without_pilot(
         sample_batch,
+        None,
         runner=runner,
         comparison_mode=comparison_mode,
         metric_states=comparison_state,
@@ -128,14 +67,6 @@ def run_solver_baseline_sampling(
         seed=seed,
         run_offset=run_offset,
     )
-    result = {
-        "mode": "solver_baseline",
-        "B": int(B),
-        **summarize_sampling_trials(trial_results, metrics),
-    }
-    if return_trial_results:
-        result["trial_results"] = trial_results
-    return result
 
 
 def run_fixed_N_sampling(
@@ -149,16 +80,14 @@ def run_fixed_N_sampling(
     N_i_list: Sequence[float],
     n_runs: int,
     seed: int | None,
-    debug: bool = False,
     n_parallel: int = 1,
     run_offset: int = 0,
-    return_trial_results: bool = False,
     max_sampling_batch_size=None,
     max_paths_in_flight=None,
-    result_mode: str = "fixed_N",
-    include_allocation: bool = False,
     variances=None,
 ):
+    """``fixed_N`` without split points; otherwise a mixture design for the given
+    factors (uniform_c, the OU oracle), whose trials carry the realized ``N_i``."""
     if split_percentages:
         _, split_points = runner.resolve_split_percentages(split_percentages)
     else:
@@ -203,10 +132,9 @@ def run_fixed_N_sampling(
             max_paths_in_flight=max_paths_in_flight,
         )
 
-    weights = None if design is None else [tree.weight for tree in design]
-
-    trial_results = _run_phase2_loop(
+    trial_results = _run_without_pilot(
         sample_batch,
+        None if design is None else [tree.weight for tree in design],
         runner=runner,
         comparison_mode=comparison_mode,
         metric_states=comparison_state,
@@ -215,18 +143,10 @@ def run_fixed_N_sampling(
         n_parallel=n_parallel,
         seed=seed,
         run_offset=run_offset,
-        weights=weights,
     )
-    if include_allocation:
-        realized = mean_split_factors(design) if design else list(split_factors)
+    if design is not None:
+        realized = mean_split_factors(design)
         for trial in trial_results:
             trial["N_i"] = list(realized)
             trial["n0"] = int(n0)
-    result = {
-        "mode": str(result_mode),
-        "B": int(B),
-        **summarize_sampling_trials(trial_results, metrics),
-    }
-    if return_trial_results:
-        result["trial_results"] = trial_results
-    return result
+    return trial_results

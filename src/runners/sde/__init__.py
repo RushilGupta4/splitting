@@ -1,20 +1,7 @@
-from runners.sde.runner import (
-    CoupledDoubleWellLangevinRunner,
-    SDERunner,
-    SDE_RUNNER_CLASSES,
-    SimpleOURunner,
-)
-from runners.sde.ou_oracle import OUOracleRunner
+from runners.sde.ou_oracle.runner import OUOracleRunner
+from runners.sde.runner import CoupledDoubleWellLangevinRunner, SimpleOURunner
 
 SDE_RUNNER_CLASSES = {
-    **SDE_RUNNER_CLASSES,
-    OUOracleRunner.runner_name: OUOracleRunner,
+    cls.runner_name: cls
+    for cls in (SimpleOURunner, CoupledDoubleWellLangevinRunner, OUOracleRunner)
 }
-
-__all__ = [
-    "CoupledDoubleWellLangevinRunner",
-    "SDERunner",
-    "SDE_RUNNER_CLASSES",
-    "SimpleOURunner",
-    "OUOracleRunner",
-]

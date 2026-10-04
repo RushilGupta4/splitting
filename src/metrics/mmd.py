@@ -17,7 +17,6 @@ MMD_DEFAULT_PARAMS: dict[str, Any] = {
     "bandwidth_pairs": 8192,
     "seed": 0,
     "batch_size": 2500,
-    "device": "runner",
     "quantize_images": True,
 }
 
@@ -62,9 +61,6 @@ def _normalize_mmd_params(
             "mmd num_frequencies must be divisible by the number of bandwidths"
         )
     merged["bandwidth_multipliers"] = multipliers
-    merged["device"] = str(merged["device"])
-    if not merged["device"]:
-        raise ValueError("mmd device must be non-empty")
     merged["quantize_images"] = bool(merged["quantize_images"])
     return merged
 
@@ -74,7 +70,6 @@ def _mmd_metric_cache_key(
     *,
     representation: str,
 ) -> dict[str, Any]:
-    params = _normalize_mmd_params(params)
     if representation not in {"quantized_image_target", "float_target"}:
         raise ValueError(f"Unknown mmd representation {representation!r}")
     return {
@@ -93,7 +88,6 @@ def _mmd_metric_cache_key(
 
 
 def _mmd_representation(runner, params: Mapping[str, Any]) -> str:
-    params = _normalize_mmd_params(params)
     is_image = bool(runner.target_spec.get("image_shape"))
     if is_image and params["quantize_images"]:
         return "quantized_image_target"
@@ -139,14 +133,6 @@ def _samples_to_mmd_coordinates(
     if not bool(torch.isfinite(coordinates).all()):
         raise ValueError("mmd samples must all be finite")
     return coordinates.contiguous()
-
-
-def _mmd_device(params: Mapping[str, Any], runner_device: str) -> torch.device:
-    requested = str(params["device"])
-    device = torch.device(runner_device if requested == "runner" else requested)
-    if device.type == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError(f"requested MMD device {device} but CUDA is unavailable")
-    return device
 
 
 def _mmd_quantize(values: torch.Tensor) -> torch.Tensor:
@@ -279,73 +265,61 @@ def _mmd_orthogonal_frequencies(
     return torch.cat(blocks, dim=1)
 
 
+def _projected_batches(samples: torch.Tensor, state: Mapping[str, Any]):
+    batch_size = int(state["params"]["batch_size"])
+    for start in range(0, int(samples.shape[0]), batch_size):
+        yield _mmd_standardize_batch(
+            samples[start : start + batch_size],
+            device=state["device"],
+            mean=state["mean"],
+            scale=state["scale"],
+            quantize=state["representation"] == "quantized_image_target",
+        ) @ state["frequencies"]
+
+
 def _mmd_feature_means(
     sample_parts: Sequence[torch.Tensor],
     state: Mapping[str, Any],
     part_weights: Sequence[float] | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, int]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Feature means of the sample.
 
     With ``part_weights`` the parts are combined as a convex combination of
     their individual means, which is what a mixture estimator needs; without
     them every observation carries the same weight.
     """
+    frequency_count = int(state["frequencies"].shape[1])
+    cosine = torch.zeros(frequency_count, dtype=torch.float64)
+    sine = torch.zeros(frequency_count, dtype=torch.float64)
     if part_weights is not None:
         weights = [float(w) for w in part_weights]
         if len(weights) != len(sample_parts):
             raise ValueError("part_weights must match the number of parts")
-        frequency_count = int(state["frequencies"].shape[1])
-        cosine = torch.zeros(frequency_count, dtype=torch.float64)
-        sine = torch.zeros(frequency_count, dtype=torch.float64)
-        total = 0
         for part, weight in zip(sample_parts, weights):
-            part_cos, part_sin, count = _mmd_feature_means([part], state)
+            part_cos, part_sin = _mmd_feature_means([part], state)
             cosine.add_(part_cos * weight)
             sine.add_(part_sin * weight)
-            total += count
-        return cosine, sine, total
-    frequency_count = int(state["frequencies"].shape[1])
-    cosine_sum = torch.zeros(frequency_count, dtype=torch.float64)
-    sine_sum = torch.zeros(frequency_count, dtype=torch.float64)
+        return cosine, sine
     count = 0
-    batch_size = int(state["params"]["batch_size"])
     for samples in sample_parts:
-        sample_count = int(samples.shape[0])
-        count += sample_count
-        for start in range(0, sample_count, batch_size):
-            batch = _mmd_standardize_batch(
-                samples[start : start + batch_size],
-                device=state["device"],
-                mean=state["mean"],
-                scale=state["scale"],
-                quantize=state["representation"] == "quantized_image_target",
-            )
-            projected = batch @ state["frequencies"]
-            cosine_sum.add_(torch.cos(projected).sum(dim=0, dtype=torch.float64).cpu())
-            sine_sum.add_(torch.sin(projected).sum(dim=0, dtype=torch.float64).cpu())
+        count += int(samples.shape[0])
+        for projected in _projected_batches(samples, state):
+            cosine.add_(torch.cos(projected).sum(dim=0, dtype=torch.float64).cpu())
+            sine.add_(torch.sin(projected).sum(dim=0, dtype=torch.float64).cpu())
     if count == 0:
-        return cosine_sum, sine_sum, 0
-    return cosine_sum.div_(count), sine_sum.div_(count), count
+        return cosine, sine
+    return cosine.div_(count), sine.div_(count)
 
 
 @torch.inference_mode()
 def mmd_features(samples, state: Mapping[str, Any]) -> torch.Tensor:
     """Random Fourier features ``phi(x)`` of the metric, one row per sample, with ``|phi(x)| = 1``."""
-    frequencies = state["frequencies"]
-    count = int(frequencies.shape[1])
     samples = _samples_to_mmd_coordinates(samples, expected_dimension=int(state["dimension"]))
-    batch_size = int(state["params"]["batch_size"])
-    rows = []
-    for start in range(0, int(samples.shape[0]), batch_size):
-        projected = _mmd_standardize_batch(
-            samples[start : start + batch_size],
-            device=state["device"],
-            mean=state["mean"],
-            scale=state["scale"],
-            quantize=state["representation"] == "quantized_image_target",
-        ) @ frequencies
-        rows.append(torch.cat([torch.cos(projected), torch.sin(projected)], dim=1))
-    return torch.cat(rows, dim=0).div_(math.sqrt(count))
+    rows = [
+        torch.cat([torch.cos(projected), torch.sin(projected)], dim=1)
+        for projected in _projected_batches(samples, state)
+    ]
+    return torch.cat(rows, dim=0).div_(math.sqrt(int(state["frequencies"].shape[1])))
 
 
 def _prepare_mmd_state(
@@ -355,7 +329,7 @@ def _prepare_mmd_state(
     reference_samples,
     params: Mapping[str, Any],
 ) -> dict[str, Any]:
-    params = _normalize_mmd_params(params)
+    """``params`` are normalized mmd metric_params."""
     if comparison_mode == "true_dist":
         raise ValueError("mmd requires a comparison mode backed by reference samples")
     if reference_samples is None:
@@ -370,7 +344,7 @@ def _prepare_mmd_state(
         raise ValueError("mmd requires at least two reference observations")
     representation = _mmd_representation(runner, params)
     quantize = representation == "quantized_image_target"
-    device = _mmd_device(params, runner.device)
+    device = torch.device(runner.device)
     mean, scale = _mmd_reference_standardization(
         reference,
         batch_size=int(params["batch_size"]),
@@ -419,11 +393,7 @@ def _prepare_mmd_state(
         "lock": Lock(),
     }
     with torch.inference_mode():
-        reference_cosine, reference_sine, measured_count = _mmd_feature_means(
-            [reference], state
-        )
-    if measured_count != reference_count:
-        raise RuntimeError("mmd reference feature count mismatch")
+        reference_cosine, reference_sine = _mmd_feature_means([reference], state)
     state["reference_cosine_mean"] = reference_cosine
     state["reference_sine_mean"] = reference_sine
     return state
@@ -463,11 +433,9 @@ def _compute_mmd_metric(parts, state, *, part_weights=None):
         return float("nan"), payload
 
     with state["lock"], torch.inference_mode():
-        cosine_mean, sine_mean, measured_count = _mmd_feature_means(
+        cosine_mean, sine_mean = _mmd_feature_means(
             sample_parts, state, part_weights=part_weights
         )
-    if measured_count != count:
-        raise RuntimeError("mmd generated feature count mismatch")
     cosine_delta = cosine_mean - state["reference_cosine_mean"]
     sine_delta = sine_mean - state["reference_sine_mean"]
     mmd_squared = float((cosine_delta.square() + sine_delta.square()).mean().item())

@@ -1,10 +1,8 @@
 from runners.common_configs import (
     OPTIMIZATION_MODES_WITH_LEARNED_C,
-    crossfit_q_config,
     mmd_sibling_config,
     split_schedules,
 )
-from runners.edm.configs import _DPMPP_2S_PARAMS, _EDM_PARAMS
 
 _SAMPLING_DEFAULTS = {
     "sigma_min": 0.002,
@@ -37,16 +35,10 @@ _SAMPLING_BASE = {
         },
     },
     "sampling_configs": [
-        *[
-            {
-                "sampler": "edm_stochastic",
-                "sampler_params": {
-                    **_EDM_PARAMS,
-                    "S_churn": i,
-                },
-            }
-            for i in [40]
-        ],
+        {
+            "sampler": "edm_stochastic",
+            "sampler_params": {"S_churn": 40, "S_min": 0.0, "S_max": 80.0, "S_noise": 1.0},
+        },
     ],
     "B_list": [
         100_000,
@@ -69,7 +61,6 @@ _SAMPLING_BASE = {
 
 _DEFAULT_CONFIG = {
     **_SAMPLING_BASE,
-    **crossfit_q_config(),
     "description": "Adaptive splitting vs deterministic EDM baselines on EDM (2D GMM)",
     "comparison_mode": "true_samples",
     "reference_generation_config": {

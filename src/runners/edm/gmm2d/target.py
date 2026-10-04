@@ -19,21 +19,12 @@ def get_target_distribution_spec():
     return copy.deepcopy(TARGET_DISTRIBUTION)
 
 
-def get_target_distribution_tensors(device=None, dtype=torch.float32):
-    spec = get_target_distribution_spec()
-    return {
-        "name": spec["name"],
-        "weights": torch.tensor(spec["weights"], device=device, dtype=dtype),
-        "means": torch.tensor(spec["means"], device=device, dtype=dtype),
-        "covariances": torch.tensor(spec["covariances"], device=device, dtype=dtype),
-    }
-
-
 def compute_target_stats(device=None, dtype=torch.float32):
-    spec = get_target_distribution_tensors(device=device, dtype=dtype)
-    weights = spec["weights"]
-    means = spec["means"]
-    covariances = spec["covariances"]
+    weights = torch.tensor(TARGET_DISTRIBUTION["weights"], device=device, dtype=dtype)
+    means = torch.tensor(TARGET_DISTRIBUTION["means"], device=device, dtype=dtype)
+    covariances = torch.tensor(
+        TARGET_DISTRIBUTION["covariances"], device=device, dtype=dtype
+    )
 
     mean = (weights[:, None] * means).sum(dim=0)
     second_moment = (
@@ -89,31 +80,3 @@ def denormalize(samples, data_mean, data_std):
     mean = _coerce_stats_tensor(data_mean, samples)
     std = _coerce_stats_tensor(data_std, samples)
     return samples * std + mean
-
-
-def get_checkpoint_target_spec(checkpoint):
-    return checkpoint.get("target_spec", get_target_distribution_spec())
-
-
-def get_checkpoint_normalization_stats(checkpoint, device=None, dtype=torch.float32):
-    data_mean = checkpoint.get("data_mean")
-    data_std = checkpoint.get("data_std")
-    if data_mean is None or data_std is None:
-        mean, std, _ = compute_target_stats(device=device, dtype=dtype)
-        return mean, std
-    return (
-        torch.as_tensor(data_mean, device=device, dtype=dtype),
-        torch.as_tensor(data_std, device=device, dtype=dtype),
-    )
-
-
-def infer_input_dim_from_checkpoint(checkpoint):
-    if "data_mean" in checkpoint and checkpoint["data_mean"] is not None:
-        return int(torch.as_tensor(checkpoint["data_mean"]).numel())
-
-    target_spec = get_checkpoint_target_spec(checkpoint)
-    means = target_spec.get("means")
-    if means is not None:
-        return len(means[0])
-
-    return 2

@@ -32,8 +32,6 @@ from typing import Sequence
 import numpy as np
 from scipy.optimize import linprog
 
-RHO_BOUND = 2.0 / (math.e * math.log(2.0))
-
 
 class InsufficientTreeBudgetError(ValueError):
     """Raised when the budget cannot afford one root of the cheapest tree."""

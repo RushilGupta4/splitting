@@ -1,9 +1,7 @@
 import numpy as np
 
-_BASE_SPLIT_SCHDULES = []
 SPLIT_COUNTS = [9, 19, 39]
-OPTIMIZATION_MODES = ["monotone"]  # monotone_cvar95 is also option
-OPTIMIZATION_MODES_WITH_LEARNED_C = ["monotone", "learned_c"]  # what we sweep
+OPTIMIZATION_MODES_WITH_LEARNED_C = ["monotone", "learned_c"]
 
 # N_i = c everywhere
 UNIFORM_C_BY_SPLIT_COUNT = {
@@ -23,9 +21,7 @@ def split_schedules(counts=SPLIT_COUNTS) -> list[list[float]]:
     ``j`` splits give ``[j/(j+1), ..., 1/(j+1)]`` -- fractions of the remaining
     steps, strictly decreasing as ``validate_split_percentages`` requires.
     """
-    return _BASE_SPLIT_SCHDULES + [
-        np.round(np.arange(j, 0, -1) / (j + 1), 2).tolist() for j in counts
-    ]
+    return [np.round(np.arange(j, 0, -1) / (j + 1), 2).tolist() for j in counts]
 
 
 KS_PHASE1_KEYS = frozenset(
@@ -44,38 +40,3 @@ def mmd_sibling_config(cfg: dict, **phase1) -> dict:
     out = {key: value for key, value in cfg.items() if key not in KS_PHASE1_KEYS}
     out["phase1"] = {"estimator": "mmd_sibling", **phase1}
     return out
-
-
-def crossfit_q_config(
-    num_queries: int | None = None,
-    losses=None,
-    folds: int | None = None,
-) -> dict:
-    """Return a config fragment for the phase-1 CrossFit-Q estimator.
-
-    Query and MLP defaults live in adaptive.py; pass values only for
-    runner-specific sweep overrides.
-    """
-    cfg: dict = {}
-    if num_queries is not None:
-        cfg["query_params"] = {"num_queries": int(num_queries)}
-    if losses is not None:
-        if isinstance(losses, str):
-            losses = [losses]
-        cfg["crossfit_q_mlp_losses"] = [str(loss) for loss in losses]
-    if folds is not None:
-        cfg["crossfit_q_folds"] = int(folds)
-    return cfg
-
-
-__all__ = [
-    "KS_PHASE1_KEYS",
-    "OPTIMIZATION_MODES",
-    "OPTIMIZATION_MODES_WITH_LEARNED_C",
-    "SPLIT_COUNTS",
-    "UNIFORM_C_BY_SPLIT_COUNT",
-    "crossfit_q_config",
-    "mmd_sibling_config",
-    "split_schedules",
-    "uniform_c_values",
-]

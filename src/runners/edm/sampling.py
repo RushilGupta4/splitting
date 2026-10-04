@@ -70,30 +70,6 @@ def _schedule_segment_indices(sigma_a, sigma_b, schedule: EDMSchedule):
     return start_idx, end_idx
 
 
-def _validate_churn_args(
-    churn_rate: float,
-    churn_min_noise_level: float,
-    churn_max_noise_level: float,
-    noise_level_inflation_factor: float,
-):
-    churn_rate = float(churn_rate)
-    churn_min_noise_level = float(churn_min_noise_level)
-    churn_max_noise_level = float(churn_max_noise_level)
-    noise_level_inflation_factor = float(noise_level_inflation_factor)
-    if churn_rate < 0.0:
-        raise ValueError("churn_rate must be >= 0")
-    if noise_level_inflation_factor < 0.0:
-        raise ValueError("noise_level_inflation_factor must be >= 0")
-    if churn_min_noise_level > churn_max_noise_level:
-        raise ValueError("churn_min_noise_level must be <= churn_max_noise_level")
-    return (
-        churn_rate,
-        churn_min_noise_level,
-        churn_max_noise_level,
-        noise_level_inflation_factor,
-    )
-
-
 def _apply_stochastic_churn(
     x,
     sigma_curr: float,
@@ -123,6 +99,18 @@ def _apply_stochastic_churn(
     return x + noise * noise_level_inflation_factor * noise_scale, sigma_hat
 
 
+def _run_steps(x, sigma_a, sigma_b, schedule: EDMSchedule, step, progress_callback):
+    if x.shape[0] == 0:
+        return x
+    start_idx, end_idx = _schedule_segment_indices(sigma_a, sigma_b, schedule)
+    with torch.inference_mode():
+        for idx in range(start_idx, end_idx):
+            x = step(x, schedule.sigmas_cpu[idx], schedule.sigmas_cpu[idx + 1])
+            if progress_callback is not None:
+                progress_callback(1)
+    return x
+
+
 def edm_sample_segment(
     model,
     x,
@@ -137,44 +125,27 @@ def edm_sample_segment(
     generator=None,
     progress_callback=None,
 ):
-    S_churn, S_min, S_max, S_noise = _validate_churn_args(
-        S_churn,
-        S_min,
-        S_max,
-        S_noise,
-    )
-    if x.shape[0] == 0:
-        return x
-    start_idx, end_idx = _schedule_segment_indices(sigma_a, sigma_b, schedule)
-    if start_idx == end_idx:
-        return x
-    with torch.inference_mode():
-        for idx in range(start_idx, end_idx):
-            sigma_curr = schedule.sigmas_cpu[idx]
-            sigma_next = schedule.sigmas_cpu[idx + 1]
-            x_hat, sigma_hat = _apply_stochastic_churn(
-                x,
-                sigma_curr,
-                schedule,
-                churn_rate=S_churn,
-                churn_min_noise_level=S_min,
-                churn_max_noise_level=S_max,
-                noise_level_inflation_factor=S_noise,
-                generator=generator,
-            )
+    def step(x, sigma_curr, sigma_next):
+        x_hat, sigma_hat = _apply_stochastic_churn(
+            x,
+            sigma_curr,
+            schedule,
+            churn_rate=S_churn,
+            churn_min_noise_level=S_min,
+            churn_max_noise_level=S_max,
+            noise_level_inflation_factor=S_noise,
+            generator=generator,
+        )
+        denoised = _denoise(model, x_hat, sigma_hat)
+        d_curr = (x_hat - denoised) / sigma_hat
+        x_euler = x_hat + (sigma_next - sigma_hat) * d_curr
+        if sigma_next <= 0.0:
+            return x_euler
+        denoised_next = _denoise(model, x_euler, sigma_next)
+        d_next = (x_euler - denoised_next) / sigma_next
+        return x_hat + 0.5 * (sigma_next - sigma_hat) * (d_curr + d_next)
 
-            denoised = _denoise(model, x_hat, sigma_hat)
-            d_curr = (x_hat - denoised) / sigma_hat
-            x_euler = x_hat + (sigma_next - sigma_hat) * d_curr
-            if sigma_next <= 0.0:
-                x = x_euler
-            else:
-                denoised_next = _denoise(model, x_euler, sigma_next)
-                d_next = (x_euler - denoised_next) / sigma_next
-                x = x_hat + 0.5 * (sigma_next - sigma_hat) * (d_curr + d_next)
-            if progress_callback is not None:
-                progress_callback(1)
-    return x
+    return _run_steps(x, sigma_a, sigma_b, schedule, step, progress_callback)
 
 
 def dpmpp_2s_sample_segment(
@@ -191,53 +162,28 @@ def dpmpp_2s_sample_segment(
     generator=None,
     progress_callback=None,
 ):
-    (
-        stochastic_churn_rate,
-        churn_min_noise_level,
-        churn_max_noise_level,
-        noise_level_inflation_factor,
-    ) = _validate_churn_args(
-        stochastic_churn_rate,
-        churn_min_noise_level,
-        churn_max_noise_level,
-        noise_level_inflation_factor,
-    )
-    if x.shape[0] == 0:
-        return x
-    start_idx, end_idx = _schedule_segment_indices(sigma_a, sigma_b, schedule)
-    if start_idx == end_idx:
-        return x
-    with torch.inference_mode():
-        for idx in range(start_idx, end_idx):
-            sigma_curr = schedule.sigmas_cpu[idx]
-            sigma_next = schedule.sigmas_cpu[idx + 1]
-            x_hat, sigma_hat = _apply_stochastic_churn(
-                x,
-                sigma_curr,
-                schedule,
-                churn_rate=stochastic_churn_rate,
-                churn_min_noise_level=churn_min_noise_level,
-                churn_max_noise_level=churn_max_noise_level,
-                noise_level_inflation_factor=noise_level_inflation_factor,
-                generator=generator,
-            )
+    def step(x, sigma_curr, sigma_next):
+        x_hat, sigma_hat = _apply_stochastic_churn(
+            x,
+            sigma_curr,
+            schedule,
+            churn_rate=stochastic_churn_rate,
+            churn_min_noise_level=churn_min_noise_level,
+            churn_max_noise_level=churn_max_noise_level,
+            noise_level_inflation_factor=noise_level_inflation_factor,
+            generator=generator,
+        )
+        denoised = _denoise(model, x_hat, sigma_hat)
+        if sigma_next <= 0.0:
+            return denoised
+        sigma_mid = (sigma_hat * sigma_next) ** 0.5
+        mid_over_current = sigma_mid / sigma_hat
+        x_mid = mid_over_current * x_hat + (1.0 - mid_over_current) * denoised
+        denoised_mid = _denoise(model, x_mid, sigma_mid)
+        next_over_current = sigma_next / sigma_hat
+        return next_over_current * x_hat + (1.0 - next_over_current) * denoised_mid
 
-            denoised = _denoise(model, x_hat, sigma_hat)
-            if sigma_next <= 0.0:
-                x = denoised
-                if progress_callback is not None:
-                    progress_callback(1)
-                continue
-
-            sigma_mid = (sigma_hat * sigma_next) ** 0.5
-            mid_over_current = sigma_mid / sigma_hat
-            x_mid = mid_over_current * x_hat + (1.0 - mid_over_current) * denoised
-            denoised_mid = _denoise(model, x_mid, sigma_mid)
-            next_over_current = sigma_next / sigma_hat
-            x = next_over_current * x_hat + (1.0 - next_over_current) * denoised_mid
-            if progress_callback is not None:
-                progress_callback(1)
-    return x
+    return _run_steps(x, sigma_a, sigma_b, schedule, step, progress_callback)
 
 
 def sde_euler_maruyama_sample_segment(
@@ -250,26 +196,17 @@ def sde_euler_maruyama_sample_segment(
     generator=None,
     progress_callback=None,
 ):
-    if x.shape[0] == 0:
-        return x
-    start_idx, end_idx = _schedule_segment_indices(sigma_a, sigma_b, schedule)
-    if start_idx == end_idx:
-        return x
-    with torch.inference_mode():
-        for idx in range(start_idx, end_idx):
-            sigma_curr = schedule.sigmas_cpu[idx]
-            sigma_next = schedule.sigmas_cpu[idx + 1]
-            delta_var = sigma_curr ** 2 - sigma_next ** 2
-            delta_var_tensor = torch.as_tensor(
-                max(delta_var, 0.0), device=x.device, dtype=x.dtype
-            )
-            denoised = _denoise(model, x, sigma_curr)
-            score = (denoised - x) / (sigma_curr ** 2)
-            noise = torch.randn(x.shape, device=x.device, dtype=x.dtype, generator=generator)
-            x = x + delta_var * score + torch.sqrt(delta_var_tensor) * noise
-            if progress_callback is not None:
-                progress_callback(1)
-    return x
+    def step(x, sigma_curr, sigma_next):
+        delta_var = sigma_curr ** 2 - sigma_next ** 2
+        delta_var_tensor = torch.as_tensor(
+            max(delta_var, 0.0), device=x.device, dtype=x.dtype
+        )
+        denoised = _denoise(model, x, sigma_curr)
+        score = (denoised - x) / (sigma_curr ** 2)
+        noise = torch.randn(x.shape, device=x.device, dtype=x.dtype, generator=generator)
+        return x + delta_var * score + torch.sqrt(delta_var_tensor) * noise
+
+    return _run_steps(x, sigma_a, sigma_b, schedule, step, progress_callback)
 
 
 def resolve_split_percentages(schedule: EDMSchedule, percentages: Sequence[float]):

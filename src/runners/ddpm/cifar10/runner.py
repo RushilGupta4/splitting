@@ -5,7 +5,7 @@ import logging
 import torch
 
 from runners.base import ComparisonModeSpec
-from runners.ddpm.runner import DDPMRunner, resolved_hf_revision
+from runners.ddpm.runner import DDPMRunner, resolved_hf_revision, stable_scheduler_config
 
 log = logging.getLogger(__name__)
 
@@ -14,40 +14,6 @@ IMAGE_SHAPE = (3, 32, 32)
 INPUT_DIM = 3 * 32 * 32
 CIFAR10_DATASET_REFERENCE_MODE = "cifar10_dataset_samples"
 CIFAR10_DATASET_TRANSFORM = "to_tensor_chw_flat_0_1_v1"
-
-
-def _json_safe(value):
-    if isinstance(value, dict):
-        return {str(k): _json_safe(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_json_safe(v) for v in value]
-    if hasattr(value, "tolist"):
-        return value.tolist()
-    if isinstance(value, (int, float, str, bool)) or value is None:
-        return value
-    return str(value)
-
-
-def _stable_scheduler_config(config):
-    behavior_keys = {
-        "beta_start",
-        "beta_end",
-        "beta_schedule",
-        "trained_betas",
-        "num_train_timesteps",
-        "variance_type",
-        "clip_sample",
-        "clip_sample_range",
-        "prediction_type",
-        "thresholding",
-        "dynamic_thresholding_ratio",
-        "sample_max_value",
-        "timestep_spacing",
-        "steps_offset",
-        "rescale_betas_zero_snr",
-    }
-    raw = dict(config)
-    return _json_safe({key: raw.get(key) for key in sorted(behavior_keys) if key in raw})
 
 
 class _FlatCIFAR10UNet(torch.nn.Module):
@@ -79,39 +45,16 @@ class DDPMCIFAR10HFRunner(DDPMRunner):
     pixel_shape = IMAGE_SHAPE
     supported_samplers = ("ddpm",)
     supported_solvers = ("ddim",)
+    reference_method = "hf_ddpm_scheduler"
     comparison_mode_specs = (
+        ComparisonModeSpec(name="true_samples", requires_reference_cache=True),
         ComparisonModeSpec(
-            name="true_samples",
-            requires_reference_cache=True,
-            reference_uses_sampling_config=False,
-            description="Two-sample KS against configured google/ddpm-cifar10-32 samples.",
-        ),
-        ComparisonModeSpec(
-            name=CIFAR10_DATASET_REFERENCE_MODE,
-            requires_reference_cache=True,
-            reference_uses_sampling_config=False,
-            description="Two-sample KS against true torchvision CIFAR-10 samples.",
+            name=CIFAR10_DATASET_REFERENCE_MODE, requires_reference_cache=True
         ),
     )
 
     @classmethod
-    def add_train_args(cls, parser) -> None:
-        del parser
-
-    @classmethod
-    def train_from_args(cls, args) -> None:
-        del args
-        raise RuntimeError(f"{cls.runner_name} uses a fixed Hugging Face checkpoint")
-
-    @classmethod
-    def load_model_and_stats(
-        cls,
-        checkpoint_path: str,
-        device: str,
-        *,
-        no_compile: bool = False,
-    ):
-        del checkpoint_path
+    def load_model(cls, device: str, *, no_compile: bool = False):
         from diffusers import DDPMPipeline
 
         pipe = DDPMPipeline.from_pretrained(HF_MODEL_ID)
@@ -134,13 +77,11 @@ class DDPMCIFAR10HFRunner(DDPMRunner):
             # The DDPM posterior variance instead of the checkpoint's fixed_large, which
             # adds noise after the last (t > 0) step of a trailing schedule.
             "scheduler_config": {
-                **_stable_scheduler_config(pipe.scheduler.config),
+                **stable_scheduler_config(pipe.scheduler.config),
                 "variance_type": "fixed_small",
             },
         }
-        data_mean = torch.zeros(INPUT_DIM, device=device, dtype=torch.float32)
-        data_std = torch.ones(INPUT_DIM, device=device, dtype=torch.float32)
-        return model, target_spec, data_mean, data_std
+        return model, target_spec
 
     def to_pixels(self, samples, *, batch_size=None):
         return torch.as_tensor(samples, dtype=torch.float32)
@@ -167,61 +108,43 @@ class DDPMCIFAR10HFRunner(DDPMRunner):
         return ((values.to(dtype=torch.float32) + 1.0) * 0.5).clamp(0.0, 1.0)
 
     def normalize_reference_generation_config(self, comparison_mode: str, reference_generation_config):
-        self._validate_mode(comparison_mode)
+        if comparison_mode != CIFAR10_DATASET_REFERENCE_MODE:
+            return super().normalize_reference_generation_config(
+                comparison_mode, reference_generation_config
+            )
         if reference_generation_config is None:
             raise ValueError(
                 f"reference_generation_config is required for comparison_mode={comparison_mode!r}"
             )
         cfg = dict(reference_generation_config)
-        if comparison_mode == CIFAR10_DATASET_REFERENCE_MODE:
-            required = {"method", "split"}
-            missing = sorted(required - set(cfg))
-            if missing:
-                raise ValueError(f"reference_generation_config missing required keys: {missing}")
-            allowed = {"method", "split", "data_root", "download", "seed", "selection", "transform"}
-            unknown = set(cfg) - allowed
-            if unknown:
-                raise ValueError(f"Unknown reference_generation_config keys: {sorted(unknown)}")
-            if str(cfg["method"]) != "torchvision_cifar10":
-                raise ValueError("CIFAR-10 dataset reference_generation_config must set method='torchvision_cifar10'")
-            split = str(cfg["split"])
-            if split not in {"train", "test"}:
-                raise ValueError("CIFAR-10 dataset split must be 'train' or 'test'")
-            selection = str(cfg.get("selection", "seeded_without_replacement"))
-            if selection != "seeded_without_replacement":
-                raise ValueError("CIFAR-10 dataset selection must be 'seeded_without_replacement'")
-            transform = str(cfg.get("transform", CIFAR10_DATASET_TRANSFORM))
-            if transform != CIFAR10_DATASET_TRANSFORM:
-                raise ValueError(f"Unknown CIFAR-10 dataset transform {transform!r}")
-            return {
-                "method": "torchvision_cifar10",
-                "split": split,
-                "data_root": str(cfg.get("data_root", "data")),
-                "download": bool(cfg.get("download", True)),
-                "seed": int(cfg.get("seed", 0)),
-                "selection": selection,
-                "transform": transform,
-            }
-
-        normalized = dict(
-            self._normalize_ddpm_sample_reference_config(
-                cfg,
-                method="hf_ddpm_scheduler",
-            )
-        )
-        scheduler_config = self.target_spec.get("scheduler_config") or {}
-        scheduler_T = scheduler_config.get("num_train_timesteps")
-        if scheduler_T is None:
-            raise ValueError(
-                "Loaded CIFAR-10 DDPM target is missing scheduler "
-                "num_train_timesteps"
-            )
-        if normalized["T"] != int(scheduler_T):
-            raise ValueError(
-                "CIFAR-10 DDPM reference T must match the loaded scheduler "
-                f"({int(scheduler_T)}), got {normalized['T']}"
-            )
-        return normalized
+        required = {"method", "split"}
+        missing = sorted(required - set(cfg))
+        if missing:
+            raise ValueError(f"reference_generation_config missing required keys: {missing}")
+        allowed = {"method", "split", "data_root", "download", "seed", "selection", "transform"}
+        unknown = set(cfg) - allowed
+        if unknown:
+            raise ValueError(f"Unknown reference_generation_config keys: {sorted(unknown)}")
+        if str(cfg["method"]) != "torchvision_cifar10":
+            raise ValueError("CIFAR-10 dataset reference_generation_config must set method='torchvision_cifar10'")
+        split = str(cfg["split"])
+        if split not in {"train", "test"}:
+            raise ValueError("CIFAR-10 dataset split must be 'train' or 'test'")
+        selection = str(cfg.get("selection", "seeded_without_replacement"))
+        if selection != "seeded_without_replacement":
+            raise ValueError("CIFAR-10 dataset selection must be 'seeded_without_replacement'")
+        transform = str(cfg.get("transform", CIFAR10_DATASET_TRANSFORM))
+        if transform != CIFAR10_DATASET_TRANSFORM:
+            raise ValueError(f"Unknown CIFAR-10 dataset transform {transform!r}")
+        return {
+            "method": "torchvision_cifar10",
+            "split": split,
+            "data_root": str(cfg.get("data_root", "data")),
+            "download": bool(cfg.get("download", True)),
+            "seed": int(cfg.get("seed", 0)),
+            "selection": selection,
+            "transform": transform,
+        }
 
     def generate_reference_samples(
         self,
@@ -233,40 +156,36 @@ class DDPMCIFAR10HFRunner(DDPMRunner):
         generator=None,
         progress=None,
     ) -> torch.Tensor:
-        self._validate_mode(comparison_mode)
+        if comparison_mode != CIFAR10_DATASET_REFERENCE_MODE:
+            return super().generate_reference_samples(
+                comparison_mode=comparison_mode,
+                reference_generation_config=reference_generation_config,
+                num_samples=num_samples,
+                batch_size=batch_size,
+                generator=generator,
+                progress=progress,
+            )
         ref_cfg = self.normalize_reference_generation_config(comparison_mode, reference_generation_config)
         if batch_size < 1:
             raise ValueError("batch_size must be at least 1")
-        if comparison_mode == CIFAR10_DATASET_REFERENCE_MODE:
-            from torchvision.datasets import CIFAR10
+        from torchvision.datasets import CIFAR10
 
-            dataset = CIFAR10(
-                root=str(ref_cfg["data_root"]),
-                train=str(ref_cfg["split"]) == "train",
-                download=bool(ref_cfg["download"]),
-            )
-            if int(num_samples) > len(dataset):
-                raise ValueError(
-                    f"Requested {num_samples} CIFAR-10 reference samples from "
-                    f"split={ref_cfg['split']!r}, but only {len(dataset)} are available"
-                )
-            generator_cpu = torch.Generator(device="cpu")
-            generator_cpu.manual_seed(int(ref_cfg["seed"]))
-            indices = torch.randperm(len(dataset), generator=generator_cpu)[: int(num_samples)]
-            data = torch.as_tensor(dataset.data[indices], dtype=torch.float32).div(255.0)
-            data = data.permute(0, 3, 1, 2).reshape(int(num_samples), INPUT_DIM).contiguous()
-            if progress is not None:
-                for _ in range(0, int(num_samples), int(batch_size)):
-                    progress["batch"](1)
-            return data
-
-        return self._generate_ddpm_model_reference(
-            ref_cfg,
-            num_samples=num_samples,
-            batch_size=batch_size,
-            generator=generator,
-            progress=progress,
+        dataset = CIFAR10(
+            root=str(ref_cfg["data_root"]),
+            train=str(ref_cfg["split"]) == "train",
+            download=bool(ref_cfg["download"]),
         )
-
-
-__all__ = ["DDPMCIFAR10HFRunner"]
+        if int(num_samples) > len(dataset):
+            raise ValueError(
+                f"Requested {num_samples} CIFAR-10 reference samples from "
+                f"split={ref_cfg['split']!r}, but only {len(dataset)} are available"
+            )
+        generator_cpu = torch.Generator(device="cpu")
+        generator_cpu.manual_seed(int(ref_cfg["seed"]))
+        indices = torch.randperm(len(dataset), generator=generator_cpu)[: int(num_samples)]
+        data = torch.as_tensor(dataset.data[indices], dtype=torch.float32).div(255.0)
+        data = data.permute(0, 3, 1, 2).reshape(int(num_samples), INPUT_DIM).contiguous()
+        if progress is not None:
+            for _ in range(0, int(num_samples), int(batch_size)):
+                progress["batch"](1)
+        return data

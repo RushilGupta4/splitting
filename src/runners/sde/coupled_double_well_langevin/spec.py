@@ -27,10 +27,6 @@ def diffusion(t: float, x: torch.Tensor) -> torch.Tensor:
     return torch.full_like(x, math.sqrt(2.0 / INVERSE_TEMPERATURE))
 
 
-def diffusion_derivative(t: float, x: torch.Tensor) -> torch.Tensor:
-    del t
-    return torch.zeros_like(x)
-
 
 def target_spec(terminal_time: float, dimension: int) -> dict:
     return {
@@ -58,17 +54,9 @@ def target_spec(terminal_time: float, dimension: int) -> dict:
 
 
 SPEC = SDECase(
-    name="coupled_double_well_langevin",
-    label="Coupled double-well overdamped Langevin",
     initial_mean=INITIAL_MEAN,
     initial_variance=INITIAL_VARIANCE,
     drift=drift,
     diffusion=diffusion,
-    diffusion_derivative=diffusion_derivative,
     target_spec_factory=target_spec,
-    diffusion_structure="diagonal",
-    description=(
-        "Overdamped Langevin dynamics in a quartic double-well potential "
-        "with periodic nearest-neighbor coupling."
-    ),
 )

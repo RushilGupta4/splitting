@@ -15,7 +15,6 @@ from tqdm import tqdm
 
 from adaptive import (
     CROSSFIT_Q_DEFAULT_FOLDS,
-    CROSSFIT_Q_DEFAULT_MLP_RUN_PARALLELISM,
     SUPPORTED_OPTIMIZATION_MODES,
     _crossfit_q_normalize_mlp_params,
     _crossfit_q_normalize_mlp_run_parallelism,
@@ -25,7 +24,6 @@ from adaptive import (
 from baselines import run_fixed_N_sampling, run_solver_baseline_sampling
 from metrics import (
     MMD_SPACE_METRICS,
-    aggregate_cached_metric_rows,
     is_mmd,
     metric_spaces,
     mmd_space,
@@ -33,11 +31,12 @@ from metrics import (
     normalize_metric_params,
     normalize_metrics,
     prepare_metric_states,
-    uses_reference_samples,
+    summarize_metric_trials,
     validate_metric_dimensions,
 )
 from metrics import spaces
 from reference_cache import (
+    checkpoint_fingerprint,
     load_reference_samples_for_runner,
     load_space_references,
     reference_samples_path_for_key,
@@ -59,7 +58,6 @@ from utils import validate_split_percentages
 
 log = logging.getLogger("compare")
 
-_FILE_IDENTITY_CACHE: Dict[str, Dict[str, Any]] = {}
 _ADAPTIVE_IMPLEMENTATION_VERSION = 3
 
 TIMING_FIELDS = (
@@ -73,6 +71,9 @@ TIMING_FIELDS = (
 )
 # Discarded warm-up run per spec in --timing mode (torch.compile, caches).
 TIMING_WARMUP_OFFSET = 10_000
+# Compiled diffusers UNets guard on batch >= 64; two sizes per side make each
+# side dynamic under automatic dynamism (FFHQ), so no timed run recompiles.
+TIMING_WARMUP_BATCH_SIZES = (32, 48, 96, 128)
 
 CSV_FIELDS = [
     "mode",
@@ -230,17 +231,6 @@ def _resolve_b1_entry(value, budget: int, *, config_key: str = "B1"):
     return resolved, f"absolute:{resolved}"
 
 
-def _resolve_b1_for_budget(value, budget: int, *, config_key: str = "B1") -> int:
-    return _resolve_b1_entry(value, budget, config_key=config_key)[0]
-
-
-def _validate_b1_lists(cfg: Mapping[str, Any]) -> None:
-    for budget in cfg["B_list"]:
-        for config_key in ("B1_list",):
-            for value in cfg.get(config_key, []):
-                _resolve_b1_for_budget(value, int(budget), config_key=config_key)
-
-
 def _resolve_unique_b1_entries(values, budget: int, *, config_key: str):
     entries = []
     seen_specs = set()
@@ -277,9 +267,7 @@ def _validate_config(cfg: dict, *, runner, config_name: str):
         raise ValueError(
             f"comparison_mode {cfg['comparison_mode']!r} not supported; available {sorted(mode_names)}"
         )
-    mode_spec = next(
-        s for s in runner.comparison_modes() if s.name == cfg["comparison_mode"]
-    )
+    mode_spec = runner.comparison_mode_spec(cfg["comparison_mode"])
     cfg["metrics"] = normalize_metrics(
         cfg.get("metrics"), supported=getattr(runner, "supported_metrics", ("ks",))
     )
@@ -301,7 +289,7 @@ def _validate_config(cfg: dict, *, runner, config_name: str):
             "mmd requires a comparison_mode backed by cached reference samples; "
             f"comparison_mode {cfg['comparison_mode']!r} is analytic"
         )
-    if mode_spec.requires_reference_cache and uses_reference_samples(cfg["metrics"]):
+    if mode_spec.requires_reference_cache:
         if "num_base_samples" not in cfg:
             raise ValueError(
                 "num_base_samples is required when a metric uses cached reference samples"
@@ -379,7 +367,9 @@ def _validate_config(cfg: dict, *, runner, config_name: str):
             spaces.validate_space(runner, mmd_space(metric, runner))
     if not cfg["B_list"]:
         raise ValueError("B_list must be non-empty")
-    _validate_b1_lists(cfg)
+    for budget in cfg["B_list"]:
+        for value in cfg["B1_list"]:
+            _resolve_b1_entry(value, int(budget), config_key="B1_list")
     if not cfg["sampling_configs"]:
         raise ValueError("sampling_configs must be non-empty")
     for sampling_config in iter_budget_resolved_sampling_configs(cfg):
@@ -441,15 +431,12 @@ def _normalize_crossfit_q_mlp_losses(raw_losses, mlp_params):
         raise ValueError("crossfit_q_mlp_losses is required")
     if isinstance(raw_losses, str):
         raw_losses = [raw_losses]
-    losses = []
-    seen = set()
-    for raw_loss in raw_losses:
-        loss = str(raw_loss).lower()
-        params = _crossfit_q_normalize_mlp_params({**dict(mlp_params), "loss": loss})
-        loss = str(params["loss"])
-        if loss not in seen:
-            losses.append(loss)
-            seen.add(loss)
+    losses = list(
+        dict.fromkeys(
+            str(_crossfit_q_normalize_mlp_params({**dict(mlp_params), "loss": str(raw).lower()})["loss"])
+            for raw in raw_losses
+        )
+    )
     if not losses:
         raise ValueError("crossfit_q_mlp_losses must be non-empty")
     return losses
@@ -458,13 +445,7 @@ def _normalize_crossfit_q_mlp_losses(raw_losses, mlp_params):
 def _normalize_optimization_modes(raw_modes):
     if isinstance(raw_modes, str):
         raw_modes = [raw_modes]
-    modes = []
-    seen = set()
-    for raw_mode in raw_modes:
-        mode = str(raw_mode)
-        if mode not in seen:
-            modes.append(mode)
-            seen.add(mode)
+    modes = list(dict.fromkeys(str(mode) for mode in raw_modes))
     if not modes:
         raise ValueError("optimization_modes must be non-empty")
     return modes
@@ -546,19 +527,6 @@ def _normalize_crossfit_q_folds(value):
     return folds
 
 
-def _crossfit_q_fold_options(cfg):
-    return _normalize_crossfit_q_folds(
-        cfg.get("crossfit_q_folds", CROSSFIT_Q_DEFAULT_FOLDS)
-    )
-
-
-def _crossfit_q_loss_options(cfg):
-    return _normalize_crossfit_q_mlp_losses(
-        cfg.get("crossfit_q_mlp_losses"),
-        _crossfit_q_normalize_mlp_params(cfg.get("crossfit_q_mlp_params")),
-    )
-
-
 def _uniform_c_specs(baseline_spec, split_percentages):
     """One spec per constant branching factor admitted by this split count."""
     values = uniform_c_values(len(split_percentages))
@@ -601,8 +569,8 @@ def _build_trial_specs(cfg, baselines, split_percentages):
         return spec
 
     sibling = cfg.get("phase1") is not None
-    loss_options = [None] if sibling else _crossfit_q_loss_options(cfg)
-    fold_options = [None] if sibling else _crossfit_q_fold_options(cfg)
+    loss_options = [None] if sibling else cfg["crossfit_q_mlp_losses"]
+    fold_options = [None] if sibling else cfg["crossfit_q_folds"]
 
     for resolved in iter_budget_resolved_sampling_config_specs(cfg):
         for B1_entry, reuse, optimizer, mlp_loss, folds in itertools.product(
@@ -654,136 +622,76 @@ def _run_trial(
     cfg,
     split_percentages,
     seed,
-    n_runs=None,
-    run_offset=0,
-    return_trial_results=False,
+    n_runs,
+    run_offset,
 ):
-    n_runs = int(cfg["n_runs"] if n_runs is None else n_runs)
-    runner = (
-        base_runner
-        if spec["mode"] == "solver_baseline"
-        else base_runner.with_sampling_config(**spec["sampling_config"])
-    )
+    """Per-run trial results of ``n_runs`` runs of one spec."""
+    runner = _runner_for_spec(base_runner, spec)
+    batching = _batching(cfg)
     common = dict(
         runner=runner,
         comparison_state=comparison_state,
         comparison_mode=cfg["comparison_mode"],
         metrics=cfg["metrics"],
         B=int(spec["B"]),
-        n_runs=n_runs,
+        n_runs=int(n_runs),
         seed=seed,
-        debug=bool(cfg.get("debug", False)),
         n_parallel=int(cfg["n_parallel"]),
         run_offset=run_offset,
-        return_trial_results=return_trial_results,
-        max_sampling_batch_size=_batching(cfg)["phase2"],
+        max_sampling_batch_size=batching["phase2"],
     )
-    max_paths_in_flight = _batching(cfg)["max_paths_in_flight"]
     if spec["mode"] == "solver_baseline":
         return run_solver_baseline_sampling(
             **common,
             solver=spec["solver"],
             solver_kwargs=spec.get("solver_kwargs", {}),
         )
+    common["max_paths_in_flight"] = batching["max_paths_in_flight"]
     if spec["mode"] == "fixed_N":
-        return run_fixed_N_sampling(
-            **common,
-            split_percentages=[],
-            N_i_list=[],
-            max_paths_in_flight=max_paths_in_flight,
-        )
+        return run_fixed_N_sampling(**common, split_percentages=[], N_i_list=[])
     if spec["mode"] == "uniform_c":
         return run_fixed_N_sampling(
             **common,
-            max_paths_in_flight=max_paths_in_flight,
             split_percentages=split_percentages,
             N_i_list=[float(spec["uniform_c"])] * len(split_percentages),
-            result_mode="uniform_c",
-            include_allocation=True,
         )
     if spec["mode"] == "ou_oracle":
-        oracle = spec.get("oracle_definition") or runner.oracle_definition(
-            split_percentages
-        )
         return run_fixed_N_sampling(
             **common,
             split_percentages=split_percentages,
-            N_i_list=oracle["split_factors"],
-            result_mode="ou_oracle",
-            include_allocation=True,
+            N_i_list=spec["oracle_definition"]["split_factors"],
             variances=runner.oracle_variances(split_percentages),
         )
-    if cfg.get("phase1") is not None:
-        return run_estimate_and_sample(
-            **common,
-            B1=int(spec["B1"]),
-            split_percentages=split_percentages,
-            optimization_mode=str(spec["optimization_mode"]),
-            reuse_phase1_samples=bool(spec["reuse_phase1_samples"]),
-            phase1=cfg["phase1"],
-            phase1_max_sampling_batch_size=_batching(cfg)["phase1"],
-            max_paths_in_flight=max_paths_in_flight,
-        )
-    crossfit_q_mlp_params = dict(cfg.get("crossfit_q_mlp_params") or {})
-    crossfit_q_mlp_params["loss"] = str(spec["crossfit_q_mlp_loss"])
-    return run_estimate_and_sample(
+    adaptive = dict(
         **common,
         B1=int(spec["B1"]),
         split_percentages=split_percentages,
-        crossfit_q_folds=int(
-            spec.get("crossfit_q_folds", CROSSFIT_Q_DEFAULT_FOLDS)
-        ),
-        crossfit_q_mlp_run_parallelism=int(
-            cfg.get(
-                "crossfit_q_mlp_run_parallelism",
-                CROSSFIT_Q_DEFAULT_MLP_RUN_PARALLELISM,
-            )
-        ),
-        crossfit_q_mlp_params=crossfit_q_mlp_params,
         optimization_mode=str(spec["optimization_mode"]),
         reuse_phase1_samples=bool(spec["reuse_phase1_samples"]),
-        query_params=dict(cfg.get("query_params") or {}),
-        phase1_max_sampling_batch_size=_batching(cfg)["phase1"],
-        max_paths_in_flight=max_paths_in_flight,
+        phase1_max_sampling_batch_size=batching["phase1"],
     )
-
-
-def _runs_dir(output_dir):
-    return os.path.join(output_dir, "runs")
+    if cfg.get("phase1") is not None:
+        return run_estimate_and_sample(**adaptive, phase1=cfg["phase1"])
+    return run_estimate_and_sample(
+        **adaptive,
+        crossfit_q_folds=int(spec["crossfit_q_folds"]),
+        crossfit_q_mlp_run_parallelism=int(cfg["crossfit_q_mlp_run_parallelism"]),
+        crossfit_q_mlp_params={
+            **cfg["crossfit_q_mlp_params"],
+            "loss": str(spec["crossfit_q_mlp_loss"]),
+        },
+        query_params=dict(cfg["query_params"]),
+    )
 
 
 def _split_tag(split_percentages):
     return "_".join(f"{float(x):g}" for x in split_percentages)
 
 
-def _csv_path(output_dir, split_percentages):
-    return os.path.join(
-        output_dir, f"compare_results_{_split_tag(split_percentages)}.csv"
-    )
-
-
-def _outputs_manifest_path(output_dir):
-    return os.path.join(output_dir, "compare_outputs.json")
-
-
 def _file_identity(path):
-    abspath = os.path.abspath(path)
-    if abspath in _FILE_IDENTITY_CACHE:
-        return dict(_FILE_IDENTITY_CACHE[abspath])
-    if not os.path.exists(abspath):
-        identity: Dict[str, Any] = {"missing_path": abspath}
-        _FILE_IDENTITY_CACHE[abspath] = identity
-        return dict(identity)
-
-    digest = hashlib.sha256()
-    with open(abspath, "rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            digest.update(chunk)
-    identity = {
-        "size": int(os.path.getsize(abspath)),
-        "sha256": digest.hexdigest(),
-    }
-    _FILE_IDENTITY_CACHE[abspath] = identity
+    identity = checkpoint_fingerprint(path)
+    if identity is None:
+        return {"missing_path": os.path.abspath(path)}
     return dict(identity)
 
 
@@ -822,10 +730,6 @@ def _split_solver_fields(spec: Mapping[str, Any]):
     solver_kwargs = dict(spec.get("solver_kwargs") or {})
     solver_steps = solver_kwargs.pop("sampling_steps", "")
     return str(spec["solver"]), solver_steps, _compact_json(solver_kwargs)
-
-
-def _csv_mode(mode: str) -> str:
-    return "adaptive" if mode == "estimate_and_sample" else str(mode)
 
 
 def _method_display(row: Mapping[str, Any]) -> str:
@@ -919,14 +823,8 @@ def _config_cache_key(
     reference_generation_config,
     split_percentages,
 ):
-    """Everything a cached run depends on.
-
-    `_validate_config` has already checked `comparison_mode` against the runner,
-    so the mode spec is guaranteed to resolve.
-    """
-    mode_spec = next(
-        s for s in runner.comparison_modes() if s.name == cfg["comparison_mode"]
-    )
+    """Everything a cached run depends on."""
+    mode_spec = runner.comparison_mode_spec(cfg["comparison_mode"])
     key = {
         "runner": args.runner,
         "checkpoint": _file_identity(runner.checkpoint_path),
@@ -939,7 +837,7 @@ def _config_cache_key(
             spec, runner=runner, split_percentages=split_percentages
         ),
     }
-    if mode_spec.requires_reference_cache and uses_reference_samples(cfg["metrics"]):
+    if mode_spec.requires_reference_cache:
         ref_key = reference_runner.reference_cache_key(
             cfg["comparison_mode"], reference_generation_config
         )
@@ -1001,14 +899,8 @@ def _write_json_atomic(path, payload):
     os.replace(tmp, path)
 
 
-def _runs_jsonl_path(config_dir):
-    return os.path.join(config_dir, "runs.jsonl")
-
-
 def _trial_to_cache_record(spec, trial):
-    metrics = dict(trial.get("metrics") or {})
-    if "ks" not in metrics and "ks_distance" in trial:
-        metrics["ks"] = float(trial["ks_distance"])
+    metrics = dict(trial["metrics"])
     record = {
         "metrics": metrics,
     }
@@ -1028,7 +920,7 @@ def _trial_to_cache_record(spec, trial):
 
 
 def _load_cached_runs(config_dir, n_runs):
-    path = _runs_jsonl_path(config_dir)
+    path = os.path.join(config_dir, "runs.jsonl")
     if not os.path.exists(path):
         return {}
     cached: Dict[int, Dict[str, Any]] = {}
@@ -1049,7 +941,7 @@ def _load_cached_runs(config_dir, n_runs):
 def _cached_oracle_definition(output_dir, split_percentages, target_runs):
     """Reuse the most advanced runs cache for an identical split schedule."""
     schedule = tuple(float(value) for value in split_percentages)
-    runs_dir = _runs_dir(output_dir)
+    runs_dir = os.path.join(output_dir, "runs")
     if not os.path.isdir(runs_dir):
         return None
 
@@ -1094,7 +986,7 @@ def _cached_oracle_definition(output_dir, split_percentages, target_runs):
 
 
 def _write_cached_runs(config_dir, cached):
-    path = _runs_jsonl_path(config_dir)
+    path = os.path.join(config_dir, "runs.jsonl")
     os.makedirs(config_dir, exist_ok=True)
     tmp = f"{path}.tmp.{os.getpid()}"
     with open(tmp, "w") as f:
@@ -1106,28 +998,15 @@ def _write_cached_runs(config_dir, cached):
 
 def _build_comparison_states(base_runner, cfg):
     mode = cfg["comparison_mode"]
-    mode_spec = next(
-        (s for s in base_runner.comparison_modes() if s.name == mode), None
-    )
-    if mode_spec is None:
-        raise ValueError(
-            f"Runner {base_runner.runner_name!r} does not support comparison_mode {mode!r}"
+    if not base_runner.comparison_mode_spec(mode).requires_reference_cache:
+        return prepare_metric_states(
+            base_runner,
+            comparison_mode=mode,
+            metrics=cfg["metrics"],
+            metric_params=cfg.get("metric_params") or {},
         )
-    if not mode_spec.requires_reference_cache or not uses_reference_samples(
-        cfg["metrics"]
-    ):
-        return mode_spec, {
-            None: prepare_metric_states(
-                base_runner,
-                comparison_mode=mode,
-                metrics=cfg["metrics"],
-                metric_params=cfg.get("metric_params") or {},
-            )
-        }
 
-    reference_generation_config = base_runner.normalize_reference_generation_config(
-        mode, cfg["reference_generation_config"]
-    )
+    reference_generation_config = cfg["reference_generation_config"]
     samples = load_reference_samples_for_runner(
         base_runner,
         mode,
@@ -1144,35 +1023,28 @@ def _build_comparison_states(base_runner, cfg):
         int(cfg["num_base_samples"]),
         batch_size=scoring_batch_size,
     )
-    states: Dict[Any, Any] = {
-        None: prepare_metric_states(
-            base_runner,
-            comparison_mode=mode,
-            reference_samples=samples,
-            metrics=cfg["metrics"],
-            metric_params=cfg.get("metric_params") or {},
-            space_references=space_references,
-            scoring_batch_size=scoring_batch_size,
-        )
-    }
+    states = prepare_metric_states(
+        base_runner,
+        comparison_mode=mode,
+        reference_samples=samples,
+        metrics=cfg["metrics"],
+        metric_params=cfg.get("metric_params") or {},
+        space_references=space_references,
+        scoring_batch_size=scoring_batch_size,
+    )
     if cfg.get("phase1") is not None:
         design_params = {
             **((cfg.get("metric_params") or {}).get("mmd") or {}),
             "seed": cfg["phase1"]["design_seed"],
         }
-        states[None]["mmd_design"] = prepare_metric_states(
+        states["mmd_design"] = prepare_metric_states(
             base_runner,
             comparison_mode=mode,
             reference_samples=samples,
             metrics=["mmd"],
             metric_params={"mmd": design_params},
         )["mmd"]
-    return mode_spec, states
-
-
-def _state_for_spec(states, mode_spec, spec, cfg):
-    del mode_spec, spec, cfg
-    return states[None]
+    return states
 
 
 def _runner_for_spec(base_runner, spec):
@@ -1183,7 +1055,7 @@ def _runner_for_spec(base_runner, spec):
 
 def _aggregate_cached_runs(spec, trials, *, base_runner, split_percentages, cfg):
     runner = _runner_for_spec(base_runner, spec)
-    metric_summary = aggregate_cached_metric_rows(trials, cfg["metrics"])
+    metric_summary = summarize_metric_trials(trials, cfg["metrics"])
     if spec["mode"] == "solver_baseline":
         nfe_per_sample = runner.solver_cost(
             spec["solver"], **spec.get("solver_kwargs", {})
@@ -1195,7 +1067,7 @@ def _aggregate_cached_runs(spec, trials, *, base_runner, split_percentages, cfg)
     )
     solver, solver_steps, solver_params = _split_solver_fields(spec)
     base = {
-        "mode": _csv_mode(spec["mode"]),
+        "mode": "adaptive" if spec["mode"] == "estimate_and_sample" else spec["mode"],
         "sampler": sampler,
         "sampling_steps": int(sampling_steps) if sampling_steps != "" else "",
         "sampling_params": sampling_params,
@@ -1243,9 +1115,7 @@ def _aggregate_cached_runs(spec, trials, *, base_runner, split_percentages, cfg)
             "N_i_std": std_vector([t["N_i"] for t in trials]),
         }
     if spec["mode"] == "ou_oracle":
-        oracle = spec.get("oracle_definition") or runner.oracle_definition(
-            split_percentages
-        )
+        oracle = spec["oracle_definition"]
         factors = [float(value) for value in oracle["split_factors"]]
         return {
             **base,
@@ -1318,169 +1188,121 @@ def _write_summary_csv(path, rows):
         writer.writerows(rows)
 
 
-def _run_split(args, cfg, base_runner, baselines, split_percentages):
-    split_percentages = [float(x) for x in split_percentages]
-    specs = _build_trial_specs(cfg, baselines, split_percentages)
-    runs_dir = _runs_dir(args.output_dir)
-    entries: List[Dict[str, Any]] = []
-    total_remaining = 0
+def _plan_split(args, cfg, base_runner, baselines, split_percentages):
+    """One entry per trial spec: its cache key, seed and cached runs."""
     target_runs = int(cfg["n_runs"])
+    specs = _build_trial_specs(cfg, baselines, split_percentages)
     cached_oracle = _cached_oracle_definition(
         args.output_dir, split_percentages, target_runs
     )
-    if cached_oracle is not None:
-        for spec in specs:
-            if spec["mode"] == "ou_oracle":
-                spec["oracle_definition"] = cached_oracle
-    mode_spec = next(
-        (s for s in base_runner.comparison_modes() if s.name == cfg["comparison_mode"]),
-        None,
-    )
-    if mode_spec is None:
-        raise ValueError(
-            f"Runner {base_runner.runner_name!r} does not support comparison_mode {cfg['comparison_mode']!r}"
-        )
-    reference_generation_config = None
-    if mode_spec.requires_reference_cache and uses_reference_samples(cfg["metrics"]):
-        reference_generation_config = base_runner.normalize_reference_generation_config(
-            cfg["comparison_mode"], cfg["reference_generation_config"]
-        )
     for spec in specs:
-        runner_for_key = _runner_for_spec(base_runner, spec)
+        if spec["mode"] == "ou_oracle":
+            spec["oracle_definition"] = cached_oracle or _runner_for_spec(
+                base_runner, spec
+            ).oracle_definition(split_percentages)
+    reference_generation_config = (
+        cfg["reference_generation_config"]
+        if base_runner.comparison_mode_spec(cfg["comparison_mode"]).requires_reference_cache
+        else None
+    )
+    entries: List[Dict[str, Any]] = []
+    for spec in specs:
         cache_key = _config_cache_key(
             args,
             cfg,
             spec,
-            runner=runner_for_key,
+            runner=_runner_for_spec(base_runner, spec),
             reference_runner=base_runner,
             reference_generation_config=reference_generation_config,
             split_percentages=split_percentages,
         )
-        digest = _config_hash(cache_key)
-        config_id = digest[:16]
-        seed = _trial_seed(cache_key, config_id)
-        config_dir = os.path.join(runs_dir, config_id)
+        config_id = _config_hash(cache_key)[:16]
+        config_dir = os.path.join(args.output_dir, "runs", config_id)
         cached = _load_cached_runs(config_dir, target_runs)
-        completed_runs = min(len(cached), target_runs)
-        remaining_runs = target_runs - completed_runs
-        total_remaining += remaining_runs
         entries.append(
             {
                 "spec": spec,
-                "seed": seed,
+                "seed": _trial_seed(cache_key, config_id),
                 "cache_key": cache_key,
                 "config_id": config_id,
                 "config_dir": config_dir,
                 "cached": cached,
-                "completed_runs": completed_runs,
-                "remaining_runs": remaining_runs,
+                "completed_runs": min(len(cached), target_runs),
+                "remaining_runs": target_runs - min(len(cached), target_runs),
             }
         )
+    return entries
 
-    if total_remaining:
-        mode_spec, comparison_states = _build_comparison_states(base_runner, cfg)
-        if args.timing:
-            # Scoring must not overlap the next run's timed sampling.
-            comparison_states[None]["serial_scoring"] = True
-        for entry in tqdm(
-            entries, desc=f"Compare split {_split_tag(split_percentages)}"
-        ):
-            remaining_runs = int(entry["remaining_runs"])
-            if remaining_runs <= 0:
-                continue
-            spec = entry["spec"]
-            config_dir = entry["config_dir"]
+
+def _warm_up_batch_sizes(base_runner, device):
+    """Compile the sampler for every batch-size regime before any timed run."""
+    generator = torch.Generator(device=torch.device(device))
+    generator.manual_seed(TIMING_WARMUP_OFFSET)
+    for batch_size in TIMING_WARMUP_BATCH_SIZES:
+        x = base_runner.sample_prior(batch_size, generator=generator)
+        base_runner.sample_segment(
+            x, base_runner.start_time, base_runner.end_time, generator=generator
+        )
+
+
+def _run_entries(args, cfg, base_runner, entries, split_percentages):
+    """Run every entry's remaining runs and append them to its cache."""
+    comparison_state = _build_comparison_states(base_runner, cfg)
+    if args.timing:
+        # Scoring must not overlap the next run's timed sampling.
+        comparison_state["serial_scoring"] = True
+    for entry in tqdm(entries, desc=f"Compare split {_split_tag(split_percentages)}"):
+        remaining_runs = int(entry["remaining_runs"])
+        if remaining_runs <= 0:
+            continue
+        spec = entry["spec"]
+        config_dir = entry["config_dir"]
+        _write_json_atomic(
+            os.path.join(config_dir, "config.json"),
+            {"run_id": entry["config_id"], "cache_key": entry["cache_key"]},
+        )
+        if spec["mode"] == "ou_oracle":
             _write_json_atomic(
-                os.path.join(config_dir, "config.json"),
-                {
-                    "run_id": entry["config_id"],
-                    "cache_key": entry["cache_key"],
-                },
+                os.path.join(config_dir, "oracle.json"), spec["oracle_definition"]
             )
-            if spec["mode"] == "ou_oracle":
-                _write_json_atomic(
-                    os.path.join(config_dir, "oracle.json"),
-                    spec.get("oracle_definition")
-                    or _runner_for_spec(base_runner, spec).oracle_definition(
-                        split_percentages
-                    ),
-                )
-            comparison_state = _state_for_spec(comparison_states, mode_spec, spec, cfg)
-
-            completed_runs = int(entry["completed_runs"])
-            try:
-                if args.timing:
-                    # Not cached: the first run of a spec pays for compilation and caches.
-                    _run_trial(
-                        spec,
-                        base_runner=base_runner,
-                        comparison_state=comparison_state,
-                        cfg=cfg,
-                        split_percentages=split_percentages,
-                        seed=entry["seed"],
-                        n_runs=1,
-                        run_offset=TIMING_WARMUP_OFFSET,
-                        return_trial_results=True,
-                    )
-                result = _run_trial(
-                    spec,
-                    base_runner=base_runner,
-                    comparison_state=comparison_state,
-                    cfg=cfg,
-                    split_percentages=split_percentages,
-                    seed=entry["seed"],
-                    n_runs=remaining_runs,
-                    run_offset=completed_runs,
-                    return_trial_results=True,
-                )
-            except Exception as exc:
-                log.warning(
-                    "Failed config %s with %s remaining runs: %s",
-                    entry["config_id"],
-                    remaining_runs,
-                    exc,
-                )
-                continue
-            trial_results = result.get("trial_results") or []
-            if len(trial_results) != remaining_runs:
-                log.warning(
-                    "Config %s returned %d/%d remaining runs; caching returned runs",
-                    entry["config_id"],
-                    len(trial_results),
-                    remaining_runs,
-                )
-            for local_idx, trial in enumerate(trial_results[:remaining_runs]):
-                run_number = completed_runs + local_idx + 1
-                entry["cached"][run_number] = _trial_to_cache_record(spec, trial)
-            _write_cached_runs(config_dir, entry["cached"])
-    else:
-        log.info(
-            "All requested runs already cached for split %s",
-            _split_tag(split_percentages),
+        completed_runs = int(entry["completed_runs"])
+        run = dict(
+            base_runner=base_runner,
+            comparison_state=comparison_state,
+            cfg=cfg,
+            split_percentages=split_percentages,
+            seed=entry["seed"],
         )
-
-    records: List[Dict[str, Any]] = []
-    completed = 0
-    for entry in entries:
-        cached = _load_cached_runs(entry["config_dir"], target_runs)
-        completed += len(cached)
-        trials = [cached[r] for r in sorted(cached)]
-        records.append(
-            _aggregate_cached_runs(
-                entry["spec"],
-                trials,
-                base_runner=base_runner,
-                split_percentages=split_percentages,
-                cfg=cfg,
+        try:
+            if args.timing:
+                # Not cached: the first run of a spec pays for compilation and caches.
+                _run_trial(spec, **run, n_runs=1, run_offset=TIMING_WARMUP_OFFSET)
+            trial_results = _run_trial(
+                spec, **run, n_runs=remaining_runs, run_offset=completed_runs
             )
-        )
+        except Exception as exc:
+            log.warning(
+                "Failed config %s with %s remaining runs: %s",
+                entry["config_id"],
+                remaining_runs,
+                exc,
+            )
+            continue
+        if len(trial_results) != remaining_runs:
+            log.warning(
+                "Config %s returned %d/%d remaining runs; caching returned runs",
+                entry["config_id"],
+                len(trial_results),
+                remaining_runs,
+            )
+        for local_idx, trial in enumerate(trial_results[:remaining_runs]):
+            entry["cached"][completed_runs + local_idx + 1] = _trial_to_cache_record(
+                spec, trial
+            )
+        _write_cached_runs(config_dir, entry["cached"])
 
-    csv_output = _csv_path(args.output_dir, split_percentages)
-    _write_summary_csv(csv_output, _build_summary_rows(records))
-    print(f"Saved CSV summary to {csv_output}")
-    print(f"Completed {completed}/{len(specs) * target_runs} cached runs")
-    print(f"Attempted {total_remaining} remaining runs")
 
+def _print_best(records, cfg):
     grouped: Dict[Any, Dict[str, Any]] = {}
     primary_metric = str(cfg.get("primary_metric", cfg["metrics"][0]))
     primary_field = f"mean_{primary_metric}"
@@ -1501,6 +1323,44 @@ def _run_split(args, cfg, base_runner, baselines, split_percentages):
             f"  B={best['B']}, {_sampling_display(best)}: best={_method_display(best)} "
             f"(B1={best.get('B1', '')}) {primary_field}={best[primary_field]:.6f}"
         )
+
+
+def _run_split(args, cfg, base_runner, baselines, split_percentages):
+    split_percentages = [float(x) for x in split_percentages]
+    target_runs = int(cfg["n_runs"])
+    entries = _plan_split(args, cfg, base_runner, baselines, split_percentages)
+    total_remaining = sum(int(entry["remaining_runs"]) for entry in entries)
+    if total_remaining:
+        _run_entries(args, cfg, base_runner, entries, split_percentages)
+    else:
+        log.info(
+            "All requested runs already cached for split %s",
+            _split_tag(split_percentages),
+        )
+
+    records: List[Dict[str, Any]] = []
+    completed = 0
+    for entry in entries:
+        cached = entry["cached"]
+        completed += len(cached)
+        records.append(
+            _aggregate_cached_runs(
+                entry["spec"],
+                [cached[r] for r in sorted(cached)],
+                base_runner=base_runner,
+                split_percentages=split_percentages,
+                cfg=cfg,
+            )
+        )
+
+    csv_output = os.path.join(
+        args.output_dir, f"compare_results_{_split_tag(split_percentages)}.csv"
+    )
+    _write_summary_csv(csv_output, _build_summary_rows(records))
+    print(f"Saved CSV summary to {csv_output}")
+    print(f"Completed {completed}/{len(entries) * target_runs} cached runs")
+    print(f"Attempted {total_remaining} remaining runs")
+    _print_best(records, cfg)
     return csv_output
 
 
@@ -1522,6 +1382,8 @@ def main():
     )
     cfg["debug"] = bool(args.debug)
     _validate_config(cfg, runner=base_runner, config_name=args.config)
+    if args.timing:
+        _warm_up_batch_sizes(base_runner, args.device)
     baselines = [
         base_runner.parse_baseline_name(str(name)) for name in cfg["baselines"]
     ]
@@ -1537,7 +1399,7 @@ def main():
         csv_outputs.append(
             _run_split(args, cfg, base_runner, baselines, split_percentages)
         )
-    manifest_path = _outputs_manifest_path(args.output_dir)
+    manifest_path = os.path.join(args.output_dir, "compare_outputs.json")
     _write_json_atomic(
         manifest_path,
         {
@@ -1548,7 +1410,7 @@ def main():
         },
     )
     print(f"Saved compare output manifest to {manifest_path}")
-    print(f"Saved compact run cache to {_runs_dir(args.output_dir)}")
+    print(f"Saved compact run cache to {os.path.join(args.output_dir, 'runs')}")
 
 
 if __name__ == "__main__":

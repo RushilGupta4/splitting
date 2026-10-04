@@ -101,34 +101,13 @@ def integer_branch_factor(branching_factor: float) -> int:
     return int(nearest)
 
 
-def balanced_branch_counts(
-    num_parents: int,
-    branching_factor: float,
-    device: str | torch.device,
-    generator: torch.Generator | None = None,
-):
-    """Every parent gets the same whole number of children."""
-    del generator
-    num_parents = int(num_parents)
-    if num_parents < 0:
-        raise ValueError("num_parents must be nonnegative")
-    if num_parents == 0:
-        return torch.empty((0,), device=device, dtype=torch.long)
-    return torch.full(
-        (num_parents,),
-        integer_branch_factor(branching_factor),
-        device=device,
-        dtype=torch.long,
-    )
-
-
 def balanced_branch_counts_by_group(
     group_ids: torch.Tensor,
     branching_factors_by_group: torch.Tensor,
     *,
     num_groups: int | None = None,
-    generator: torch.Generator | None = None,
 ):
+    """Every parent in a group gets that group's whole number of children."""
     group_ids = group_ids.to(dtype=torch.long)
     if group_ids.ndim != 1:
         raise ValueError("group_ids must be 1D")
@@ -154,19 +133,10 @@ def balanced_branch_counts_by_group(
     if not torch.isfinite(factors).all() or torch.any(factors < 0.0):
         raise ValueError("branching factors must be finite and nonnegative")
 
-    counts = torch.empty_like(group_ids, dtype=torch.long)
-    for group_idx in range(num_groups):
-        positions = torch.nonzero(group_ids == group_idx, as_tuple=False).flatten()
-        if positions.numel() == 0:
-            continue
-        group_counts = balanced_branch_counts(
-            int(positions.numel()),
-            float(factors[group_idx].item()),
-            group_ids.device,
-            generator=generator,
-        )
-        counts[positions] = group_counts
-    return counts
+    per_group = torch.zeros(num_groups, device=group_ids.device, dtype=torch.long)
+    for group_idx in torch.unique(group_ids).tolist():
+        per_group[group_idx] = integer_branch_factor(float(factors[group_idx].item()))
+    return per_group[group_ids]
 
 
 def iter_run_id_batches(
@@ -261,47 +231,22 @@ def iter_child_parent_batches_by_run(
     if not batch_counts_by_run:
         return
 
-    parent_positions_by_run = []
-    child_counts_by_parent_run = []
+    parents_by_run = []
     for run_idx in range(num_runs):
         positions = torch.nonzero(run_ids == run_idx, as_tuple=False).flatten()
-        parent_positions_by_run.append(positions.detach().cpu().tolist())
-        child_counts_by_parent_run.append(
-            child_counts.index_select(0, positions).detach().cpu().tolist()
+        parents_by_run.append(
+            positions.repeat_interleave(child_counts.index_select(0, positions))
         )
 
     offsets_by_run = [0] * num_runs
+    empty = torch.empty((0,), device=run_ids.device, dtype=torch.long)
     for batch_counts in batch_counts_by_run:
-        parent_indices = []
+        pieces = []
         for run_idx, take in enumerate(batch_counts):
-            take = int(take)
-            if take <= 0:
-                continue
             start = offsets_by_run[run_idx]
-            end = start + take
-            offsets_by_run[run_idx] = end
-            cursor = 0
-            for parent_idx, count in zip(
-                parent_positions_by_run[run_idx],
-                child_counts_by_parent_run[run_idx],
-            ):
-                count = int(count)
-                next_cursor = cursor + count
-                if next_cursor <= start:
-                    cursor = next_cursor
-                    continue
-                if cursor >= end:
-                    break
-                overlap_start = max(start, cursor)
-                overlap_end = min(end, next_cursor)
-                repeats = overlap_end - overlap_start
-                if repeats > 0:
-                    parent_indices.extend([int(parent_idx)] * int(repeats))
-                cursor = next_cursor
-        yield (
-            torch.as_tensor(parent_indices, device=run_ids.device, dtype=torch.long),
-            batch_counts,
-        )
+            offsets_by_run[run_idx] = start + int(take)
+            pieces.append(parents_by_run[run_idx][start : start + int(take)])
+        yield torch.cat([empty, *pieces]), batch_counts
 
 
 def apply_to_run_batches(
@@ -327,26 +272,62 @@ def apply_to_run_batches(
     return out
 
 
-def repeat_by_counts(x: torch.Tensor, counts: torch.Tensor):
-    return x.repeat_interleave(counts, dim=0)
+def sample_prior_by_run_batches(
+    runner, counts_by_run, *, max_sampling_batch_size=None, generator=None
+):
+    """Prior draws for each run, concatenated in run order, and their run ids."""
+    max_sampling_batch_size = normalize_max_sampling_batch_size(max_sampling_batch_size)
+    counts_by_run = [int(count) for count in counts_by_run]
+    run_ids = torch.repeat_interleave(
+        torch.arange(len(counts_by_run), device=runner.device, dtype=torch.long),
+        torch.as_tensor(counts_by_run, device=runner.device, dtype=torch.long),
+    )
+    if max_sampling_batch_size is None:
+        return runner.sample_prior(sum(counts_by_run), generator=generator), run_ids
+    parts_by_run = [[] for _ in counts_by_run]
+    for counts in split_counts_by_run_batches(counts_by_run, max_sampling_batch_size):
+        total = int(sum(counts))
+        if total > 0:
+            append_by_counts(
+                parts_by_run, runner.sample_prior(total, generator=generator), counts
+            )
+    return torch.cat([torch.cat(parts, dim=0) for parts in parts_by_run], dim=0), run_ids
+
+
+def sample_segment_by_run_batches(
+    runner,
+    x: torch.Tensor,
+    run_ids: torch.Tensor,
+    *,
+    num_runs: int,
+    start_time,
+    end_time,
+    max_sampling_batch_size=None,
+    generator=None,
+):
+    return apply_to_run_batches(
+        x,
+        run_ids,
+        num_runs=int(num_runs),
+        max_count_per_run=max_sampling_batch_size,
+        fn=lambda batch: runner.sample_segment(
+            batch, start_time, end_time, generator=generator
+        ),
+    )
 
 
 def balanced_split_with_run_ids(
     x: torch.Tensor,
     run_ids: torch.Tensor,
     split_factors_by_run: torch.Tensor,
-    generator: torch.Generator | None = None,
 ):
     if x.shape[0] == 0:
         return x, run_ids
-
     counts = balanced_branch_counts_by_group(
         run_ids,
         split_factors_by_run,
         num_groups=int(split_factors_by_run.numel()),
-        generator=generator,
     )
-
     return x.repeat_interleave(counts, dim=0), run_ids.repeat_interleave(counts, dim=0)
 
 
@@ -423,17 +404,10 @@ def trajectory_segment_costs(runner, split_points):
     return [runner.segment_cost(start, end) for start, end in zip(starts, ends)]
 
 
-def trajectory_expected_cost_per_root(runner, split_points, split_factors) -> float:
-    """Compute expected trajectory cost from cumulative split factors."""
-    costs = trajectory_segment_costs(runner, split_points)
-    if len(costs) == 1:
-        return float(costs[0])
-    cumulative_split = 1.0
-    cost = float(costs[0])
-    for idx, split_factor in enumerate(split_factors):
-        cumulative_split *= float(split_factor)
-        cost += cumulative_split * float(costs[idx + 1])
-    return float(cost)
+def _sample_full_trajectories(runner, total, generator):
+    x = runner.sample_prior(total, generator=generator)
+    x = runner.sample_segment(x, runner.start_time, runner.end_time, generator=generator)
+    return runner.postprocess_samples(x)
 
 
 def run_full_trajectory_batch(
@@ -452,28 +426,20 @@ def run_full_trajectory_batch(
     )
     sampling_start = time.perf_counter()
 
-    def sample_batch(total):
-        x = runner.sample_prior(total, generator=generator)
-        x = runner.sample_segment(
-            x,
-            runner.start_time,
-            runner.end_time,
-            generator=generator,
-        )
-        return runner.postprocess_samples(x)
-
     if max_sampling_batch_size is not None:
         samples_by_run = collect_run_batches(
             [n0] * chunk_size,
             max_sampling_batch_size,
-            sample_batch=lambda total: sample_batch(total).to(dtype=torch.float32),
+            sample_batch=lambda total: _sample_full_trajectories(
+                runner, total, generator
+            ).to(dtype=torch.float32),
             empty_template=runner.postprocess_samples(
                 runner.sample_prior(0)
             ).to(dtype=torch.float32),
         )
         return samples_by_run, time.perf_counter() - sampling_start
 
-    samples = sample_batch(chunk_size * n0)
+    samples = _sample_full_trajectories(runner, chunk_size * n0, generator)
     sampling_time = time.perf_counter() - sampling_start
     samples = samples.to(dtype=torch.float32).reshape(chunk_size, n0, -1).contiguous()
     return [samples[idx] for idx in range(chunk_size)], sampling_time
@@ -488,11 +454,10 @@ def run_split_trajectory_batch(
     generator=None,
     max_sampling_batch_size=None,
 ):
-    """Run generic trajectory splitting using runner-owned sampling primitives.
+    """Run trajectory splitting with runner-owned sampling primitives.
 
     ``split_points`` must already be canonicalized by the runner family. The
-    ordering of random draws and sampling calls intentionally matches the
-    former EDM/SDE implementations.
+    capped and uncapped paths draw random numbers in different orders.
     """
     if len(n0_by_run) == 0:
         return [], [], 0.0
@@ -515,19 +480,13 @@ def run_split_trajectory_batch(
 
     if max_sampling_batch_size is not None and not split_points:
         segment_cost = int(runner.segment_cost(runner.start_time, runner.end_time))
-
-        def sample_full_batch(total):
-            x = runner.sample_prior(total, generator=generator)
-            x = runner.sample_segment(
-                x, runner.start_time, runner.end_time, generator=generator
-            )
-            return runner.postprocess_samples(x)
-
         realized_costs += n0_tensor * segment_cost
         samples_by_run = collect_run_batches(
             n0_by_run,
             max_sampling_batch_size,
-            sample_batch=sample_full_batch,
+            sample_batch=lambda total: _sample_full_trajectories(
+                runner, total, generator
+            ),
             empty_template=runner.postprocess_samples(runner.sample_prior(0)),
         )
         sampling_time = time.perf_counter() - sampling_start
@@ -599,7 +558,6 @@ def run_split_trajectory_batch(
                     run_ids,
                     split_factors_tensor[:, idx],
                     num_groups=num_runs,
-                    generator=generator,
                 )
                 counts = child_counts_by_run(
                     run_ids,
@@ -634,10 +592,7 @@ def run_split_trajectory_batch(
                 )
 
             x, run_ids = balanced_split_with_run_ids(
-                x,
-                run_ids,
-                split_factors_tensor[:, idx],
-                generator=generator,
+                x, run_ids, split_factors_tensor[:, idx]
             )
             counts = torch.bincount(run_ids, minlength=num_runs)
             realized_costs += counts * int(runner.segment_cost(split_point, end_t))
