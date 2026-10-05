@@ -28,6 +28,7 @@ MMD_SIBLING_DEFAULTS: dict[str, Any] = {
     "estimator": MMD_SIBLING,
     "min_pairs": 5,
     "design_seed": 1,
+    "variance_shrinkage_pct": 5,
 }
 
 
@@ -46,6 +47,11 @@ def normalize_mmd_sibling_params(params: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("mmd_sibling min_pairs must be at least 2")
     if merged["design_seed"] < 0:
         raise ValueError("mmd_sibling design_seed must be nonnegative")
+    pct = merged["variance_shrinkage_pct"]
+    if isinstance(pct, bool) or not isinstance(pct, (int, float)) or not 0 <= pct < 100:
+        raise ValueError(
+            f"mmd_sibling variance_shrinkage_pct must be a number in [0, 100), got {pct!r}"
+        )
     return merged
 
 
@@ -106,6 +112,22 @@ def sibling_trace_profile(
     q = np.clip(_weighted_pava_non_decreasing(q, weights), lower, top)
     q[-1] = top
     return np.diff(q)[:, None], np.array([q[0] - lower])
+
+
+def shrink_to_cost(variance2, tau2, seg_costs, pct: float):
+    """``(variance2, tau2)`` with the per-level weights moved ``pct`` percent toward
+    the cost-proportional profile of the same total, the root term folded into level 0.
+
+    Every weight becomes positive, which bounds the monotone allocation independently
+    of the budget.
+    """
+    w = np.asarray(variance2, dtype=float)[:, 0].copy()
+    w[0] += float(np.asarray(tau2, dtype=float)[0])
+    if pct == 0:
+        return w[:, None], np.zeros(1)
+    costs = np.asarray(seg_costs, dtype=float)
+    s = float(pct) / 100.0
+    return ((1.0 - s) * w + s * w.sum() * costs / costs.sum())[:, None], np.zeros(1)
 
 
 def floor_for_min_roots(variance2, tau2, seg_costs, B2: int, optimization_mode: str):
@@ -242,6 +264,9 @@ def run_mmd_sibling_phase1_batch(
             assignment,
             anchors,
             len(seg_costs),
+        )
+        variance2, tau2 = shrink_to_cost(
+            variance2, tau2, seg_costs, phase1["variance_shrinkage_pct"]
         )
         variance2, tau2 = floor_for_min_roots(
             variance2, tau2, seg_costs, int(B) - used_B1, optimization_mode

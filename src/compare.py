@@ -855,7 +855,11 @@ def _config_cache_key(
     if spec["mode"] == "estimate_and_sample":
         key["adaptive_implementation_version"] = _ADAPTIVE_IMPLEMENTATION_VERSION
         if cfg.get("phase1") is not None:
-            key["phase1"] = _json_safe(cfg["phase1"])
+            phase1 = dict(cfg["phase1"])
+            # Unshrunk designs keep the cache keys they had before shrinkage existed.
+            if phase1.get("variance_shrinkage_pct") == 0:
+                phase1.pop("variance_shrinkage_pct")
+            key["phase1"] = _json_safe(phase1)
             return key
         crossfit_folds = int(
             spec.get("crossfit_q_folds", CROSSFIT_Q_DEFAULT_FOLDS)

@@ -15,7 +15,7 @@ set -euo pipefail
 cd "$(dirname -- "$0")"
 
 BASE_DIR="${BASE_DIR:-outputs_paper_final_5}"
-DEVICE="${DEVICE:-cuda:1}"
+DEVICE="${DEVICE:-cuda:0}"
 DEBUG="${DEBUG:-0}"
 CI_LEVEL=0.95
 
@@ -26,10 +26,10 @@ EXPERIMENTS=(
     # "edm_default|edm_gmm2d|default|50000|2500|100|"
     # "ou_oracle|ou_oracle|default|1000000|10000|1000|"
 
-    # "ddpm_cifar10_hf_mmd|ddpm_cifar10_hf|mmd|5000|50|5|"
-    # "ldm_ffhq_mmd|ldm_ffhq|mmd|1024|50|2|"
     "ddpm_cifar10_hf_timing|ddpm_cifar10_hf|timing|5000|10|1|--timing"
     "ldm_ffhq_timing|ldm_ffhq|timing|1024|10|1|--timing"
+    "ddpm_cifar10_hf_mmd|ddpm_cifar10_hf|mmd|5000|50|5|"
+    "ldm_ffhq_mmd|ldm_ffhq|mmd|1024|50|2|"
 )
 
 debug_flag=""
