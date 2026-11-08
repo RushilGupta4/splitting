@@ -64,8 +64,8 @@ def _four_model_layout(height: float, *, h_pad: float, w_pad: float) -> dict[str
 
 GAIN_LAYOUT = _four_model_layout(FOUR_MODEL_FIGSIZE[1], h_pad=0.76, w_pad=0.89)
 ALLOCATION_LAYOUT = _four_model_layout(FOUR_MODEL_FIGSIZE[1], h_pad=0.67, w_pad=1.65)
-# Five panels: the 2x2 grid plus a centred third row at the same panel size.
-ABSOLUTE_FIGSIZE = (FOUR_MODEL_FIGSIZE[0], 1.5 * FOUR_MODEL_FIGSIZE[1])
+# Seven panels in four rows (the second centred) at the 2x2 panel size.
+ABSOLUTE_FIGSIZE = (FOUR_MODEL_FIGSIZE[0], 2.0 * FOUR_MODEL_FIGSIZE[1])
 ABSOLUTE_LAYOUT = _four_model_layout(ABSOLUTE_FIGSIZE[1], h_pad=0.95, w_pad=1.8)
 
 SINGLE_01 = (0.1,)
@@ -316,8 +316,26 @@ PLOT_MODELS = tuple(
         "ldm_ffhq_mmd",
     )
 )
-# Only the absolute-metric figure has room for CIFAR-10, in a centred bottom row.
-ABSOLUTE_MODELS = (*PLOT_MODELS, MODELS_BY_DIRECTORY["ddpm_cifar10_hf_mmd"])
+# The image models are also scored with DINOv2 features. Their rows are stored
+# under their own key so they do not replace the Inception rows.
+DINO_MODELS = tuple(
+    {
+        **MODELS_BY_DIRECTORY[directory],
+        "metric": "mmd_dino",
+        "rows_key": f"{directory}:mmd_dino",
+    }
+    for directory in ("ddpm_cifar10_hf_mmd", "ldm_ffhq_mmd")
+)
+DINO_MODELS_BY_DIRECTORY = {model["directory"]: model for model in DINO_MODELS}
+# KS models in the first two rows (EDM centred), then one row per image model
+# with its Inception and DINOv2 panels side by side.
+ABSOLUTE_MODELS = (
+    *PLOT_MODELS[:3],
+    MODELS_BY_DIRECTORY["ddpm_cifar10_hf_mmd"],
+    DINO_MODELS_BY_DIRECTORY["ddpm_cifar10_hf_mmd"],
+    MODELS_BY_DIRECTORY["ldm_ffhq_mmd"],
+    DINO_MODELS_BY_DIRECTORY["ldm_ffhq_mmd"],
+)
 
 OU_ORACLE_MODEL = {
     **MODELS[0],
@@ -636,6 +654,11 @@ def _check_loaded_schedules(
         raise RuntimeError(f"No usable partial results in {experiment_dir}")
 
 
+def _rows_key(model: dict[str, Any]) -> str:
+    """Key of a model's rows in ``all_rows``: the directory unless the model sets one."""
+    return model.get("rows_key", model["directory"])
+
+
 def _load_manifest_rows(
     outputs_root: Path,
     models: tuple[dict[str, Any], ...] = MODELS,
@@ -776,7 +799,7 @@ def _load_manifest_rows(
             partial_run_counts=partial_run_counts,
             skipped_zero_run_rows=skipped_zero_run_rows,
         )
-        all_rows[model["directory"]] = schedule_rows
+        all_rows[_rows_key(model)] = schedule_rows
     return all_rows
 
 
@@ -1122,7 +1145,7 @@ def _attach_and_verify_caches(
             with config_path.open() as handle:
                 configs.append((config_path, json.load(handle)))
 
-        for rows in all_rows[model["directory"]].values():
+        for rows in all_rows[_rows_key(model)].values():
             for row in rows:
                 matches: list[
                     tuple[np.ndarray, np.ndarray | None, dict[str, np.ndarray] | None]
@@ -1193,13 +1216,14 @@ def _load_and_verify_rows(
     debug: bool,
 ) -> dict[str, dict[tuple[float, ...], list[ResultRow]]]:
     if not debug:
-        all_rows = _load_manifest_rows(outputs_root, (*MODELS, *TIMING_MODELS))
-        _attach_and_verify_caches(outputs_root, all_rows, (*MODELS, *TIMING_MODELS))
+        models = (*MODELS, *DINO_MODELS, *TIMING_MODELS)
+        all_rows = _load_manifest_rows(outputs_root, models)
+        _attach_and_verify_caches(outputs_root, all_rows, models)
         all_rows["ou_oracle"] = _load_ou_oracle_rows(outputs_root)
         return all_rows
 
     all_rows: dict[str, dict[tuple[float, ...], list[ResultRow]]] = {}
-    for model in (*MODELS, *TIMING_MODELS):
+    for model in (*MODELS, *DINO_MODELS, *TIMING_MODELS):
         try:
             model_rows = _load_manifest_rows(
                 outputs_root,
@@ -1210,7 +1234,7 @@ def _load_and_verify_rows(
             _attach_and_verify_caches(outputs_root, model_rows, models=(model,))
         except (OSError, KeyError, RuntimeError, ValueError) as exc:
             warnings.warn(
-                f"Skipping {model['title']} in debug mode: {exc}",
+                f"Skipping {model['title']} ({model['metric']}) in debug mode: {exc}",
                 RuntimeWarning,
                 stacklevel=2,
             )
@@ -1419,6 +1443,13 @@ def _four_model_style() -> None:
     )
 
 
+METRIC_TITLES = {
+    "ks": "KS",
+    "mmd_inception": "MMD Inception",
+    "mmd_dino": "MMD DINOv2",
+}
+
+
 def _four_model_title(model: dict[str, Any], *, include_metric: bool = True) -> str:
     """Return a concise panel title, optionally retaining the metric identifier."""
     title = {
@@ -1430,7 +1461,11 @@ def _four_model_title(model: dict[str, Any], *, include_metric: bool = True) -> 
         "ddpm_cifar10_hf_timing": "CIFAR-10",
         "ldm_ffhq_timing": "FFHQ",
     }[model["directory"]]
-    return f"{title} ({model['metric'].upper()})" if include_metric else title
+    if not include_metric:
+        return title
+    if model["metric"] not in METRIC_TITLES:
+        raise ValueError(f"No panel title for metric {model['metric']!r}")
+    return f"{title} ({METRIC_TITLES[model['metric']]})"
 
 
 def _label_visible_grid(axes: np.ndarray, *, xlabel: str, ylabel: str) -> None:
@@ -1900,22 +1935,26 @@ def _plot_absolute_metrics(
 ) -> None:
     _four_model_style()
     fig = plt.figure(figsize=ABSOLUTE_FIGSIZE)
-    grid = fig.add_gridspec(3, 4)
+    grid = fig.add_gridspec(4, 4)
     axes = [
-        fig.add_subplot(grid[row, 2 * column : 2 * column + 2])
-        for row in range(2)
-        for column in range(2)
+        fig.add_subplot(grid[0, 0:2]),
+        fig.add_subplot(grid[0, 2:4]),
+        fig.add_subplot(grid[1, 1:3]),
+        *(
+            fig.add_subplot(grid[row, 2 * column : 2 * column + 2])
+            for row in (2, 3)
+            for column in range(2)
+        ),
     ]
-    axes.append(fig.add_subplot(grid[2, 1:3]))
     legend_handles: list[Any] = []
     legend_labels: list[str] = []
     plotted_any = False
 
     for ax, model in zip(axes, ABSOLUTE_MODELS):
-        if model["directory"] not in all_rows:
+        if _rows_key(model) not in all_rows:
             ax.set_visible(False)
             continue
-        rows_by_schedule = all_rows[model["directory"]]
+        rows_by_schedule = all_rows[_rows_key(model)]
         panel_has_data = False
         independent_by_budget = _validated_independent_rows(rows_by_schedule)
         if independent_by_budget:

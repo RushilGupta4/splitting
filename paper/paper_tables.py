@@ -11,6 +11,7 @@ from typing import Any, Iterable, Mapping
 import numpy as np
 
 from paper_plots import (
+    DINO_MODELS_BY_DIRECTORY,
     LEARNED_C_OPTIMIZER,
     MODELS,
     PILOT_STAGES,
@@ -24,6 +25,7 @@ from paper_plots import (
     _load_and_verify_rows,
     _normal_reduction,
     _row_at_budget,
+    _rows_key,
     _timing_mean_ci,
     _timing_overhead,
     _timing_rows,
@@ -205,7 +207,7 @@ def _complete_result_rows(
     *,
     debug: bool = False,
 ) -> tuple[list[str], list[dict[str, Any]]]:
-    rows_by_schedule = all_rows.get(model["directory"], {})
+    rows_by_schedule = all_rows.get(_rows_key(model), {})
 
     def result_row(
         schedule: tuple[float, ...],
@@ -454,6 +456,10 @@ def main() -> None:
 
     for model in MODELS:
         fieldnames, rows = _complete_result_rows(model, all_rows, debug=args.debug)
+        # The image tables also carry the DINOv2 rows, told apart by `metric`.
+        dino_model = DINO_MODELS_BY_DIRECTORY.get(model["directory"])
+        if dino_model is not None:
+            rows += _complete_result_rows(dino_model, all_rows, debug=args.debug)[1]
         stem = RESULT_TABLE_STEMS[model["directory"]]
         written.append(_write_csv(output_dir, stem, fieldnames, rows))
 
